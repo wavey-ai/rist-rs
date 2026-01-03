@@ -1,0 +1,15 @@
+[package]
+name = "rist-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Raw FFI bindings to librist"
+links = "rist"
+
+[build-dependencies]
+bindgen = "0.70"
+pkg-config = "0.3"
+
+[features]
+default = []

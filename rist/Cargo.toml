@@ -1,0 +1,11 @@
+[package]
+name = "rist"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Safe Rust bindings for librist (RIST protocol)"
+
+[dependencies]
+rist-sys = { path = "../rist-sys" }
+thiserror = "2"
