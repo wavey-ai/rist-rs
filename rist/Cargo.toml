@@ -6,6 +6,11 @@ license.workspace = true
 repository.workspace = true
 description = "Safe Rust bindings for librist (RIST protocol)"
 
+[features]
+default = []
+tokio = ["dep:tokio"]
+
 [dependencies]
 rist-sys = { path = "../rist-sys" }
 thiserror = "2"
+tokio = { version = "1", features = ["rt", "sync", "time", "io-util"], optional = true }

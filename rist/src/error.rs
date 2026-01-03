@@ -34,4 +34,7 @@ pub enum Error {
 
     #[error("logging setup failed")]
     LoggingSetup,
+
+    #[error("async task join error: {0}")]
+    JoinError(String),
 }

@@ -26,10 +26,13 @@ mod profile;
 mod receiver;
 mod sender;
 
+#[cfg(feature = "tokio")]
+pub mod tokio;
+
 pub use error::Error;
 pub use logging::{LogLevel, set_logging};
 pub use profile::Profile;
-pub use receiver::{Receiver, DataBlock};
+pub use receiver::{DataBlock, Receiver};
 pub use sender::Sender;
 
 pub type Result<T> = std::result::Result<T, Error>;

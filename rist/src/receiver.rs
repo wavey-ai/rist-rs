@@ -9,6 +9,11 @@ pub struct DataBlock {
 }
 
 impl DataBlock {
+    /// Create a DataBlock from a raw pointer.
+    pub(crate) fn from_raw(inner: *mut rist_sys::rist_data_block) -> Self {
+        Self { inner }
+    }
+
     /// Get the payload data.
     pub fn payload(&self) -> &[u8] {
         unsafe {
