@@ -22,6 +22,7 @@
 
 mod error;
 mod logging;
+mod options;
 mod profile;
 mod receiver;
 mod sender;
@@ -30,7 +31,8 @@ mod sender;
 pub mod tokio;
 
 pub use error::Error;
-pub use logging::{LogLevel, set_logging};
+pub use logging::{set_logging, LogLevel};
+pub use options::{ReceiverOptions, RecoveryMode, SenderOptions};
 pub use profile::Profile;
 pub use receiver::{DataBlock, Receiver};
 pub use sender::Sender;

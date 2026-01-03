@@ -1,4 +1,4 @@
-use crate::{DataBlock, Error, Profile, Result};
+use crate::{DataBlock, Error, Profile, ReceiverOptions, Result};
 use std::ffi::CString;
 use std::ptr;
 use std::time::Duration;
@@ -36,6 +36,13 @@ impl AsyncReceiver {
     ///
     /// URL format: `rist://@:port` for listening
     pub fn bind(profile: Profile, url: &str) -> Result<Self> {
+        Self::bind_with_options(profile, url, ReceiverOptions::default())
+    }
+
+    /// Bind a receiver with custom options.
+    ///
+    /// URL format: `rist://@:port` for listening
+    pub fn bind_with_options(profile: Profile, url: &str, options: ReceiverOptions) -> Result<Self> {
         let mut raw_ctx: *mut rist_sys::rist_ctx = ptr::null_mut();
 
         let ret = unsafe {
@@ -46,17 +53,24 @@ impl AsyncReceiver {
             return Err(Error::ContextCreation);
         }
 
+        // Set FIFO size if specified
+        if let Some(fifo_size) = options.fifo_size {
+            unsafe {
+                rist_sys::rist_receiver_data_notify_fd_set(raw_ctx, fifo_size as i32);
+            }
+        }
+
         let mut receiver = Self {
             ctx: SendCtx::new(raw_ctx),
             raw_ctx,
         };
-        receiver.add_peer(url)?;
+        receiver.add_peer_with_options(url, &options)?;
         receiver.start()?;
 
         Ok(receiver)
     }
 
-    fn add_peer(&mut self, url: &str) -> Result<()> {
+    fn add_peer_with_options(&mut self, url: &str, options: &ReceiverOptions) -> Result<()> {
         let url_c = CString::new(url)?;
         let mut peer_config: *mut rist_sys::rist_peer_config = ptr::null_mut();
 
@@ -64,6 +78,11 @@ impl AsyncReceiver {
 
         if ret != 0 || peer_config.is_null() {
             return Err(Error::UrlParse(url.to_string()));
+        }
+
+        // Apply options to peer config
+        unsafe {
+            options.apply_to_peer_config(&mut *peer_config);
         }
 
         let mut peer: *mut rist_sys::rist_peer = ptr::null_mut();

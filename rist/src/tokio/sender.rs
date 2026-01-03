@@ -1,4 +1,4 @@
-use crate::{Error, Profile, Result};
+use crate::{Error, Profile, Result, SenderOptions};
 use std::ffi::CString;
 use std::future::Future;
 use std::io;
@@ -44,6 +44,7 @@ enum ConnectState {
 pub struct Connect {
     profile: Profile,
     url: String,
+    options: SenderOptions,
     state: ConnectState,
 }
 
@@ -55,6 +56,7 @@ impl Future for Connect {
             ConnectState::Idle => {
                 let profile = self.profile;
                 let url = self.url.clone();
+                let options = self.options.clone();
 
                 let mut handle = spawn_blocking(move || {
                     let mut ctx: *mut rist_sys::rist_ctx = ptr::null_mut();
@@ -77,6 +79,11 @@ impl Future for Connect {
                     if ret != 0 || peer_config.is_null() {
                         unsafe { rist_sys::rist_destroy(ctx) };
                         return Err(Error::UrlParse(url));
+                    }
+
+                    // Apply options to peer config
+                    unsafe {
+                        options.apply_to_peer_config(&mut *peer_config);
                     }
 
                     let mut peer: *mut rist_sys::rist_peer = ptr::null_mut();
@@ -126,9 +133,17 @@ impl AsyncSender {
     ///
     /// URL format: `rist://host:port`
     pub fn connect(profile: Profile, url: &str) -> Connect {
+        Self::connect_with_options(profile, url, SenderOptions::default())
+    }
+
+    /// Connect to a RIST receiver with custom options.
+    ///
+    /// URL format: `rist://host:port`
+    pub fn connect_with_options(profile: Profile, url: &str, options: SenderOptions) -> Connect {
         Connect {
             profile,
             url: url.to_string(),
+            options,
             state: ConnectState::Idle,
         }
     }
