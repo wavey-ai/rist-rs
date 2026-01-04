@@ -1,9 +1,12 @@
+use crate::stats::SenderStats;
 use crate::{Error, Profile, Result, SenderOptions};
 use std::ffi::CString;
 use std::future::Future;
 use std::io;
+use std::os::raw::c_void;
 use std::pin::Pin;
 use std::ptr;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use ::tokio::io::AsyncWrite;
 use ::tokio::task::{spawn_blocking, JoinHandle};
@@ -25,10 +28,38 @@ impl SendCtx {
     }
 }
 
+/// Stats callback for librist sender
+unsafe extern "C" fn stats_callback(
+    arg: *mut c_void,
+    stats_container: *const rist_sys::rist_stats,
+) -> i32 {
+    if arg.is_null() || stats_container.is_null() {
+        return 0;
+    }
+
+    let stats_arc = &*(arg as *const Arc<Mutex<Option<SenderStats>>>);
+    let stats = &*stats_container;
+
+    // Check if this is sender stats
+    if stats.stats_type == rist_sys::rist_stats_type_RIST_STATS_SENDER_PEER {
+        let sender_stats = SenderStats::from(&stats.stats.sender_peer);
+        if let Ok(mut guard) = stats_arc.lock() {
+            *guard = Some(sender_stats);
+        }
+    }
+
+    // Free the stats container
+    rist_sys::rist_stats_free(stats_container);
+
+    0
+}
+
 /// Async RIST sender.
 pub struct AsyncSender {
     ctx: SendCtx,
     raw_ctx: *mut rist_sys::rist_ctx,
+    stats: Arc<Mutex<Option<SenderStats>>>,
+    _stats_data: Option<Box<Arc<Mutex<Option<SenderStats>>>>>,
 }
 
 // SAFETY: The sender context is thread-safe in librist
@@ -67,6 +98,16 @@ impl Future for Connect {
 
                     if ret != 0 || ctx.is_null() {
                         return Err(Error::ContextCreation);
+                    }
+
+                    // Set up stats callback
+                    let stats = Arc::new(Mutex::new(None));
+                    let stats_data = Box::new(stats.clone());
+                    let stats_ptr =
+                        &*stats_data as *const Arc<Mutex<Option<SenderStats>>> as *mut c_void;
+
+                    unsafe {
+                        rist_sys::rist_stats_callback_set(ctx, 1000, Some(stats_callback), stats_ptr);
                     }
 
                     // Add peer
@@ -108,6 +149,8 @@ impl Future for Connect {
                     Ok(AsyncSender {
                         ctx: SendCtx::new(ctx),
                         raw_ctx: ctx,
+                        stats,
+                        _stats_data: Some(stats_data),
                     })
                 });
 
@@ -177,6 +220,14 @@ impl AsyncSender {
         })
         .await
         .map_err(|e| Error::JoinError(e.to_string()))?
+    }
+
+    /// Returns the latest stats for this sender.
+    ///
+    /// Stats are updated periodically (every 1 second by default).
+    /// Returns `None` if no stats have been collected yet.
+    pub fn raw_stats(&self) -> Option<SenderStats> {
+        self.stats.lock().ok().and_then(|guard| guard.clone())
     }
 }
 

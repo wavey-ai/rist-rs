@@ -1,6 +1,9 @@
+use crate::stats::ReceiverStats;
 use crate::{DataBlock, Error, Profile, ReceiverOptions, Result};
 use std::ffi::CString;
+use std::os::raw::c_void;
 use std::ptr;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use ::tokio::task::spawn_blocking;
 
@@ -25,11 +28,40 @@ impl SendCtx {
 pub struct AsyncReceiver {
     ctx: SendCtx,
     raw_ctx: *mut rist_sys::rist_ctx,
+    stats: Arc<Mutex<Option<ReceiverStats>>>,
+    // prevent the boxed callback data from being dropped
+    _stats_data: Option<Box<Arc<Mutex<Option<ReceiverStats>>>>>,
 }
 
 // SAFETY: librist contexts are thread-safe
 unsafe impl Send for AsyncReceiver {}
 unsafe impl Sync for AsyncReceiver {}
+
+/// Stats callback for librist
+unsafe extern "C" fn stats_callback(
+    arg: *mut c_void,
+    stats_container: *const rist_sys::rist_stats,
+) -> i32 {
+    if arg.is_null() || stats_container.is_null() {
+        return 0;
+    }
+
+    let stats_arc = &*(arg as *const Arc<Mutex<Option<ReceiverStats>>>);
+    let stats = &*stats_container;
+
+    // Check if this is receiver stats
+    if stats.stats_type == rist_sys::rist_stats_type_RIST_STATS_RECEIVER_FLOW {
+        let receiver_stats = ReceiverStats::from(&stats.stats.receiver_flow);
+        if let Ok(mut guard) = stats_arc.lock() {
+            *guard = Some(receiver_stats);
+        }
+    }
+
+    // Free the stats container
+    rist_sys::rist_stats_free(stats_container);
+
+    0
+}
 
 impl AsyncReceiver {
     /// Bind a receiver to listen on the given URL.
@@ -42,7 +74,11 @@ impl AsyncReceiver {
     /// Bind a receiver with custom options.
     ///
     /// URL format: `rist://@:port` for listening
-    pub fn bind_with_options(profile: Profile, url: &str, options: ReceiverOptions) -> Result<Self> {
+    pub fn bind_with_options(
+        profile: Profile,
+        url: &str,
+        options: ReceiverOptions,
+    ) -> Result<Self> {
         let mut raw_ctx: *mut rist_sys::rist_ctx = ptr::null_mut();
 
         let ret = unsafe {
@@ -60,9 +96,21 @@ impl AsyncReceiver {
             }
         }
 
+        // Set up stats callback
+        let stats = Arc::new(Mutex::new(None));
+        let stats_data = Box::new(stats.clone());
+        let stats_ptr = &*stats_data as *const Arc<Mutex<Option<ReceiverStats>>> as *mut c_void;
+
+        unsafe {
+            // Set stats callback with 1 second interval
+            rist_sys::rist_stats_callback_set(raw_ctx, 1000, Some(stats_callback), stats_ptr);
+        }
+
         let mut receiver = Self {
             ctx: SendCtx::new(raw_ctx),
             raw_ctx,
+            stats,
+            _stats_data: Some(stats_data),
         };
         receiver.add_peer_with_options(url, &options)?;
         receiver.start()?;
@@ -142,6 +190,14 @@ impl AsyncReceiver {
         })
         .await
         .map_err(|e| Error::JoinError(e.to_string()))?
+    }
+
+    /// Returns the latest stats for this receiver.
+    ///
+    /// Stats are updated periodically (every 1 second by default).
+    /// Returns `None` if no stats have been collected yet.
+    pub fn raw_stats(&self) -> Option<ReceiverStats> {
+        self.stats.lock().ok().and_then(|guard| guard.clone())
     }
 }
 
