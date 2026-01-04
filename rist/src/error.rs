@@ -37,4 +37,7 @@ pub enum Error {
 
     #[error("async task join error: {0}")]
     JoinError(String),
+
+    #[error("eventfd error: {0}")]
+    EventFd(String),
 }

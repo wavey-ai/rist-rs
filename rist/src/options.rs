@@ -13,6 +13,7 @@ pub enum RecoveryMode {
 }
 
 impl RecoveryMode {
+    #[allow(dead_code)]
     pub(crate) fn to_raw(self) -> rist_sys::rist_recovery_mode {
         match self {
             RecoveryMode::Disabled => rist_sys::rist_recovery_mode_RIST_RECOVERY_MODE_DISABLED,
@@ -78,6 +79,7 @@ impl ReceiverOptions {
         self
     }
 
+    #[allow(dead_code)]
     pub(crate) fn apply_to_peer_config(&self, config: &mut rist_sys::rist_peer_config) {
         if let Some(mode) = self.recovery_mode {
             config.recovery_mode = mode.to_raw();
@@ -146,6 +148,7 @@ impl SenderOptions {
         self
     }
 
+    #[allow(dead_code)]
     pub(crate) fn apply_to_peer_config(&self, config: &mut rist_sys::rist_peer_config) {
         if let Some(mode) = self.recovery_mode {
             config.recovery_mode = mode.to_raw();

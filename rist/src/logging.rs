@@ -12,6 +12,7 @@ pub enum LogLevel {
 }
 
 impl LogLevel {
+    #[allow(dead_code)]
     pub(crate) fn to_raw(self) -> rist_sys::rist_log_level {
         match self {
             LogLevel::Disable => rist_sys::rist_log_level_RIST_LOG_DISABLE,

@@ -3,40 +3,104 @@ use crate::{DataBlock, Error, Profile, ReceiverOptions, Result};
 use std::ffi::CString;
 use std::io;
 use std::os::raw::c_void;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::ptr;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use ::tokio::io::{AsyncRead, ReadBuf};
-use ::tokio::task::spawn_blocking;
+use ::tokio::io::unix::AsyncFd;
 
-/// Send-safe wrapper for rist context pointer.
-/// SAFETY: librist contexts are thread-safe.
-#[derive(Clone, Copy)]
-struct SendCtx(usize);
+/// Wrapper for a pipe read-end that can be used with AsyncFd.
+/// librist will write to the write-end when data is available.
+struct NotifyPipe {
+    read_fd: RawFd,
+    write_fd: RawFd,
+}
 
-unsafe impl Send for SendCtx {}
+impl NotifyPipe {
+    fn new() -> io::Result<Self> {
+        let mut fds = [0i32; 2];
+        let ret = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
 
-impl SendCtx {
-    fn new(ctx: *mut rist_sys::rist_ctx) -> Self {
-        Self(ctx as usize)
+        // Set read end to non-blocking
+        let flags = unsafe { libc::fcntl(fds[0], libc::F_GETFL) };
+        if flags < 0 {
+            unsafe {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+            }
+            return Err(io::Error::last_os_error());
+        }
+        let ret = unsafe { libc::fcntl(fds[0], libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        if ret < 0 {
+            unsafe {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+            }
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(Self {
+            read_fd: fds[0],
+            write_fd: fds[1],
+        })
     }
 
-    fn as_ptr(self) -> *mut rist_sys::rist_ctx {
-        self.0 as *mut rist_sys::rist_ctx
+    /// Get the write fd to pass to librist
+    fn write_fd(&self) -> RawFd {
+        self.write_fd
+    }
+
+    /// Consume pending notifications (drain the pipe)
+    fn consume(&self) -> io::Result<()> {
+        let mut buf = [0u8; 64];
+        loop {
+            let ret = unsafe { libc::read(self.read_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+            if ret < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::WouldBlock {
+                    return Ok(()); // No more data
+                }
+                return Err(err);
+            }
+            if ret == 0 {
+                return Ok(()); // EOF
+            }
+            // Loop to drain all pending bytes
+        }
+    }
+}
+
+impl AsRawFd for NotifyPipe {
+    fn as_raw_fd(&self) -> RawFd {
+        self.read_fd
+    }
+}
+
+impl Drop for NotifyPipe {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.read_fd);
+            libc::close(self.write_fd);
+        }
     }
 }
 
 /// Async RIST receiver.
 pub struct AsyncReceiver {
-    ctx: SendCtx,
     raw_ctx: *mut rist_sys::rist_ctx,
     stats: Arc<Mutex<Option<ReceiverStats>>>,
     // prevent the boxed callback data from being dropped
     _stats_data: Option<Box<Arc<Mutex<Option<ReceiverStats>>>>>,
     // Buffer for AsyncRead
     read_buf: Mutex<Vec<u8>>,
+    // AsyncFd for native async notification
+    async_fd: AsyncFd<NotifyPipe>,
 }
 
 // SAFETY: librist contexts are thread-safe
@@ -95,12 +159,17 @@ impl AsyncReceiver {
             return Err(Error::ContextCreation);
         }
 
-        // Set FIFO size if specified
-        if let Some(fifo_size) = options.fifo_size {
-            unsafe {
-                rist_sys::rist_receiver_data_notify_fd_set(raw_ctx, fifo_size as i32);
-            }
+        // Create pipe for async notification
+        let notify_pipe = NotifyPipe::new().map_err(|e| Error::EventFd(e.to_string()))?;
+
+        // Register the write-end with librist - it will write to this when data is available
+        let ret = unsafe { rist_sys::rist_receiver_data_notify_fd_set(raw_ctx, notify_pipe.write_fd()) };
+        if ret != 0 {
+            return Err(Error::EventFd("failed to set notify fd".to_string()));
         }
+
+        // Wrap the read-end in AsyncFd for tokio integration
+        let async_fd = AsyncFd::new(notify_pipe).map_err(|e| Error::EventFd(e.to_string()))?;
 
         // Set up stats callback
         let stats = Arc::new(Mutex::new(None));
@@ -113,11 +182,11 @@ impl AsyncReceiver {
         }
 
         let mut receiver = Self {
-            ctx: SendCtx::new(raw_ctx),
             raw_ctx,
             stats,
             _stats_data: Some(stats_data),
             read_buf: Mutex::new(Vec::new()),
+            async_fd,
         };
         receiver.add_peer_with_options(url, &options)?;
         receiver.start()?;
@@ -164,39 +233,55 @@ impl AsyncReceiver {
         Ok(())
     }
 
-    /// Receive data asynchronously.
+    /// Receive data asynchronously using native eventfd notification.
     ///
-    /// Returns `Ok(None)` when the connection is closed.
+    /// Returns `Ok(None)` on timeout or when no data is available.
     pub async fn recv(&self) -> Result<Option<DataBlock>> {
-        self.recv_timeout(Duration::from_millis(100)).await
+        // Wait for the eventfd to be readable (librist signals data available)
+        let mut guard = self.async_fd.readable().await.map_err(|e| Error::EventFd(e.to_string()))?;
+
+        // Consume the event
+        if let Err(e) = guard.get_inner().consume() {
+            if e.kind() != io::ErrorKind::WouldBlock {
+                return Err(Error::EventFd(e.to_string()));
+            }
+        }
+
+        // Read with timeout=0 (non-blocking) since we know data is available
+        let result = self.try_recv();
+
+        // Clear readiness so we wait again next time
+        guard.clear_ready();
+
+        result
     }
 
     /// Receive data with a custom timeout.
     pub async fn recv_timeout(&self, timeout: Duration) -> Result<Option<DataBlock>> {
-        let ctx = self.ctx;
-        let timeout_ms: i32 = timeout
-            .as_millis()
-            .try_into()
-            .map_err(|_| Error::TimeoutOverflow)?;
+        // Use tokio timeout wrapping the native async recv
+        match ::tokio::time::timeout(timeout, self.recv()).await {
+            Ok(result) => result,
+            Err(_) => Ok(None), // Timeout
+        }
+    }
 
-        spawn_blocking(move || {
-            let mut block: *mut rist_sys::rist_data_block = ptr::null_mut();
+    /// Try to receive data without blocking.
+    /// Returns Ok(None) if no data is immediately available.
+    pub fn try_recv(&self) -> Result<Option<DataBlock>> {
+        let mut block: *mut rist_sys::rist_data_block = ptr::null_mut();
 
-            let ret =
-                unsafe { rist_sys::rist_receiver_data_read2(ctx.as_ptr(), &mut block, timeout_ms) };
+        // timeout=0 means non-blocking
+        let ret = unsafe { rist_sys::rist_receiver_data_read2(self.raw_ctx, &mut block, 0) };
 
-            if ret < 0 {
-                return Err(Error::Read);
-            }
+        if ret < 0 {
+            return Err(Error::Read);
+        }
 
-            if ret == 0 || block.is_null() {
-                return Ok(None);
-            }
+        if ret == 0 || block.is_null() {
+            return Ok(None);
+        }
 
-            Ok(Some(DataBlock::from_raw(block)))
-        })
-        .await
-        .map_err(|e| Error::JoinError(e.to_string()))?
+        Ok(Some(DataBlock::from_raw(block)))
     }
 
     /// Returns the latest stats for this receiver.

@@ -135,7 +135,7 @@ impl Receiver {
             return Ok(None);
         }
 
-        Ok(Some(DataBlock { inner: block }))
+        Ok(Some(DataBlock::from_raw(block)))
     }
 }
 
