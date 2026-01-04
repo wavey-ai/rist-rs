@@ -1,10 +1,14 @@
 use crate::stats::ReceiverStats;
 use crate::{DataBlock, Error, Profile, ReceiverOptions, Result};
 use std::ffi::CString;
+use std::io;
 use std::os::raw::c_void;
+use std::pin::Pin;
 use std::ptr;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
+use ::tokio::io::{AsyncRead, ReadBuf};
 use ::tokio::task::spawn_blocking;
 
 /// Send-safe wrapper for rist context pointer.
@@ -31,6 +35,8 @@ pub struct AsyncReceiver {
     stats: Arc<Mutex<Option<ReceiverStats>>>,
     // prevent the boxed callback data from being dropped
     _stats_data: Option<Box<Arc<Mutex<Option<ReceiverStats>>>>>,
+    // Buffer for AsyncRead
+    read_buf: Mutex<Vec<u8>>,
 }
 
 // SAFETY: librist contexts are thread-safe
@@ -111,6 +117,7 @@ impl AsyncReceiver {
             raw_ctx,
             stats,
             _stats_data: Some(stats_data),
+            read_buf: Mutex::new(Vec::new()),
         };
         receiver.add_peer_with_options(url, &options)?;
         receiver.start()?;
@@ -206,5 +213,52 @@ impl Drop for AsyncReceiver {
         unsafe {
             rist_sys::rist_destroy(self.raw_ctx);
         }
+    }
+}
+
+impl AsyncRead for AsyncReceiver {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        // First, try to read from the internal buffer
+        if let Ok(mut read_buf) = self.read_buf.lock() {
+            if !read_buf.is_empty() {
+                let to_read = std::cmp::min(buf.remaining(), read_buf.len());
+                buf.put_slice(&read_buf[..to_read]);
+                read_buf.drain(..to_read);
+                return Poll::Ready(Ok(()));
+            }
+        }
+
+        // Buffer is empty, read from RIST (non-blocking with 0 timeout)
+        let mut block: *mut rist_sys::rist_data_block = ptr::null_mut();
+        let ret = unsafe { rist_sys::rist_receiver_data_read2(self.raw_ctx, &mut block, 0) };
+
+        if ret < 0 {
+            return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, "read failed")));
+        }
+
+        if ret == 0 || block.is_null() {
+            // No data available, would block
+            return Poll::Pending;
+        }
+
+        // Copy data from block
+        let data_block = DataBlock::from_raw(block);
+        let payload = data_block.payload();
+
+        let to_read = std::cmp::min(buf.remaining(), payload.len());
+        buf.put_slice(&payload[..to_read]);
+
+        // Store remaining data in buffer
+        if to_read < payload.len() {
+            if let Ok(mut read_buf) = self.read_buf.lock() {
+                read_buf.extend_from_slice(&payload[to_read..]);
+            }
+        }
+
+        Poll::Ready(Ok(()))
     }
 }

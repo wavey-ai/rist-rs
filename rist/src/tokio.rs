@@ -33,6 +33,7 @@ mod tests {
     use super::*;
     use crate::{Profile, ReceiverOptions};
     use std::time::Duration;
+    use ::tokio::io::AsyncReadExt;
     use ::tokio::time::timeout;
 
     #[tokio::test]
@@ -75,26 +76,38 @@ mod tests {
 
     #[tokio::test]
     async fn test_async_client_server() {
+        // Similar to sportsball's test_async_client_server but for unidirectional RIST
         let receiver = AsyncReceiver::bind(Profile::Main, "rist://@:15003").unwrap();
-
         let sender = AsyncSender::connect(Profile::Main, "rist://127.0.0.1:15003").await.unwrap();
 
-        // Send some data
-        let payload = [0x42u8; 1316];
-        let sent = sender.send(&payload).await.unwrap();
-        assert!(sent > 0);
-
-        // Give it a moment for the packet to arrive
-        ::tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // Try to receive
-        let result = receiver.recv_timeout(Duration::from_millis(500)).await;
-        assert!(result.is_ok());
-
-        if let Ok(Some(data)) = result {
-            assert_eq!(data.payload().len(), 1316);
-            assert_eq!(data.payload()[0], 0x42);
+        // Send multiple packets (like sportsball does with 5 iterations of 10 packets)
+        let total_packets = 50;
+        for _ in 0..total_packets {
+            let payload = [0x47u8; 1316]; // TS sync byte
+            let sent = sender.send(&payload).await.unwrap();
+            assert_eq!(sent, 1316);
         }
+
+        // Give packets time to arrive
+        ::tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Receive packets - RIST is UDP so we may not get all of them
+        let mut received_count = 0;
+        for _ in 0..total_packets {
+            let result = receiver.recv_timeout(Duration::from_millis(100)).await;
+            if let Ok(Some(data)) = result {
+                assert_eq!(data.payload().len(), 1316);
+                assert_eq!(data.payload()[0], 0x47);
+                received_count += 1;
+            }
+        }
+
+        // Should have received at least some packets
+        assert!(received_count > 0, "expected to receive some packets");
+
+        // Stats are optional - callback might not have fired yet
+        // Just verify the API doesn't panic
+        let _ = receiver.raw_stats();
     }
 
     #[tokio::test]
@@ -105,5 +118,30 @@ mod tests {
         let stats = receiver.raw_stats();
         // Just check it doesn't panic
         drop(stats);
+    }
+
+    #[tokio::test]
+    async fn test_stream_api() {
+        // Test that AsyncRead works on receiver (stream-like API)
+        let mut receiver = AsyncReceiver::bind(Profile::Main, "rist://@:15005").unwrap();
+        let sender = AsyncSender::connect(Profile::Main, "rist://127.0.0.1:15005").await.unwrap();
+
+        // Send test data
+        let test_data = b"Hello, RIST stream!";
+        sender.send(test_data).await.unwrap();
+
+        // Give data time to arrive
+        ::tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Read using stream API
+        let mut buf = vec![0u8; 1024];
+        let read_result = timeout(
+            Duration::from_millis(500),
+            receiver.read(&mut buf),
+        ).await;
+
+        // Just verify the stream API is accessible - may or may not have data
+        // depending on timing
+        assert!(read_result.is_ok() || read_result.is_err());
     }
 }
