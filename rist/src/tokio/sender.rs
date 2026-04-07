@@ -1,5 +1,7 @@
 use crate::stats::SenderStats;
 use crate::{Error, Profile, Result, SenderOptions};
+use ::tokio::io::AsyncWrite;
+use ::tokio::task::{spawn_blocking, JoinHandle};
 use std::ffi::CString;
 use std::future::Future;
 use std::io;
@@ -8,8 +10,6 @@ use std::pin::Pin;
 use std::ptr;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use ::tokio::io::AsyncWrite;
-use ::tokio::task::{spawn_blocking, JoinHandle};
 
 /// Send-safe wrapper for rist context pointer.
 /// SAFETY: librist contexts are thread-safe.
@@ -107,7 +107,12 @@ impl Future for Connect {
                         &*stats_data as *const Arc<Mutex<Option<SenderStats>>> as *mut c_void;
 
                     unsafe {
-                        rist_sys::rist_stats_callback_set(ctx, 1000, Some(stats_callback), stats_ptr);
+                        rist_sys::rist_stats_callback_set(
+                            ctx,
+                            1000,
+                            Some(stats_callback),
+                            stats_ptr,
+                        );
                     }
 
                     // Add peer
