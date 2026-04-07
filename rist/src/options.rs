@@ -79,6 +79,25 @@ impl ReceiverOptions {
         self
     }
 
+    pub(crate) fn apply_to_receiver_ctx(&self, ctx: *mut rist_sys::rist_ctx) -> crate::Result<()> {
+        if let Some(size) = self.fifo_size {
+            if size != 0 && !size.is_power_of_two() {
+                return Err(crate::Error::Configuration(
+                    "receiver fifo_size must be 0 or a power of 2".to_string(),
+                ));
+            }
+
+            let ret = unsafe { rist_sys::rist_receiver_set_output_fifo_size(ctx, size) };
+            if ret != 0 {
+                return Err(crate::Error::Configuration(
+                    "failed to set receiver output fifo size".to_string(),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub(crate) fn apply_to_peer_config(&self, config: &mut rist_sys::rist_peer_config) {
         if let Some(mode) = self.recovery_mode {

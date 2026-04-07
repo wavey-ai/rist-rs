@@ -43,6 +43,17 @@ pub use stats::{ReceiverStats, SenderStats};
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]
+pub(crate) static TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn next_test_port() -> u16 {
+    std::net::UdpSocket::bind("127.0.0.1:0")
+        .and_then(|socket| socket.local_addr())
+        .map(|addr| addr.port())
+        .expect("failed to allocate test UDP port")
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::thread;
@@ -50,50 +61,79 @@ mod tests {
 
     #[test]
     fn test_receiver_create() {
+        let _guard = crate::TEST_MUTEX.lock().unwrap();
         let result = Receiver::new(Profile::Main);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_sender_create() {
+        let _guard = crate::TEST_MUTEX.lock().unwrap();
         let result = Sender::new(Profile::Main);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_receiver_add_peer() {
+        let _guard = crate::TEST_MUTEX.lock().unwrap();
+        let url = format!("rist://@:{}", crate::next_test_port());
         let mut receiver = Receiver::new(Profile::Main).unwrap();
-        let result = receiver.add_peer("rist://@:16000");
+        let result = receiver.add_peer(&url);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_receiver_add_peer_rejects_invalid_fifo_size() {
+        let _guard = crate::TEST_MUTEX.lock().unwrap();
+        let url = format!("rist://@:{}", crate::next_test_port());
+        let mut receiver = Receiver::new(Profile::Main).unwrap();
+        let options = ReceiverOptions::new().fifo_size(3);
+        let result = receiver.add_peer_with_options(&url, &options);
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_sender_add_peer() {
+        let _guard = crate::TEST_MUTEX.lock().unwrap();
+        let url = format!("rist://127.0.0.1:{}", crate::next_test_port());
         let mut sender = Sender::new(Profile::Main).unwrap();
-        let result = sender.add_peer("rist://127.0.0.1:16001");
+        let result = sender.add_peer(&url);
         assert!(result.is_ok());
     }
 
     #[test]
+    fn test_set_logging() {
+        let _guard = crate::TEST_MUTEX.lock().unwrap();
+        set_logging(LogLevel::Warn).unwrap();
+        set_logging(LogLevel::Disable).unwrap();
+    }
+
+    #[test]
     fn test_receiver_start() {
+        let _guard = crate::TEST_MUTEX.lock().unwrap();
+        let url = format!("rist://@:{}", crate::next_test_port());
         let mut receiver = Receiver::new(Profile::Main).unwrap();
-        receiver.add_peer("rist://@:16002").unwrap();
+        receiver.add_peer(&url).unwrap();
         let result = receiver.start();
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_sender_start() {
+        let _guard = crate::TEST_MUTEX.lock().unwrap();
+        let url = format!("rist://127.0.0.1:{}", crate::next_test_port());
         let mut sender = Sender::new(Profile::Main).unwrap();
-        sender.add_peer("rist://127.0.0.1:16003").unwrap();
+        sender.add_peer(&url).unwrap();
         let result = sender.start();
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_receiver_read_timeout() {
+        let _guard = crate::TEST_MUTEX.lock().unwrap();
+        let url = format!("rist://@:{}", crate::next_test_port());
         let mut receiver = Receiver::new(Profile::Main).unwrap();
-        receiver.add_peer("rist://@:16004").unwrap();
+        receiver.add_peer(&url).unwrap();
         receiver.start().unwrap();
 
         // Should timeout since nothing is sending
@@ -104,12 +144,16 @@ mod tests {
 
     #[test]
     fn test_sync_roundtrip() {
+        let _guard = crate::TEST_MUTEX.lock().unwrap();
+        let port = crate::next_test_port();
+        let receiver_url = format!("rist://@:{port}");
+        let sender_url = format!("rist://127.0.0.1:{port}");
         let mut receiver = Receiver::new(Profile::Main).unwrap();
-        receiver.add_peer("rist://@:16005").unwrap();
+        receiver.add_peer(&receiver_url).unwrap();
         receiver.start().unwrap();
 
         let mut sender = Sender::new(Profile::Main).unwrap();
-        sender.add_peer("rist://127.0.0.1:16005").unwrap();
+        sender.add_peer(&sender_url).unwrap();
         sender.start().unwrap();
 
         // Send test data
@@ -139,6 +183,7 @@ mod tests {
 
     #[test]
     fn test_sender_empty_url() {
+        let _guard = crate::TEST_MUTEX.lock().unwrap();
         let mut sender = Sender::new(Profile::Main).unwrap();
         let result = sender.add_peer("");
         assert!(result.is_err());
@@ -146,12 +191,16 @@ mod tests {
 
     #[test]
     fn test_send_with_flow_id() {
+        let _guard = crate::TEST_MUTEX.lock().unwrap();
+        let port = crate::next_test_port();
+        let receiver_url = format!("rist://@:{port}");
+        let sender_url = format!("rist://127.0.0.1:{port}");
         let mut receiver = Receiver::new(Profile::Main).unwrap();
-        receiver.add_peer("rist://@:16006").unwrap();
+        receiver.add_peer(&receiver_url).unwrap();
         receiver.start().unwrap();
 
         let mut sender = Sender::new(Profile::Main).unwrap();
-        sender.add_peer("rist://127.0.0.1:16006").unwrap();
+        sender.add_peer(&sender_url).unwrap();
         sender.start().unwrap();
 
         // Send with specific flow ID
@@ -168,6 +217,7 @@ mod tests {
 
     #[test]
     fn test_profiles() {
+        let _guard = crate::TEST_MUTEX.lock().unwrap();
         // Test all profiles can be used
         for profile in [Profile::Simple, Profile::Main, Profile::Advanced] {
             let result = Receiver::new(profile);

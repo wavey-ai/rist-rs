@@ -11,6 +11,9 @@ pub enum Error {
     #[error("failed to parse URL: {0}")]
     UrlParse(String),
 
+    #[error("invalid configuration: {0}")]
+    Configuration(String),
+
     #[error("failed to start context")]
     Start,
 

@@ -1,5 +1,7 @@
 use crate::stats::ReceiverStats;
 use crate::{DataBlock, Error, Profile, ReceiverOptions, Result};
+use ::tokio::io::unix::AsyncFd;
+use ::tokio::io::{AsyncRead, ReadBuf};
 use std::ffi::CString;
 use std::io;
 use std::os::raw::c_void;
@@ -9,8 +11,6 @@ use std::ptr;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
-use ::tokio::io::{AsyncRead, ReadBuf};
-use ::tokio::io::unix::AsyncFd;
 
 /// Wrapper for a pipe read-end that can be used with AsyncFd.
 /// librist will write to the write-end when data is available.
@@ -159,17 +159,45 @@ impl AsyncReceiver {
             return Err(Error::ContextCreation);
         }
 
+        if let Err(err) = options.apply_to_receiver_ctx(raw_ctx) {
+            unsafe {
+                rist_sys::rist_destroy(raw_ctx);
+            }
+            return Err(err);
+        }
+
         // Create pipe for async notification
-        let notify_pipe = NotifyPipe::new().map_err(|e| Error::EventFd(e.to_string()))?;
+        let notify_pipe = match NotifyPipe::new() {
+            Ok(pipe) => pipe,
+            Err(err) => {
+                unsafe {
+                    rist_sys::rist_destroy(raw_ctx);
+                }
+                return Err(Error::EventFd(err.to_string()));
+            }
+        };
 
         // Register the write-end with librist - it will write to this when data is available
-        let ret = unsafe { rist_sys::rist_receiver_data_notify_fd_set(raw_ctx, notify_pipe.write_fd()) };
+        let ret =
+            unsafe { rist_sys::rist_receiver_data_notify_fd_set(raw_ctx, notify_pipe.write_fd()) };
         if ret != 0 {
+            unsafe {
+                rist_sys::rist_destroy(raw_ctx);
+            }
             return Err(Error::EventFd("failed to set notify fd".to_string()));
         }
 
         // Wrap the read-end in AsyncFd for tokio integration
-        let async_fd = AsyncFd::new(notify_pipe).map_err(|e| Error::EventFd(e.to_string()))?;
+        let async_fd = match AsyncFd::new(notify_pipe) {
+            Ok(async_fd) => async_fd,
+            Err(err) => {
+                unsafe {
+                    rist_sys::rist_receiver_data_notify_fd_set(raw_ctx, 0);
+                    rist_sys::rist_destroy(raw_ctx);
+                }
+                return Err(Error::EventFd(err.to_string()));
+            }
+        };
 
         // Set up stats callback
         let stats = Arc::new(Mutex::new(None));
@@ -237,23 +265,36 @@ impl AsyncReceiver {
     ///
     /// Returns `Ok(None)` on timeout or when no data is available.
     pub async fn recv(&self) -> Result<Option<DataBlock>> {
-        // Wait for the eventfd to be readable (librist signals data available)
-        let mut guard = self.async_fd.readable().await.map_err(|e| Error::EventFd(e.to_string()))?;
-
-        // Consume the event
-        if let Err(e) = guard.get_inner().consume() {
-            if e.kind() != io::ErrorKind::WouldBlock {
-                return Err(Error::EventFd(e.to_string()));
-            }
+        if let Some(block) = self.try_recv()? {
+            return Ok(Some(block));
         }
 
-        // Read with timeout=0 (non-blocking) since we know data is available
-        let result = self.try_recv();
+        loop {
+            // Wait for the eventfd to be readable (librist signals data available)
+            let mut guard = self
+                .async_fd
+                .readable()
+                .await
+                .map_err(|e| Error::EventFd(e.to_string()))?;
 
-        // Clear readiness so we wait again next time
-        guard.clear_ready();
+            // Consume the event
+            if let Err(e) = guard.get_inner().consume() {
+                if e.kind() != io::ErrorKind::WouldBlock {
+                    return Err(Error::EventFd(e.to_string()));
+                }
+            }
 
-        result
+            // Read with timeout=0 (non-blocking) since we know data is available
+            let result = self.try_recv();
+
+            // Clear readiness so we wait again next time
+            guard.clear_ready();
+
+            match result? {
+                Some(block) => return Ok(Some(block)),
+                None => continue,
+            }
+        }
     }
 
     /// Receive data with a custom timeout.
@@ -296,6 +337,7 @@ impl AsyncReceiver {
 impl Drop for AsyncReceiver {
     fn drop(&mut self) {
         unsafe {
+            rist_sys::rist_receiver_data_notify_fd_set(self.raw_ctx, 0);
             rist_sys::rist_destroy(self.raw_ctx);
         }
     }
@@ -304,46 +346,60 @@ impl Drop for AsyncReceiver {
 impl AsyncRead for AsyncReceiver {
     fn poll_read(
         self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        // First, try to read from the internal buffer
-        if let Ok(mut read_buf) = self.read_buf.lock() {
-            if !read_buf.is_empty() {
-                let to_read = std::cmp::min(buf.remaining(), read_buf.len());
-                buf.put_slice(&read_buf[..to_read]);
-                read_buf.drain(..to_read);
+        let this = self.get_mut();
+
+        loop {
+            // First, try to read from the internal buffer
+            if let Ok(mut read_buf) = this.read_buf.lock() {
+                if !read_buf.is_empty() {
+                    let to_read = std::cmp::min(buf.remaining(), read_buf.len());
+                    buf.put_slice(&read_buf[..to_read]);
+                    read_buf.drain(..to_read);
+                    return Poll::Ready(Ok(()));
+                }
+            }
+
+            // Buffer is empty, read from RIST (non-blocking with 0 timeout)
+            let mut block: *mut rist_sys::rist_data_block = ptr::null_mut();
+            let ret = unsafe { rist_sys::rist_receiver_data_read2(this.raw_ctx, &mut block, 0) };
+
+            if ret < 0 {
+                return Poll::Ready(Err(io::Error::other("read failed")));
+            }
+
+            if ret > 0 && !block.is_null() {
+                // Copy data from block
+                let data_block = DataBlock::from_raw(block);
+                let payload = data_block.payload();
+
+                let to_read = std::cmp::min(buf.remaining(), payload.len());
+                buf.put_slice(&payload[..to_read]);
+
+                // Store remaining data in buffer
+                if to_read < payload.len() {
+                    if let Ok(mut read_buf) = this.read_buf.lock() {
+                        read_buf.extend_from_slice(&payload[to_read..]);
+                    }
+                }
+
                 return Poll::Ready(Ok(()));
             }
-        }
 
-        // Buffer is empty, read from RIST (non-blocking with 0 timeout)
-        let mut block: *mut rist_sys::rist_data_block = ptr::null_mut();
-        let ret = unsafe { rist_sys::rist_receiver_data_read2(self.raw_ctx, &mut block, 0) };
-
-        if ret < 0 {
-            return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, "read failed")));
-        }
-
-        if ret == 0 || block.is_null() {
-            // No data available, would block
-            return Poll::Pending;
-        }
-
-        // Copy data from block
-        let data_block = DataBlock::from_raw(block);
-        let payload = data_block.payload();
-
-        let to_read = std::cmp::min(buf.remaining(), payload.len());
-        buf.put_slice(&payload[..to_read]);
-
-        // Store remaining data in buffer
-        if to_read < payload.len() {
-            if let Ok(mut read_buf) = self.read_buf.lock() {
-                read_buf.extend_from_slice(&payload[to_read..]);
+            match this.async_fd.poll_read_ready(cx) {
+                Poll::Ready(Ok(mut guard)) => {
+                    if let Err(err) = guard.get_inner().consume() {
+                        if err.kind() != io::ErrorKind::WouldBlock {
+                            return Poll::Ready(Err(io::Error::other(err)));
+                        }
+                    }
+                    guard.clear_ready();
+                }
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
             }
         }
-
-        Poll::Ready(Ok(()))
     }
 }

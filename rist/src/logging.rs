@@ -1,3 +1,5 @@
+use std::ptr;
+
 /// Log level for librist logging.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LogLevel {
@@ -27,7 +29,33 @@ impl LogLevel {
 }
 
 /// Set the global logging level for librist.
-pub fn set_logging(_level: LogLevel) -> crate::Result<()> {
-    // TODO: implement logging callback setup
+pub fn set_logging(level: LogLevel) -> crate::Result<()> {
+    unsafe {
+        if matches!(level, LogLevel::Disable) {
+            rist_sys::rist_logging_unset_global();
+            return Ok(());
+        }
+
+        let mut settings: *mut rist_sys::rist_logging_settings = ptr::null_mut();
+        let ret = rist_sys::rist_logging_set(
+            &mut settings,
+            level.to_raw(),
+            None,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+        );
+        if ret != 0 || settings.is_null() {
+            return Err(crate::Error::LoggingSetup);
+        }
+
+        let set_ret = rist_sys::rist_logging_set_global(settings);
+        let free_ret = rist_sys::rist_logging_settings_free2(&mut settings);
+
+        if set_ret != 0 || free_ret != 0 {
+            return Err(crate::Error::LoggingSetup);
+        }
+    }
+
     Ok(())
 }

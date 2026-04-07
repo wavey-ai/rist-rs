@@ -1,4 +1,4 @@
-use crate::{Error, Profile, Result};
+use crate::{Error, Profile, Result, SenderOptions};
 use std::ffi::CString;
 use std::ptr;
 
@@ -13,32 +13,41 @@ impl Sender {
     pub fn new(profile: Profile) -> Result<Self> {
         let mut ctx: *mut rist_sys::rist_ctx = ptr::null_mut();
 
-        let ret = unsafe { rist_sys::rist_sender_create(&mut ctx, profile.to_raw(), 0, ptr::null_mut()) };
+        let ret =
+            unsafe { rist_sys::rist_sender_create(&mut ctx, profile.to_raw(), 0, ptr::null_mut()) };
 
         if ret != 0 || ctx.is_null() {
             return Err(Error::ContextCreation);
         }
 
-        Ok(Self { ctx, started: false })
+        Ok(Self {
+            ctx,
+            started: false,
+        })
     }
 
     /// Add a peer by URL (e.g., "rist://192.168.1.1:5000").
     pub fn add_peer(&mut self, url: &str) -> Result<()> {
+        self.add_peer_with_options(url, &SenderOptions::default())
+    }
+
+    /// Add a peer by URL with custom sender options.
+    pub fn add_peer_with_options(&mut self, url: &str, options: &SenderOptions) -> Result<()> {
         let url_c = CString::new(url)?;
         let mut peer_config: *mut rist_sys::rist_peer_config = ptr::null_mut();
 
-        let ret = unsafe {
-            rist_sys::rist_parse_address2(url_c.as_ptr(), &mut peer_config)
-        };
+        let ret = unsafe { rist_sys::rist_parse_address2(url_c.as_ptr(), &mut peer_config) };
 
         if ret != 0 || peer_config.is_null() {
             return Err(Error::UrlParse(url.to_string()));
         }
 
+        unsafe {
+            options.apply_to_peer_config(&mut *peer_config);
+        }
+
         let mut peer: *mut rist_sys::rist_peer = ptr::null_mut();
-        let ret = unsafe {
-            rist_sys::rist_peer_create(self.ctx, &mut peer, peer_config)
-        };
+        let ret = unsafe { rist_sys::rist_peer_create(self.ctx, &mut peer, peer_config) };
 
         unsafe {
             rist_sys::rist_peer_config_free2(&mut peer_config);

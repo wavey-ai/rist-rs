@@ -109,4 +109,4 @@ This library follows the same patterns as [sportsball-ai/av-rs](https://github.c
 
 ## License
 
-MIT OR Apache-2.0
+MIT
