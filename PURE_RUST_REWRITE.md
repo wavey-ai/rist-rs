@@ -71,6 +71,8 @@ The first milestone has grown into a usable pure-Rust prototype:
 - Mio UDP transport for Simple and Main profiles, including packet loss recovery,
   NPD, RTCP echo RTT, Main Profile keepalive/buffer negotiation, and encrypted
   Main Profile recovery.
+- Main Profile sender restart regression coverage that repeatedly creates,
+  uses, drops, and recreates a sender while exercising a sustained send loop.
 - A `rist` crate `pure-rust` feature that exposes the Rust implementation under
   `rist::pure` while leaving the existing librist-backed API unchanged by
   default. `rist::pure::Sender` and `rist::pure::Receiver` now provide builder
@@ -89,5 +91,5 @@ The first milestone has grown into a usable pure-Rust prototype:
 
 ## Next Slices
 
-1. Build out the remaining upstream loss/mode matrix: Simple multicast and
-   sender restart behavior.
+1. Build out the remaining upstream loss/mode matrix: Simple multicast coverage
+   on non-Darwin hosts.

@@ -915,7 +915,7 @@ mod tests {
     use super::*;
     use rist_core::mpegts::{TS_NULL_PID, TS_PACKET_SIZE, TS_SYNC_BYTE};
     use rist_core::time::ntp_from_unix_duration;
-    use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket as StdUdpSocket};
     use std::thread;
     use std::time::Duration;
 
@@ -1232,6 +1232,30 @@ mod tests {
         assert_eq!(negotiation.receiver_current_buffer_ms, 250);
     }
 
+    #[test]
+    fn main_profile_sender_restart_keeps_send_loop_usable() {
+        let sink = StdUdpSocket::bind(loopback_any()).unwrap();
+        sink.set_nonblocking(true).unwrap();
+        let peer = sink.local_addr().unwrap();
+        let payload = ts_packet(0x0100, b"restart");
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+
+        for iteration in 0..5 {
+            let mut sender =
+                MainMioSender::connect(loopback_any(), peer, 0x1122_3344 + iteration, 64).unwrap();
+
+            for i in 0..1000 {
+                sender.send_payload(&payload, ntp, Instant::now()).unwrap();
+                if i % 50 == 0 {
+                    drain_udp_sink(&sink);
+                }
+            }
+
+            drop(sender);
+            drain_udp_sink(&sink);
+        }
+    }
+
     fn npd_payload() -> Vec<u8> {
         let mut payload = Vec::new();
         payload.extend_from_slice(&ts_packet(0x0100, b"first"));
@@ -1247,6 +1271,17 @@ mod tests {
         packet[3] = 0x10;
         packet[4..4 + label.len()].copy_from_slice(label);
         packet
+    }
+
+    fn drain_udp_sink(socket: &StdUdpSocket) {
+        let mut buf = [0u8; 2048];
+        loop {
+            match socket.recv_from(&mut buf) {
+                Ok(_) => {}
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return,
+                Err(err) => panic!("failed to drain UDP sink: {err}"),
+            }
+        }
     }
 
     fn recv_payload_eventually(
