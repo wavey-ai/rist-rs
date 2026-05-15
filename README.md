@@ -89,6 +89,15 @@ if let Some(stats) = sender.raw_stats() {
 }
 ```
 
+## Examples
+
+`examples/browser-tab-stream` contains a static browser UI that streams camera or local video frames from one tab to another and displays glass-to-glass latency. It uses `BroadcastChannel` for same-origin tab transport because ordinary browser pages cannot open UDP sockets or speak RIST directly.
+
+```sh
+cd examples/browser-tab-stream
+python3 -m http.server 8787 --bind 127.0.0.1
+```
+
 ## API Comparison with SRT
 
 This library follows the same patterns as [sportsball-ai/av-rs](https://github.com/sportsball-ai/av-rs/tree/main/srt) SRT bindings for API consistency:

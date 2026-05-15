@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>RIST Browser Tab Stream Demo</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="app">
+      <header class="topbar">
+        <div>
+          <h1>Browser Tab Stream</h1>
+          <p>Same-origin sender and receiver with live glass-to-glass latency.</p>
+        </div>
+        <div class="topbar-controls" aria-label="Session controls">
+          <label class="field">
+            <span>Room</span>
+            <input id="roomInput" value="rist-demo" autocomplete="off" spellcheck="false" />
+          </label>
+          <div class="segmented" role="group" aria-label="Role">
+            <button id="senderRole" class="active" type="button">Send</button>
+            <button id="receiverRole" type="button">Receive</button>
+          </div>
+        </div>
+      </header>
+
+      <section id="senderPanel" class="workspace" aria-labelledby="senderTitle">
+        <div class="surface video-surface">
+          <div class="surface-header">
+            <div>
+              <h2 id="senderTitle">Sender</h2>
+              <p id="senderStatus">Idle</p>
+            </div>
+            <span id="senderBadge" class="badge idle">idle</span>
+          </div>
+          <video id="sourceVideo" class="source-video" muted playsinline></video>
+          <canvas id="senderCanvas" class="stream-canvas" width="960" height="540"></canvas>
+        </div>
+
+        <aside class="surface control-surface">
+          <div class="surface-header compact">
+            <h2>Controls</h2>
+          </div>
+          <div class="button-grid">
+            <button id="cameraButton" type="button">Camera</button>
+            <button id="fileButton" type="button">File</button>
+            <button id="startButton" class="primary" type="button">Start</button>
+            <button id="stopButton" type="button" disabled>Stop</button>
+          </div>
+          <input id="fileInput" type="file" accept="video/*" hidden />
+
+          <label class="field full">
+            <span>Frame rate</span>
+            <select id="fpsSelect">
+              <option value="10">10 fps</option>
+              <option value="15" selected>15 fps</option>
+              <option value="24">24 fps</option>
+              <option value="30">30 fps</option>
+            </select>
+          </label>
+
+          <label class="field full">
+            <span>Quality</span>
+            <input id="qualityInput" type="range" min="35" max="92" value="72" />
+          </label>
+
+          <dl class="stats">
+            <div>
+              <dt>Frames sent</dt>
+              <dd id="sentFrames">0</dd>
+            </div>
+            <div>
+              <dt>Publish fps</dt>
+              <dd id="sendFps">0.0</dd>
+            </div>
+            <div>
+              <dt>Bitrate</dt>
+              <dd id="sendBitrate">0 kb/s</dd>
+            </div>
+            <div>
+              <dt>Receiver latency</dt>
+              <dd id="remoteLatency">n/a</dd>
+            </div>
+          </dl>
+        </aside>
+      </section>
+
+      <section id="receiverPanel" class="workspace hidden" aria-labelledby="receiverTitle">
+        <div class="surface video-surface">
+          <div class="surface-header">
+            <div>
+              <h2 id="receiverTitle">Receiver</h2>
+              <p id="receiverStatus">Waiting for frames</p>
+            </div>
+            <span id="receiverBadge" class="badge idle">waiting</span>
+          </div>
+          <canvas id="receiverCanvas" class="stream-canvas" width="960" height="540"></canvas>
+        </div>
+
+        <aside class="surface control-surface">
+          <div class="surface-header compact">
+            <h2>Latency</h2>
+          </div>
+          <dl class="stats">
+            <div>
+              <dt>Current</dt>
+              <dd id="latencyNow">n/a</dd>
+            </div>
+            <div>
+              <dt>Average</dt>
+              <dd id="latencyAvg">n/a</dd>
+            </div>
+            <div>
+              <dt>Min / max</dt>
+              <dd id="latencyMinMax">n/a</dd>
+            </div>
+            <div>
+              <dt>Receive fps</dt>
+              <dd id="receiveFps">0.0</dd>
+            </div>
+            <div>
+              <dt>Frames received</dt>
+              <dd id="receivedFrames">0</dd>
+            </div>
+            <div>
+              <dt>Dropped while decoding</dt>
+              <dd id="droppedFrames">0</dd>
+            </div>
+          </dl>
+        </aside>
+      </section>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
