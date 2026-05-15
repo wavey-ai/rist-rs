@@ -32,6 +32,9 @@ pub mod stats;
 #[cfg(feature = "tokio")]
 pub mod tokio;
 
+#[cfg(feature = "pure-rust")]
+pub mod pure;
+
 pub use error::Error;
 pub use logging::{set_logging, LogLevel};
 pub use options::{ReceiverOptions, RecoveryMode, SenderOptions};

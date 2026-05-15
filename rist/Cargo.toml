@@ -8,9 +8,12 @@ description = "Safe Rust bindings for librist (RIST protocol)"
 
 [features]
 default = []
+pure-rust = ["dep:rist-core", "dep:rist-mio"]
 tokio = ["dep:tokio", "dep:libc"]
 
 [dependencies]
+rist-core = { path = "../rist-core", optional = true }
+rist-mio = { path = "../rist-mio", optional = true }
 rist-sys = { path = "../rist-sys" }
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "io-util", "macros", "net"], optional = true }
