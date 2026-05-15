@@ -59,21 +59,22 @@ The first milestone has grown into a usable pure-Rust prototype:
 - A `rist` crate `pure-rust` feature that exposes the Rust implementation under
   `rist::pure` while leaving the existing librist-backed API unchanged by
   default.
-- An environment-gated `librist` interop harness for pure Rust Simple sender to
-  librist receiver.
+- An environment-gated bidirectional `librist` interop harness for Simple
+  Profile. It covers pure Rust sender to librist receiver and librist sender to
+  pure Rust receiver, including Simple Profile RTP/RTCP even-port pairing.
+- GitHub Actions CI that installs `librist-dev` and runs `RIST_INTEROP=1`
+  interop coverage.
 
 ## Next Slices
 
-1. Add Rust receiver against `librist` sender interop, then enable actual
-   `RIST_INTEROP=1` CI coverage on hosts with librist installed.
-2. Add automatic RTCP scheduling and receiver-report generation instead of only
+1. Add automatic RTCP scheduling and receiver-report generation instead of only
    explicit feedback construction.
-3. Encrypt keepalive and buffer-negotiation control packets in Main Profile.
-4. Replace deterministic PSK nonce construction in tests with production nonce
+2. Encrypt keepalive and buffer-negotiation control packets in Main Profile.
+3. Replace deterministic PSK nonce construction in tests with production nonce
    generation and key-rotation policy.
-5. Expand the `rist::pure` API from reexports into ergonomic sender/receiver
+4. Expand the `rist::pure` API from reexports into ergonomic sender/receiver
    builders that mirror the existing librist-backed API.
-6. Implement SRP/EAP authentication and passphrase rollover.
-7. Build out the remaining upstream loss/mode matrix: Simple multicast,
+5. Implement SRP/EAP authentication and passphrase rollover.
+6. Build out the remaining upstream loss/mode matrix: Simple multicast,
    Main server/client and client/server modes, AES mismatch failures, sender
    restart behavior, and SRP-enabled integration.

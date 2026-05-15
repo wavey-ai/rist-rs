@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install librist
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang librist-dev pkg-config
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Test workspace
+        run: cargo test --workspace
+      - name: Test librist interop
+        run: RIST_INTEROP=1 cargo test -p rist-mio --test librist_interop -- --test-threads=1

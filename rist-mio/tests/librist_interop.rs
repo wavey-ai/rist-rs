@@ -1,17 +1,44 @@
 #![forbid(unsafe_code)]
 
+use rist_core::packet::rtcp::{
+    encode_echo, encode_empty_receiver_report, encode_sdes_cname, Echo, EchoKind, NackMode,
+};
 use rist_core::time::ntp_now;
-use rist_mio::SimpleMioSender;
+use rist_mio::{SimpleMioReceiver, SimpleMioSender};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
+use std::sync::Mutex;
+use std::thread;
 use std::time::{Duration, Instant};
+
+static INTEROP_MUTEX: Mutex<()> = Mutex::new(());
 
 fn loopback_any() -> SocketAddr {
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
 }
 
-fn next_test_port() -> u16 {
-    let socket = UdpSocket::bind(loopback_any()).expect("failed to allocate UDP port");
-    socket.local_addr().unwrap().port()
+fn next_even_test_port_pair() -> u16 {
+    for _ in 0..128 {
+        let socket = UdpSocket::bind(loopback_any()).expect("failed to allocate UDP port");
+        let port = socket.local_addr().unwrap().port();
+        drop(socket);
+
+        let base = if port % 2 == 0 {
+            port
+        } else {
+            port.saturating_add(1)
+        };
+        if base == u16::MAX {
+            continue;
+        }
+
+        let rtp_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, base));
+        let rtcp_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, base + 1));
+        if let (Ok(_rtp), Ok(_rtcp)) = (UdpSocket::bind(rtp_addr), UdpSocket::bind(rtcp_addr)) {
+            return base;
+        }
+    }
+
+    panic!("failed to allocate even UDP port pair");
 }
 
 fn interop_enabled() -> bool {
@@ -23,23 +50,33 @@ fn pure_rust_simple_sender_to_librist_receiver() {
     if !interop_enabled() {
         return;
     }
+    let _guard = INTEROP_MUTEX.lock().unwrap();
 
-    let port = next_test_port();
+    let port = next_even_test_port_pair();
     let receiver_url = format!("rist://@127.0.0.1:{port}");
     let receiver_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+    let receiver_rtcp_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port + 1));
 
     let mut receiver = rist::Receiver::new(rist::Profile::Simple).unwrap();
     receiver.add_peer(&receiver_url).unwrap();
     receiver.start().unwrap();
 
-    let mut sender =
-        SimpleMioSender::connect(loopback_any(), receiver_addr, 0x1122_3344, 64).unwrap();
-    let payload = mpegts_payload("PURE RUST TO LIBRIST");
-    sender
-        .send_payload(&payload, ntp_now(), Instant::now())
-        .unwrap();
+    let sender_port = next_even_test_port_pair();
+    let sender_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, sender_port));
+    let sender_rtcp_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, sender_port + 1));
+    let rtcp_socket = UdpSocket::bind(sender_rtcp_addr).unwrap();
+    let mut sender = SimpleMioSender::connect(sender_addr, receiver_addr, 0x1122_3344, 64).unwrap();
+    let payload = mpegts_payload_7("PURE RUST TO LIBRIST");
+    send_simple_rtcp_probe(&rtcp_socket, receiver_rtcp_addr, 0x1122_3344);
+    thread::sleep(Duration::from_millis(20));
+    for sequence in 1..=20 {
+        let packet =
+            sender.build_payload_with_sequence(sequence, &payload, ntp_now(), Instant::now());
+        sender.send_outbound(&packet).unwrap();
+        thread::sleep(Duration::from_millis(10));
+    }
 
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if let Some(block) = receiver.read(Duration::from_millis(50)).unwrap() {
             assert!(block.payload().starts_with(&[0x47]));
@@ -56,6 +93,68 @@ fn pure_rust_simple_sender_to_librist_receiver() {
     }
 }
 
+fn send_simple_rtcp_probe(socket: &UdpSocket, peer: SocketAddr, ssrc: u32) {
+    let mut packet = Vec::new();
+    encode_empty_receiver_report(ssrc, &mut packet);
+    encode_sdes_cname(ssrc, "rust", &mut packet);
+    encode_echo(
+        Echo {
+            ssrc,
+            ntp_timestamp: ntp_now(),
+            kind: EchoKind::Request,
+        },
+        &mut packet,
+    );
+    socket.send_to(&packet, peer).unwrap();
+}
+
+#[test]
+fn librist_simple_sender_to_pure_rust_receiver() {
+    if !interop_enabled() {
+        return;
+    }
+    let _guard = INTEROP_MUTEX.lock().unwrap();
+
+    let flow_id = 0x1122_3344;
+    let receiver_port = next_even_test_port_pair();
+    let receiver_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, receiver_port));
+    let receiver_rtcp_addr =
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, receiver_port + 1));
+    let _rtcp_sink = UdpSocket::bind(receiver_rtcp_addr).unwrap();
+    let mut receiver =
+        SimpleMioReceiver::bind(receiver_addr, flow_id, "rust", NackMode::Range).unwrap();
+    let receiver_addr = receiver.local_addr().unwrap();
+    let sender_url = format!("rist://127.0.0.1:{}", receiver_addr.port());
+
+    let mut sender = rist::Sender::new(rist::Profile::Simple).unwrap();
+    sender.add_peer(&sender_url).unwrap();
+    sender.start().unwrap();
+
+    let payload = mpegts_payload("LIBRIST TO PURE RUST");
+    for _ in 0..5 {
+        sender.send(&payload).unwrap();
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let mut buf = [0; 1500];
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some((_from, received)) = receiver.try_recv_payload(&mut buf).unwrap() {
+            assert!(received.payload.starts_with(&[0x47]));
+            assert!(received
+                .payload
+                .windows(b"LIBRIST TO PURE RUST".len())
+                .any(|window| window == b"LIBRIST TO PURE RUST"));
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for pure Rust receiver"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
 fn mpegts_payload(label: &str) -> [u8; 188] {
     let mut payload = [0xff; 188];
     payload[0] = 0x47;
@@ -64,5 +163,14 @@ fn mpegts_payload(label: &str) -> [u8; 188] {
     payload[3] = 0x10;
     let bytes = label.as_bytes();
     payload[4..4 + bytes.len()].copy_from_slice(bytes);
+    payload
+}
+
+fn mpegts_payload_7(label: &str) -> [u8; 1316] {
+    let packet = mpegts_payload(label);
+    let mut payload = [0xff; 1316];
+    for chunk in payload.chunks_exact_mut(188) {
+        chunk.copy_from_slice(&packet);
+    }
     payload
 }

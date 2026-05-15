@@ -159,6 +159,17 @@ impl SimpleMioSender {
         self.core.send_payload(payload, ntp_timestamp, now)
     }
 
+    pub fn build_payload_with_sequence(
+        &mut self,
+        sequence: u32,
+        payload: &[u8],
+        ntp_timestamp: u64,
+        now: Instant,
+    ) -> OutboundPacket {
+        self.core
+            .send_payload_with_sequence(sequence, payload, ntp_timestamp, now)
+    }
+
     pub fn enable_null_packet_suppression(&mut self) {
         self.core.enable_null_packet_suppression();
     }
