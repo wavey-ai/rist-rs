@@ -28,7 +28,9 @@ pub use mpegts::{expand_null_packets, suppress_null_packets, NullPacketSuppressi
 pub use profile::Profile;
 pub use recovery::{MissingTracker, ReceiverObservation, SenderHistory};
 pub use sequence::SequenceExtender;
-pub use simple::{OutboundPacket, ReceivedPayload, SimpleReceiverCore, SimpleSenderCore};
+pub use simple::{
+    OutboundPacket, ReceivedPayload, RtcpIntervals, SimpleReceiverCore, SimpleSenderCore,
+};
 pub use stats::{ReceiverStats, SenderStats};
 
 pub type Result<T> = std::result::Result<T, Error>;

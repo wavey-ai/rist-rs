@@ -129,6 +129,11 @@ impl MainSenderCore {
             .collect())
     }
 
+    pub fn poll_rtcp(&mut self, now: Instant, ntp_timestamp: u64) -> Option<MainControlPacket> {
+        let packet = self.simple.poll_rtcp(now, ntp_timestamp)?;
+        Some(self.wrap_control_payload(&packet))
+    }
+
     pub fn build_keepalive(&mut self, keepalive: GreKeepalive<'_>) -> MainControlPacket {
         let gre_sequence = self.next_gre_sequence();
         MainControlPacket {
@@ -189,6 +194,23 @@ impl MainSenderCore {
             rtp_sequence,
             gre_sequence,
             retry,
+            bytes,
+        }
+    }
+
+    fn wrap_control_payload(&mut self, payload: &[u8]) -> MainControlPacket {
+        let gre_sequence = self.next_gre_sequence();
+        let reduced = ReducedHeader {
+            src_port: self.virt_src_port,
+            dst_port: self.virt_dst_port,
+        };
+        let bytes = if let Some(key) = &mut self.tx_key {
+            encode_encrypted_reduced_payload(self.gre_version, gre_sequence, reduced, payload, key)
+        } else {
+            encode_reduced_payload(self.gre_version, gre_sequence, reduced, payload)
+        };
+        MainControlPacket {
+            gre_sequence,
             bytes,
         }
     }
@@ -271,6 +293,30 @@ impl MainReceiverCore {
     }
 
     pub fn build_feedback(&mut self) -> MainReceiverFeedback {
+        let feedback = self.simple.build_feedback_and_record();
+        self.wrap_feedback_payload(&feedback)
+    }
+
+    pub fn poll_rtcp(&mut self, now: Instant, now_ntp: u64) -> Option<MainReceiverFeedback> {
+        let packet = self.simple.poll_rtcp(now, now_ntp)?;
+        Some(self.wrap_feedback_payload(&packet))
+    }
+
+    pub fn handle_rtcp(
+        &mut self,
+        packet: &[u8],
+        now_ntp: u64,
+    ) -> Result<Vec<MainReceiverFeedback>> {
+        let packet = self.decode_reduced(packet)?;
+        self.last_reduced = Some(packet.reduced());
+        let responses = self.simple.handle_rtcp_at(packet.payload(), now_ntp)?;
+        Ok(responses
+            .into_iter()
+            .map(|response| self.wrap_feedback_payload(&response))
+            .collect())
+    }
+
+    fn wrap_feedback_payload(&mut self, feedback: &[u8]) -> MainReceiverFeedback {
         let gre_sequence = self.next_gre_sequence();
         let reduced = self
             .last_reduced
@@ -282,7 +328,6 @@ impl MainReceiverCore {
                 src_port: DEFAULT_VIRT_DST_PORT,
                 dst_port: DEFAULT_VIRT_SRC_PORT,
             });
-        let feedback = self.simple.build_feedback_and_record();
         let bytes = if let Some(key) = &mut self.tx_key {
             encode_encrypted_reduced_payload(
                 self.gre_version,
@@ -387,8 +432,9 @@ mod tests {
         BufferNegotiationPacket, KeepalivePacket, GRE_PROTOCOL_TYPE_VSF,
         KEEPALIVE_CAP1_NULL_PACKET_DELETION, KEEPALIVE_CAP2_REDUCED_OVERHEAD,
     };
+    use crate::packet::rtcp::{decode_compound, Echo, EchoKind, RtcpPacket, SenderReport};
     use crate::packet::rtp::RtpPacket;
-    use crate::time::ntp_from_unix_duration;
+    use crate::time::{mpegts_rtp_timestamp, ntp_from_unix_duration};
     use std::time::Duration;
 
     #[test]
@@ -491,6 +537,42 @@ mod tests {
         assert_eq!(
             decoded_negotiation.negotiation.receiver_current_buffer_ms,
             250
+        );
+    }
+
+    #[test]
+    fn sender_polls_scheduled_rtcp_over_reduced_gre() {
+        let now = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut sender = MainSenderCore::new(0x1122_3344, 64);
+
+        assert_eq!(sender.poll_rtcp(now, ntp), None);
+        let control = sender.poll_rtcp(now + Duration::from_secs(1), ntp).unwrap();
+
+        assert_eq!(control.gre_sequence, 0);
+        let reduced = ReducedPacket::decode(&control.bytes).unwrap();
+        assert_eq!(reduced.reduced.src_port, DEFAULT_VIRT_SRC_PORT);
+        assert_eq!(reduced.reduced.dst_port, DEFAULT_VIRT_DST_PORT);
+        assert_eq!(
+            decode_compound(reduced.payload).unwrap(),
+            vec![
+                RtcpPacket::SenderReport(SenderReport {
+                    ssrc: 0x1122_3344,
+                    ntp_timestamp: ntp,
+                    rtp_timestamp: mpegts_rtp_timestamp(ntp),
+                    sender_packets: 0,
+                    sender_bytes: 0,
+                }),
+                RtcpPacket::SourceDescription {
+                    ssrc: 0x1122_3344,
+                    cname: "rust".to_string(),
+                },
+                RtcpPacket::Echo(Echo {
+                    ssrc: 0x1122_3344,
+                    ntp_timestamp: ntp,
+                    kind: EchoKind::Request,
+                }),
+            ]
         );
     }
 

@@ -39,6 +39,8 @@ The first milestone has grown into a usable pure-Rust prototype:
 - RTCP sender reports, receiver reports, SDES CNAME, echo request/response,
   range NACKs, bitmask NACKs, seq-ext NACK context, and compound feedback
   decoding.
+- Automatic RTCP polling for sender reports, receiver reports, echo requests,
+  and NACK feedback in the pure Rust cores, with Mio helpers to send due RTCP.
 - GRE reduced-header encode/decode for Main Profile v1 and v2 VSF wrapping.
 - GRE keepalive and buffer-negotiation packet encode/decode.
 - PSK crypto primitives matching librist's PBKDF2-HMAC-SHA256 + AES-CTR
@@ -67,14 +69,12 @@ The first milestone has grown into a usable pure-Rust prototype:
 
 ## Next Slices
 
-1. Add automatic RTCP scheduling and receiver-report generation instead of only
-   explicit feedback construction.
-2. Encrypt keepalive and buffer-negotiation control packets in Main Profile.
-3. Replace deterministic PSK nonce construction in tests with production nonce
+1. Encrypt keepalive and buffer-negotiation control packets in Main Profile.
+2. Replace deterministic PSK nonce construction in tests with production nonce
    generation and key-rotation policy.
-4. Expand the `rist::pure` API from reexports into ergonomic sender/receiver
+3. Expand the `rist::pure` API from reexports into ergonomic sender/receiver
    builders that mirror the existing librist-backed API.
-5. Implement SRP/EAP authentication and passphrase rollover.
-6. Build out the remaining upstream loss/mode matrix: Simple multicast,
+4. Implement SRP/EAP authentication and passphrase rollover.
+5. Build out the remaining upstream loss/mode matrix: Simple multicast,
    Main server/client and client/server modes, AES mismatch failures, sender
    restart behavior, and SRP-enabled integration.

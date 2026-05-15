@@ -14,8 +14,8 @@ use rist_core::packet::gre::{
 use rist_core::packet::rtp::{encode_packet, RtpHeader, RtpPacket};
 use rist_core::{
     packet::rtcp::NackMode, MainControlPacket, MainOutboundPacket, MainReceiverCore,
-    MainSenderCore, OutboundPacket, ReceivedPayload, ReceiverStats, SenderStats,
-    SimpleReceiverCore, SimpleSenderCore,
+    MainReceiverFeedback, MainSenderCore, OutboundPacket, ReceivedPayload, ReceiverStats,
+    SenderStats, SimpleReceiverCore, SimpleSenderCore,
 };
 use std::io;
 use std::net::SocketAddr;
@@ -210,6 +210,17 @@ impl SimpleMioSender {
         self.send_rtcp(&packet)
     }
 
+    pub fn poll_rtcp_and_send(
+        &mut self,
+        now: Instant,
+        ntp_timestamp: u64,
+    ) -> io::Result<Option<usize>> {
+        let Some(packet) = self.core.poll_rtcp(now, ntp_timestamp) else {
+            return Ok(None);
+        };
+        self.send_rtcp(&packet).map(Some)
+    }
+
     pub fn try_recv_feedback_and_retransmit(
         &mut self,
         buf: &mut [u8],
@@ -300,6 +311,20 @@ impl SimpleMioReceiver {
 
     pub fn feedback_packet(&mut self) -> Vec<u8> {
         self.core.build_feedback_and_record()
+    }
+
+    pub fn poll_rtcp_packet(&mut self, now: Instant, now_ntp: u64) -> Option<Vec<u8>> {
+        self.core.poll_rtcp(now, now_ntp)
+    }
+
+    pub fn poll_rtcp_and_send(&mut self, now: Instant, now_ntp: u64) -> io::Result<Option<usize>> {
+        let Some(peer) = self.last_peer else {
+            return Ok(None);
+        };
+        let Some(packet) = self.poll_rtcp_packet(now, now_ntp) else {
+            return Ok(None);
+        };
+        self.socket.send_packet_to(peer, &packet).map(Some)
     }
 
     pub fn send_feedback(&mut self) -> io::Result<Option<usize>> {
@@ -403,6 +428,18 @@ impl MainMioSender {
         let packet = self.build_payload(payload, ntp_timestamp, now);
         self.send_outbound(&packet)?;
         Ok(packet)
+    }
+
+    pub fn poll_rtcp_and_send(
+        &mut self,
+        now: Instant,
+        ntp_timestamp: u64,
+    ) -> io::Result<Option<MainControlPacket>> {
+        let Some(packet) = self.core.poll_rtcp(now, ntp_timestamp) else {
+            return Ok(None);
+        };
+        self.socket.send_packet(&packet.bytes)?;
+        Ok(Some(packet))
     }
 
     pub fn build_keepalive(&mut self, keepalive: GreKeepalive<'_>) -> MainControlPacket {
@@ -531,6 +568,40 @@ impl MainMioReceiver {
     pub fn send_feedback_to(&mut self, peer: SocketAddr) -> io::Result<usize> {
         let feedback = self.core.build_feedback();
         self.socket.send_packet_to(peer, &feedback.bytes)
+    }
+
+    pub fn poll_rtcp_and_send(
+        &mut self,
+        now: Instant,
+        now_ntp: u64,
+    ) -> io::Result<Option<MainReceiverFeedback>> {
+        let Some(peer) = self.last_peer else {
+            return Ok(None);
+        };
+        let Some(packet) = self.core.poll_rtcp(now, now_ntp) else {
+            return Ok(None);
+        };
+        self.socket.send_packet_to(peer, &packet.bytes)?;
+        Ok(Some(packet))
+    }
+
+    pub fn try_recv_rtcp_and_respond(
+        &mut self,
+        buf: &mut [u8],
+        now_ntp: u64,
+    ) -> io::Result<Option<usize>> {
+        let Some((from, packet)) = self.socket.recv_datagram(buf)? else {
+            return Ok(None);
+        };
+        let responses = self
+            .core
+            .handle_rtcp(packet, now_ntp)
+            .map_err(core_to_io_error)?;
+        for response in &responses {
+            self.socket.send_packet_to(from, &response.bytes)?;
+        }
+        self.last_peer = Some(from);
+        Ok(Some(responses.len()))
     }
 
     pub fn send_keepalive_to(
