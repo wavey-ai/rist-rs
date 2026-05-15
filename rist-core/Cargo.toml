@@ -9,6 +9,7 @@ description = "Pure Rust protocol primitives for RIST"
 [dependencies]
 aes = "0.8"
 ctr = "0.9"
+getrandom = "0.2"
 pbkdf2 = "0.12"
 sha2 = "0.10"
 thiserror = "2"

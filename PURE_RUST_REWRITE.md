@@ -46,6 +46,9 @@ The first milestone has grown into a usable pure-Rust prototype:
 - PSK crypto primitives matching librist's PBKDF2-HMAC-SHA256 + AES-CTR
   approach, with encrypted Main Profile reduced packets, feedback packets,
   keepalives, and buffer-negotiation packets.
+- Production PSK transmit keys generate nonces from OS randomness and rotate
+  nonce/key material after a configurable packet count. Deterministic nonces are
+  confined to known-vector tests.
 - RIST URL parsing for listen/client addresses and common recovery/crypto query
   options.
 - Sequence extension and missing-packet tracking.
@@ -70,11 +73,9 @@ The first milestone has grown into a usable pure-Rust prototype:
 
 ## Next Slices
 
-1. Replace deterministic PSK nonce construction in tests with production nonce
-   generation and key-rotation policy.
-2. Expand the `rist::pure` API from reexports into ergonomic sender/receiver
+1. Expand the `rist::pure` API from reexports into ergonomic sender/receiver
    builders that mirror the existing librist-backed API.
-3. Implement SRP/EAP authentication and passphrase rollover.
-4. Build out the remaining upstream loss/mode matrix: Simple multicast,
+2. Implement SRP/EAP authentication and passphrase rollover.
+3. Build out the remaining upstream loss/mode matrix: Simple multicast,
    Main server/client and client/server modes, AES mismatch failures, sender
    restart behavior, and SRP-enabled integration.

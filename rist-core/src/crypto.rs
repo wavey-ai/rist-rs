@@ -6,6 +6,7 @@ use sha2::Sha256;
 
 pub const PBKDF2_HMAC_SHA256_ITERATIONS: u32 = 1024;
 pub const AES_BLOCK_SIZE: usize = 16;
+pub const DEFAULT_KEY_ROTATION_PACKETS: u64 = 1_000_000;
 
 type Aes128Ctr = ctr::Ctr128BE<Aes128>;
 type Aes192Ctr = ctr::Ctr128BE<Aes192>;
@@ -52,7 +53,25 @@ pub struct PskKey {
 }
 
 impl PskKey {
-    pub fn new(
+    pub fn new(key_size_bits: u32, password: impl AsRef<[u8]>) -> Result<Self> {
+        Self::with_key_rotation(key_size_bits, DEFAULT_KEY_ROTATION_PACKETS, password)
+    }
+
+    pub fn with_key_rotation(
+        key_size_bits: u32,
+        key_rotation: u64,
+        password: impl AsRef<[u8]>,
+    ) -> Result<Self> {
+        let mut nonce = [0; 4];
+        getrandom::getrandom(&mut nonce).map_err(|_| Error::RandomNonce)?;
+        Self::from_nonce(key_size_bits, key_rotation, password, nonce)
+    }
+
+    pub fn receiver(key_size_bits: u32, password: impl AsRef<[u8]>) -> Result<Self> {
+        Self::from_nonce(key_size_bits, 0, password, [0; 4])
+    }
+
+    pub fn from_nonce(
         key_size_bits: u32,
         key_rotation: u64,
         password: impl AsRef<[u8]>,
@@ -104,6 +123,7 @@ impl PskKey {
 
     fn crypt(&mut self, gre_version: u8, sequence: u32, input: &[u8]) -> Vec<u8> {
         if self.key_rotation > 0 && self.used_times >= self.key_rotation {
+            self.advance_nonce();
             self.aes_key = derive_aes_key(self.key_size, &self.password, &self.nonce);
             self.used_times = 0;
         }
@@ -126,6 +146,14 @@ impl PskKey {
         }
         self.used_times += 1;
         out
+    }
+
+    fn advance_nonce(&mut self) {
+        let mut value = u32::from_be_bytes(self.nonce).wrapping_add(1);
+        if value == 0 {
+            value = 1;
+        }
+        self.nonce = value.to_be_bytes();
     }
 }
 
@@ -156,12 +184,24 @@ mod tests {
 
     #[test]
     fn aes_ctr_round_trips_payload() {
-        let mut tx = PskKey::new(256, 0, b"secret", [1, 2, 3, 4]).unwrap();
-        let mut rx = PskKey::new(256, 0, b"secret", [0, 0, 0, 0]).unwrap();
+        let mut tx = PskKey::from_nonce(256, 0, b"secret", [1, 2, 3, 4]).unwrap();
+        let mut rx = PskKey::receiver(256, b"secret").unwrap();
         let encrypted = tx.encrypt(2, 42, b"payload");
         assert_ne!(encrypted, b"payload");
         let decrypted = rx.decrypt([1, 2, 3, 4], 2, 42, &encrypted);
         assert_eq!(decrypted, b"payload");
+    }
+
+    #[test]
+    fn tx_key_rotates_nonce_after_configured_uses() {
+        let mut tx = PskKey::from_nonce(256, 2, b"secret", [1, 2, 3, 4]).unwrap();
+        assert_eq!(tx.nonce(), [1, 2, 3, 4]);
+        tx.encrypt(2, 0, b"first");
+        assert_eq!(tx.nonce(), [1, 2, 3, 4]);
+        tx.encrypt(2, 1, b"second");
+        assert_eq!(tx.nonce(), [1, 2, 3, 4]);
+        tx.encrypt(2, 2, b"third");
+        assert_eq!(tx.nonce(), [1, 2, 3, 5]);
     }
 
     #[test]

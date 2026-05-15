@@ -644,15 +644,15 @@ mod tests {
 
     #[test]
     fn main_profile_encrypts_and_decrypts_control_packets() {
-        let sender_tx = PskKey::new(256, 0, b"secret", [1, 2, 3, 4]).unwrap();
-        let receiver_rx = PskKey::new(256, 0, b"secret", [0, 0, 0, 0]).unwrap();
+        let sender_tx = PskKey::new(256, b"secret").unwrap();
+        let receiver_rx = PskKey::receiver(256, b"secret").unwrap();
         let mut sender = MainSenderCore::new(0x1122_3344, 64).with_tx_key(sender_tx);
         let mut receiver =
             MainReceiverCore::new(0x1122_3344, "rust", NackMode::Range).with_rx_key(receiver_rx);
 
         let keepalive = sender.build_keepalive(GreKeepalive::librist_default([1, 2, 3, 4, 5, 6]));
         let keepalive_header = GreHeader::decode(&keepalive.bytes).unwrap().0;
-        assert_eq!(keepalive_header.key, Some(0x0102_0304));
+        assert!(keepalive_header.key.is_some());
         assert!(KeepalivePacket::decode(&keepalive.bytes).is_err());
         let keepalive = receiver.accept_keepalive(&keepalive.bytes).unwrap();
         assert_eq!(keepalive.keepalive.mac, [1, 2, 3, 4, 5, 6]);
@@ -660,7 +660,7 @@ mod tests {
 
         let negotiation = sender.build_buffer_negotiation(BufferNegotiation::session(1000, 250));
         let negotiation_header = GreHeader::decode(&negotiation.bytes).unwrap().0;
-        assert_eq!(negotiation_header.key, Some(0x0102_0304));
+        assert!(negotiation_header.key.is_some());
         assert!(BufferNegotiationPacket::decode(&negotiation.bytes).is_err());
         let negotiation = receiver
             .accept_buffer_negotiation(&negotiation.bytes)
@@ -673,14 +673,14 @@ mod tests {
     fn main_profile_encrypts_and_decrypts_payload() {
         let now = Instant::now();
         let ntp = ntp_from_unix_duration(Duration::from_secs(1));
-        let tx_key = PskKey::new(256, 0, b"secret", [1, 2, 3, 4]).unwrap();
-        let rx_key = PskKey::new(256, 0, b"secret", [0, 0, 0, 0]).unwrap();
+        let tx_key = PskKey::new(256, b"secret").unwrap();
+        let rx_key = PskKey::receiver(256, b"secret").unwrap();
         let mut sender = MainSenderCore::new(0x1122_3344, 64).with_tx_key(tx_key);
         let mut receiver =
             MainReceiverCore::new(0x1122_3344, "rust", NackMode::Range).with_rx_key(rx_key);
 
         let packet = sender.send_payload(b"payload", ntp, now);
-        assert_eq!(&packet.bytes[..4], &[0x30, 0x50, 0xcc, 0xe0]);
+        assert!(GreHeader::decode(&packet.bytes).unwrap().0.key.is_some());
         assert!(ReducedPacket::decode(&packet.bytes).is_err());
 
         let received = receiver.accept_packet(&packet.bytes).unwrap();
@@ -691,10 +691,10 @@ mod tests {
     fn main_profile_recovers_over_encrypted_feedback() {
         let now = Instant::now();
         let ntp = ntp_from_unix_duration(Duration::from_secs(1));
-        let sender_tx = PskKey::new(256, 0, b"secret", [1, 2, 3, 4]).unwrap();
-        let sender_rx = PskKey::new(256, 0, b"secret", [0, 0, 0, 0]).unwrap();
-        let receiver_tx = PskKey::new(256, 0, b"secret", [5, 6, 7, 8]).unwrap();
-        let receiver_rx = PskKey::new(256, 0, b"secret", [0, 0, 0, 0]).unwrap();
+        let sender_tx = PskKey::new(256, b"secret").unwrap();
+        let sender_rx = PskKey::receiver(256, b"secret").unwrap();
+        let receiver_tx = PskKey::new(256, b"secret").unwrap();
+        let receiver_rx = PskKey::receiver(256, b"secret").unwrap();
         let mut sender = MainSenderCore::new(0x1122_3344, 64)
             .with_tx_key(sender_tx)
             .with_rx_key(sender_rx);

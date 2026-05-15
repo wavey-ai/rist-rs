@@ -848,8 +848,8 @@ mod tests {
 
     #[test]
     fn encrypted_reduced_packet_round_trips() {
-        let mut tx_key = PskKey::new(256, 0, b"secret", [1, 2, 3, 4]).unwrap();
-        let mut rx_key = PskKey::new(256, 0, b"secret", [0, 0, 0, 0]).unwrap();
+        let mut tx_key = PskKey::from_nonce(256, 0, b"secret", [1, 2, 3, 4]).unwrap();
+        let mut rx_key = PskKey::receiver(256, b"secret").unwrap();
         let packet = encode_encrypted_reduced_payload(
             2,
             42,
@@ -880,8 +880,8 @@ mod tests {
 
     #[test]
     fn encrypted_keepalive_packet_round_trips() {
-        let mut tx_key = PskKey::new(256, 0, b"secret", [1, 2, 3, 4]).unwrap();
-        let mut rx_key = PskKey::new(256, 0, b"secret", [0, 0, 0, 0]).unwrap();
+        let mut tx_key = PskKey::from_nonce(256, 0, b"secret", [1, 2, 3, 4]).unwrap();
+        let mut rx_key = PskKey::receiver(256, b"secret").unwrap();
         let keepalive = GreKeepalive {
             mac: [1, 2, 3, 4, 5, 6],
             capabilities1: KEEPALIVE_CAP1_NULL_PACKET_DELETION,
@@ -906,8 +906,8 @@ mod tests {
 
     #[test]
     fn encrypted_buffer_negotiation_packet_round_trips() {
-        let mut tx_key = PskKey::new(128, 0, b"secret", [5, 6, 7, 8]).unwrap();
-        let mut rx_key = PskKey::new(128, 0, b"secret", [0, 0, 0, 0]).unwrap();
+        let mut tx_key = PskKey::from_nonce(128, 0, b"secret", [5, 6, 7, 8]).unwrap();
+        let mut rx_key = PskKey::receiver(128, b"secret").unwrap();
         let negotiation = BufferNegotiation {
             sender_max_buffer_ms: 1000,
             receiver_current_buffer_ms: 250,

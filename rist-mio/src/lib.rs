@@ -825,13 +825,13 @@ mod tests {
         let ntp = ntp_from_unix_duration(Duration::from_secs(1));
         let mut receiver =
             MainMioReceiver::bind(loopback_any(), flow_id, "rust", NackMode::Range).unwrap();
-        receiver.set_tx_key(PskKey::new(256, 0, b"secret", [5, 6, 7, 8]).unwrap());
-        receiver.set_rx_key(PskKey::new(256, 0, b"secret", [0, 0, 0, 0]).unwrap());
+        receiver.set_tx_key(PskKey::new(256, b"secret").unwrap());
+        receiver.set_rx_key(PskKey::receiver(256, b"secret").unwrap());
         let receiver_addr = receiver.local_addr().unwrap();
         let mut sender =
             MainMioSender::connect(loopback_any(), receiver_addr, flow_id, 64).unwrap();
-        sender.set_tx_key(PskKey::new(256, 0, b"secret", [1, 2, 3, 4]).unwrap());
-        sender.set_rx_key(PskKey::new(256, 0, b"secret", [0, 0, 0, 0]).unwrap());
+        sender.set_tx_key(PskKey::new(256, b"secret").unwrap());
+        sender.set_rx_key(PskKey::receiver(256, b"secret").unwrap());
         let sender_addr = sender.local_addr().unwrap();
 
         let first = sender.build_payload(b"first", ntp, now);
@@ -929,16 +929,16 @@ mod tests {
         let flow_id = 0x1122_3344;
         let mut receiver =
             MainMioReceiver::bind(loopback_any(), flow_id, "rust", NackMode::Range).unwrap();
-        receiver.set_rx_key(PskKey::new(256, 0, b"secret", [0, 0, 0, 0]).unwrap());
+        receiver.set_rx_key(PskKey::receiver(256, b"secret").unwrap());
         let receiver_addr = receiver.local_addr().unwrap();
         let mut sender =
             MainMioSender::connect(loopback_any(), receiver_addr, flow_id, 64).unwrap();
-        sender.set_tx_key(PskKey::new(256, 0, b"secret", [1, 2, 3, 4]).unwrap());
+        sender.set_tx_key(PskKey::new(256, b"secret").unwrap());
 
         let sent = sender
             .send_keepalive(GreKeepalive::librist_default([1, 2, 3, 4, 5, 6]))
             .unwrap();
-        assert_eq!(&sent.bytes[..8], &[0x30, 0x50, 0xcc, 0xe0, 1, 2, 3, 4]);
+        assert_eq!(&sent.bytes[..4], &[0x30, 0x50, 0xcc, 0xe0]);
 
         let mut rx_buf = [0u8; 1500];
         let keepalive = recv_keepalive_eventually(&mut receiver, &mut rx_buf);
@@ -948,7 +948,7 @@ mod tests {
         let sent = sender
             .send_buffer_negotiation(BufferNegotiation::session(1000, 250))
             .unwrap();
-        assert_eq!(&sent.bytes[..8], &[0x30, 0x50, 0xcc, 0xe0, 1, 2, 3, 4]);
+        assert_eq!(&sent.bytes[..4], &[0x30, 0x50, 0xcc, 0xe0]);
 
         let negotiation = recv_buffer_negotiation_eventually(&mut receiver, &mut rx_buf);
         assert_eq!(negotiation.sequence, Some(1));

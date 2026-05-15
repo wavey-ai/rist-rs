@@ -26,6 +26,9 @@ pub enum Error {
     #[error("unsupported AES key size {0}")]
     UnsupportedAesKeySize(u16),
 
+    #[error("failed to generate PSK nonce")]
+    RandomNonce,
+
     #[error("unsupported GRE protocol type 0x{0:04x}")]
     UnsupportedGreProtocol(u16),
 
