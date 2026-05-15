@@ -71,6 +71,8 @@ The first milestone has grown into a usable pure-Rust prototype:
 - Mio UDP transport for Simple and Main profiles, including packet loss recovery,
   NPD, RTCP echo RTT, Main Profile keepalive/buffer negotiation, and encrypted
   Main Profile recovery.
+- Mio multicast socket controls, plus non-Darwin Simple Profile multicast
+  coverage matching the upstream platform constraint.
 - Main Profile sender restart regression coverage that repeatedly creates,
   uses, drops, and recreates a sender while exercising a sustained send loop.
 - A `rist` crate `pure-rust` feature that exposes the Rust implementation under
@@ -91,5 +93,6 @@ The first milestone has grown into a usable pure-Rust prototype:
 
 ## Next Slices
 
-1. Build out the remaining upstream loss/mode matrix: Simple multicast coverage
-   on non-Darwin hosts.
+1. Move beyond the upstream smoke matrix into remaining production gaps:
+   Advanced Profile, bonding/load-balancing, full connection/session timers,
+   multicast SRP rollover, full URL option parity, and long-running soak tests.

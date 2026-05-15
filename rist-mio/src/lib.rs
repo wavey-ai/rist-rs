@@ -22,7 +22,7 @@ use rist_core::{
     ReceiverStats, SenderStats, SimpleReceiverCore, SimpleSenderCore, SrpCredentialStore,
 };
 use std::io;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Instant;
 
 pub struct RtpUdpSocket {
@@ -87,6 +87,22 @@ impl RtpUdpSocket {
 
     pub fn send_packet_to(&mut self, peer: SocketAddr, packet: &[u8]) -> io::Result<usize> {
         self.socket.send_to(packet, peer)
+    }
+
+    pub fn set_multicast_loop_v4(&self, on: bool) -> io::Result<()> {
+        self.socket.set_multicast_loop_v4(on)
+    }
+
+    pub fn set_multicast_ttl_v4(&self, ttl: u32) -> io::Result<()> {
+        self.socket.set_multicast_ttl_v4(ttl)
+    }
+
+    pub fn join_multicast_v4(&self, multiaddr: Ipv4Addr, interface: Ipv4Addr) -> io::Result<()> {
+        self.socket.join_multicast_v4(&multiaddr, &interface)
+    }
+
+    pub fn leave_multicast_v4(&self, multiaddr: Ipv4Addr, interface: Ipv4Addr) -> io::Result<()> {
+        self.socket.leave_multicast_v4(&multiaddr, &interface)
     }
 
     pub fn send_mpegts_payload(&mut self, timestamp: u32, payload: &[u8]) -> io::Result<usize> {
@@ -205,6 +221,14 @@ impl SimpleMioSender {
         Ok(packet)
     }
 
+    pub fn set_multicast_loop_v4(&self, on: bool) -> io::Result<()> {
+        self.socket.set_multicast_loop_v4(on)
+    }
+
+    pub fn set_multicast_ttl_v4(&self, ttl: u32) -> io::Result<()> {
+        self.socket.set_multicast_ttl_v4(ttl)
+    }
+
     pub fn send_rtcp(&mut self, packet: &[u8]) -> io::Result<usize> {
         self.socket.send_packet(packet)
     }
@@ -278,6 +302,14 @@ impl SimpleMioSender {
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
+    }
+
+    pub fn join_multicast_v4(&self, multiaddr: Ipv4Addr, interface: Ipv4Addr) -> io::Result<()> {
+        self.socket.join_multicast_v4(multiaddr, interface)
+    }
+
+    pub fn leave_multicast_v4(&self, multiaddr: Ipv4Addr, interface: Ipv4Addr) -> io::Result<()> {
+        self.socket.leave_multicast_v4(multiaddr, interface)
     }
 }
 
@@ -365,6 +397,14 @@ impl SimpleMioReceiver {
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
+    }
+
+    pub fn join_multicast_v4(&self, multiaddr: Ipv4Addr, interface: Ipv4Addr) -> io::Result<()> {
+        self.socket.join_multicast_v4(multiaddr, interface)
+    }
+
+    pub fn leave_multicast_v4(&self, multiaddr: Ipv4Addr, interface: Ipv4Addr) -> io::Result<()> {
+        self.socket.leave_multicast_v4(multiaddr, interface)
     }
 }
 
@@ -999,6 +1039,56 @@ mod tests {
         let mut rx_buf = [0u8; 1500];
         let received = recv_payload_eventually(&mut receiver, &mut rx_buf);
         assert_eq!(received.payload, payload);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn simple_profile_receives_multicast_payload() {
+        let flow_id = 0x1122_3344;
+        let port_probe =
+            StdUdpSocket::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)))
+                .unwrap();
+        let port = port_probe.local_addr().unwrap().port();
+        drop(port_probe);
+
+        let group = Ipv4Addr::new(239, 255, (port >> 8) as u8, port as u8);
+        let interface = Ipv4Addr::UNSPECIFIED;
+        let receiver_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port));
+        let multicast_addr = SocketAddr::V4(SocketAddrV4::new(group, port));
+
+        let mut receiver =
+            SimpleMioReceiver::bind(receiver_addr, flow_id, "rust", NackMode::Range).unwrap();
+        receiver.join_multicast_v4(group, interface).unwrap();
+
+        let mut sender = SimpleMioSender::connect(loopback_any(), multicast_addr, flow_id, 64)
+            .or_else(|_| {
+                SimpleMioSender::connect(
+                    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
+                    multicast_addr,
+                    flow_id,
+                    64,
+                )
+            })
+            .unwrap();
+        sender.set_multicast_loop_v4(true).unwrap();
+        sender.set_multicast_ttl_v4(1).unwrap();
+
+        for _ in 0..5 {
+            sender
+                .send_payload(
+                    b"multicast",
+                    ntp_from_unix_duration(Duration::from_secs(1)),
+                    Instant::now(),
+                )
+                .unwrap();
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let mut rx_buf = [0u8; 1500];
+        let received = recv_payload_eventually(&mut receiver, &mut rx_buf);
+        assert_eq!(received.payload, b"multicast");
+
+        receiver.leave_multicast_v4(group, interface).unwrap();
     }
 
     #[test]
