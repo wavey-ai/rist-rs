@@ -22,8 +22,9 @@ use rist_core::{
     MainSessionTimers, OutboundPacket, PeerSelection, ReceivedPayload, ReceiverStats, SenderStats,
     SimpleReceiverCore, SimpleSenderCore, SrpCredentialStore, WeightedPeerSelector,
 };
+use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket as StdUdpSocket};
 use std::time::Instant;
 
 pub struct RtpUdpSocket {
@@ -37,6 +38,15 @@ impl RtpUdpSocket {
     pub fn bind(local: SocketAddr, ssrc: u32) -> io::Result<Self> {
         Ok(Self {
             socket: UdpSocket::bind(local)?,
+            peer: None,
+            next_sequence: 0,
+            ssrc,
+        })
+    }
+
+    pub fn bind_reuse(local: SocketAddr, ssrc: u32) -> io::Result<Self> {
+        Ok(Self {
+            socket: bind_reuse_udp(local)?,
             peer: None,
             next_sequence: 0,
             ssrc,
@@ -98,6 +108,10 @@ impl RtpUdpSocket {
         self.socket.set_multicast_ttl_v4(ttl)
     }
 
+    pub fn set_multicast_if_v4(&self, interface: Ipv4Addr) -> io::Result<()> {
+        SockRef::from(&self.socket).set_multicast_if_v4(&interface)
+    }
+
     pub fn join_multicast_v4(&self, multiaddr: Ipv4Addr, interface: Ipv4Addr) -> io::Result<()> {
         self.socket.join_multicast_v4(&multiaddr, &interface)
     }
@@ -151,6 +165,22 @@ impl RtpUdpSocket {
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
     }
+}
+
+fn bind_reuse_udp(local: SocketAddr) -> io::Result<UdpSocket> {
+    let domain = if local.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_reuse_address(true)?;
+    #[cfg(unix)]
+    socket.set_reuse_port(true)?;
+    socket.bind(&local.into())?;
+    socket.set_nonblocking(true)?;
+    let socket: StdUdpSocket = socket.into();
+    Ok(UdpSocket::from_std(socket))
 }
 
 pub struct SimpleMioSender {
@@ -228,6 +258,10 @@ impl SimpleMioSender {
 
     pub fn set_multicast_ttl_v4(&self, ttl: u32) -> io::Result<()> {
         self.socket.set_multicast_ttl_v4(ttl)
+    }
+
+    pub fn set_multicast_if_v4(&self, interface: Ipv4Addr) -> io::Result<()> {
+        self.socket.set_multicast_if_v4(interface)
     }
 
     pub fn send_rtcp(&mut self, packet: &[u8]) -> io::Result<usize> {
@@ -329,6 +363,19 @@ impl SimpleMioReceiver {
     ) -> io::Result<Self> {
         Ok(Self {
             socket: RtpUdpSocket::bind(local, flow_id)?,
+            core: SimpleReceiverCore::new(flow_id, cname, nack_mode),
+            last_peer: None,
+        })
+    }
+
+    pub fn bind_reuse(
+        local: SocketAddr,
+        flow_id: u32,
+        cname: impl Into<String>,
+        nack_mode: NackMode,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            socket: RtpUdpSocket::bind_reuse(local, flow_id)?,
             core: SimpleReceiverCore::new(flow_id, cname, nack_mode),
             last_peer: None,
         })
@@ -696,6 +743,10 @@ impl MainMioSender {
         self.socket.set_multicast_ttl_v4(ttl)
     }
 
+    pub fn set_multicast_if_v4(&self, interface: Ipv4Addr) -> io::Result<()> {
+        self.socket.set_multicast_if_v4(interface)
+    }
+
     fn handle_eapol_datagram(&mut self, packet: &[u8]) -> io::Result<Option<EapolFrame>> {
         let frame = self.core.accept_eapol(packet).map_err(core_to_io_error)?;
         let authenticated = self.srp_authenticated();
@@ -886,6 +937,10 @@ impl MainMioMultiSender {
         self.socket.set_multicast_ttl_v4(ttl)
     }
 
+    pub fn set_multicast_if_v4(&self, interface: Ipv4Addr) -> io::Result<()> {
+        self.socket.set_multicast_if_v4(interface)
+    }
+
     pub fn stats(&self) -> SenderStats {
         self.core.stats()
     }
@@ -943,6 +998,21 @@ impl MainMioReceiver {
     ) -> io::Result<Self> {
         Ok(Self {
             socket: RtpUdpSocket::bind(local, flow_id)?,
+            core: MainReceiverCore::new(flow_id, cname, nack_mode),
+            timers: MainSessionTimers::new(),
+            last_peer: None,
+            srp: None,
+        })
+    }
+
+    pub fn bind_reuse(
+        local: SocketAddr,
+        flow_id: u32,
+        cname: impl Into<String>,
+        nack_mode: NackMode,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            socket: RtpUdpSocket::bind_reuse(local, flow_id)?,
             core: MainReceiverCore::new(flow_id, cname, nack_mode),
             timers: MainSessionTimers::new(),
             last_peer: None,
@@ -1337,6 +1407,16 @@ mod tests {
         assert_eq!(packet.header.ssrc, 0x1234);
         assert_eq!(packet.header.sequence_number, 0);
         assert_eq!(packet.payload, b"payload");
+    }
+
+    #[test]
+    fn rtp_udp_socket_supports_reuse_bind_and_multicast_interface() {
+        let first = RtpUdpSocket::bind_reuse(loopback_any(), 1).unwrap();
+        let first_addr = first.local_addr().unwrap();
+        let second = RtpUdpSocket::bind_reuse(first_addr, 2).unwrap();
+
+        first.set_multicast_if_v4(Ipv4Addr::UNSPECIFIED).unwrap();
+        second.set_multicast_if_v4(Ipv4Addr::UNSPECIFIED).unwrap();
     }
 
     #[test]

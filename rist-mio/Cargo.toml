@@ -9,6 +9,7 @@ description = "Mio transport experiments for the pure Rust RIST implementation"
 [dependencies]
 mio = { version = "1", features = ["net", "os-poll"] }
 rist-core = { path = "../rist-core" }
+socket2 = { version = "0.6", features = ["all"] }
 
 [dev-dependencies]
 rist = { path = "../rist" }

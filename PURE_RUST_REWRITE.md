@@ -88,6 +88,9 @@ The first milestone has grown into a usable pure-Rust prototype:
   Main Profile recovery.
 - Mio multicast socket controls, plus non-Darwin Simple Profile multicast
   coverage matching the upstream platform constraint.
+- Reusable UDP bind support and explicit IPv4 multicast interface selection,
+  with Main/Simple sender hooks and pure URL `miface` application for IPv4
+  literal interfaces.
 - Main Profile sender restart regression coverage that repeatedly creates,
   uses, drops, and recreates a sender while exercising a sustained send loop.
 - A `rist` crate `pure-rust` feature that exposes the Rust implementation under

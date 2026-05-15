@@ -5,7 +5,7 @@
 //! librist FFI.
 
 use std::io;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::time::Instant;
 use thiserror::Error;
 
@@ -96,6 +96,7 @@ pub struct SenderBuilder {
     history_packets: usize,
     virtual_ports: VirtualPorts,
     session_config: MainSessionConfig,
+    multicast_interface_v4: Option<Ipv4Addr>,
     null_packet_suppression: bool,
     psk: Option<PskOptions>,
     srp_client: Option<(String, Vec<u8>)>,
@@ -111,6 +112,7 @@ impl SenderBuilder {
             history_packets: 1024,
             virtual_ports: VirtualPorts::default(),
             session_config: MainSessionConfig::default(),
+            multicast_interface_v4: None,
             null_packet_suppression: false,
             psk: None,
             srp_client: None,
@@ -138,6 +140,7 @@ impl SenderBuilder {
         if let (Some(username), Some(password)) = (&config.srp_username, &config.srp_password) {
             self.srp_client = Some((username.clone(), password.as_bytes().to_vec()));
         }
+        self.multicast_interface_v4 = parse_miface_v4(config.endpoint.miface.as_deref())?;
         self.virtual_ports = config.virtual_ports;
         self.session_config = config.connection.into();
         self.peer = Some(resolve_endpoint(&config.endpoint)?);
@@ -161,6 +164,11 @@ impl SenderBuilder {
 
     pub fn session_config(mut self, config: MainSessionConfig) -> Self {
         self.session_config = config;
+        self
+    }
+
+    pub fn multicast_interface_v4(mut self, interface: Ipv4Addr) -> Self {
+        self.multicast_interface_v4 = Some(interface);
         self
     }
 
@@ -207,6 +215,9 @@ impl SenderBuilder {
                     self.flow_id,
                     self.history_packets,
                 )?;
+                if let Some(interface) = self.multicast_interface_v4 {
+                    sender.set_multicast_if_v4(interface)?;
+                }
                 if self.null_packet_suppression {
                     sender.enable_null_packet_suppression();
                 }
@@ -221,6 +232,9 @@ impl SenderBuilder {
                 )?;
                 sender.set_ports(self.virtual_ports.src, self.virtual_ports.dst);
                 sender.set_session_config(self.session_config);
+                if let Some(interface) = self.multicast_interface_v4 {
+                    sender.set_multicast_if_v4(interface)?;
+                }
                 if self.null_packet_suppression {
                     sender.enable_null_packet_suppression();
                 }
@@ -375,6 +389,7 @@ pub struct MultiSenderBuilder {
     history_packets: usize,
     virtual_ports: VirtualPorts,
     session_config: MainSessionConfig,
+    multicast_interface_v4: Option<Ipv4Addr>,
     null_packet_suppression: bool,
     psk: Option<PskOptions>,
 }
@@ -389,6 +404,7 @@ impl MultiSenderBuilder {
             history_packets: 1024,
             virtual_ports: VirtualPorts::default(),
             session_config: MainSessionConfig::default(),
+            multicast_interface_v4: None,
             null_packet_suppression: false,
             psk: None,
         }
@@ -412,6 +428,7 @@ impl MultiSenderBuilder {
         if let Some(encryption) = &config.encryption {
             self.psk = Some(PskOptions::from_config(encryption));
         }
+        self.multicast_interface_v4 = parse_miface_v4(config.endpoint.miface.as_deref())?;
         self.virtual_ports = config.virtual_ports;
         self.session_config = config.connection.into();
         self.peers.push(MultiSenderPeer {
@@ -438,6 +455,11 @@ impl MultiSenderBuilder {
 
     pub fn session_config(mut self, config: MainSessionConfig) -> Self {
         self.session_config = config;
+        self
+    }
+
+    pub fn multicast_interface_v4(mut self, interface: Ipv4Addr) -> Self {
+        self.multicast_interface_v4 = Some(interface);
         self
     }
 
@@ -468,6 +490,9 @@ impl MultiSenderBuilder {
                 )?;
                 sender.set_ports(self.virtual_ports.src, self.virtual_ports.dst);
                 sender.set_session_config(self.session_config);
+                if let Some(interface) = self.multicast_interface_v4 {
+                    sender.set_multicast_if_v4(interface)?;
+                }
                 if self.null_packet_suppression {
                     sender.enable_null_packet_suppression();
                 }
@@ -818,6 +843,10 @@ fn resolve_endpoint(endpoint: &Endpoint) -> Result<SocketAddr> {
         .to_socket_addrs()?
         .next()
         .ok_or(Error::AddressResolution(address))
+}
+
+fn parse_miface_v4(miface: Option<&str>) -> Result<Option<Ipv4Addr>> {
+    Ok(miface.and_then(|value| value.parse().ok()))
 }
 
 #[cfg(test)]
