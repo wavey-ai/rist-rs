@@ -1,6 +1,7 @@
 # rist-rs
 
-Safe Rust bindings for [librist](https://code.videolan.org/rist/librist) (RIST protocol).
+Pure Rust RIST protocol work plus the existing safe Rust bindings for
+[librist](https://code.videolan.org/rist/librist).
 
 RIST (Reliable Internet Stream Transport) is a protocol for reliable video streaming over lossy networks with low latency.
 
@@ -91,20 +92,15 @@ if let Some(stats) = sender.raw_stats() {
 
 ## Examples
 
-`examples/browser-tab-stream` contains a static browser UI that streams camera or local video frames from one tab to another and displays glass-to-glass latency. It uses `BroadcastChannel` for same-origin tab transport because ordinary browser pages cannot open UDP sockets or speak RIST directly.
+Protocol-level sender and receiver examples live with the `rist` crate.
 
 ```sh
-cd examples/browser-tab-stream
-python3 -m http.server 8787 --bind 127.0.0.1
+cargo run -p rist --example receiver --features tokio
+cargo run -p rist --example sender --features tokio
 ```
 
-`examples/webrtc-rist-llhls` is the native browser pipeline example. It uses the `web-service` crate for HTTPS/WebSocket signaling and LL-HLS endpoints, terminates a browser WebRTC data channel with `webrtc-rs`, relays chunks over pure Rust RIST with `rist-mio`, and serves a receiver page backed by a low-latency HLS playlist.
-
-```sh
-cargo run --manifest-path examples/webrtc-rist-llhls/Cargo.toml
-```
-
-Open `https://127.0.0.1:9443/sender` and `https://127.0.0.1:9444/receiver`.
+Application examples that combine RIST with browser playback or other services
+belong in the consuming service repositories, not in this protocol crate.
 
 ## API Comparison with SRT
 
