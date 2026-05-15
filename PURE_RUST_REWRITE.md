@@ -64,7 +64,10 @@ The first milestone has grown into a usable pure-Rust prototype:
   Main Profile recovery.
 - A `rist` crate `pure-rust` feature that exposes the Rust implementation under
   `rist::pure` while leaving the existing librist-backed API unchanged by
-  default.
+  default. `rist::pure::Sender` and `rist::pure::Receiver` now provide builder
+  APIs over the Mio transport, with socket-address and RIST URL setup, PSK
+  options, send/receive helpers, feedback, RTCP polling, stats, and local
+  address access.
 - An environment-gated bidirectional `librist` interop harness for Simple
   Profile. It covers pure Rust sender to librist receiver and librist sender to
   pure Rust receiver, including Simple Profile RTP/RTCP even-port pairing.
@@ -73,9 +76,7 @@ The first milestone has grown into a usable pure-Rust prototype:
 
 ## Next Slices
 
-1. Expand the `rist::pure` API from reexports into ergonomic sender/receiver
-   builders that mirror the existing librist-backed API.
-2. Implement SRP/EAP authentication and passphrase rollover.
-3. Build out the remaining upstream loss/mode matrix: Simple multicast,
+1. Implement SRP/EAP authentication and passphrase rollover.
+2. Build out the remaining upstream loss/mode matrix: Simple multicast,
    Main server/client and client/server modes, AES mismatch failures, sender
    restart behavior, and SRP-enabled integration.

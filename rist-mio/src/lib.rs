@@ -658,6 +658,10 @@ impl MainMioReceiver {
         self.socket.local_addr()
     }
 
+    pub fn missing_sequences(&self) -> Vec<u32> {
+        self.core.missing_sequences()
+    }
+
     pub fn stats(&self) -> ReceiverStats {
         self.core.stats()
     }
