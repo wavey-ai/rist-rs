@@ -44,7 +44,8 @@ The first milestone has grown into a usable pure-Rust prototype:
 - GRE reduced-header encode/decode for Main Profile v1 and v2 VSF wrapping.
 - GRE keepalive and buffer-negotiation packet encode/decode.
 - PSK crypto primitives matching librist's PBKDF2-HMAC-SHA256 + AES-CTR
-  approach, with encrypted Main Profile reduced packets.
+  approach, with encrypted Main Profile reduced packets, feedback packets,
+  keepalives, and buffer-negotiation packets.
 - RIST URL parsing for listen/client addresses and common recovery/crypto query
   options.
 - Sequence extension and missing-packet tracking.
@@ -69,12 +70,11 @@ The first milestone has grown into a usable pure-Rust prototype:
 
 ## Next Slices
 
-1. Encrypt keepalive and buffer-negotiation control packets in Main Profile.
-2. Replace deterministic PSK nonce construction in tests with production nonce
+1. Replace deterministic PSK nonce construction in tests with production nonce
    generation and key-rotation policy.
-3. Expand the `rist::pure` API from reexports into ergonomic sender/receiver
+2. Expand the `rist::pure` API from reexports into ergonomic sender/receiver
    builders that mirror the existing librist-backed API.
-4. Implement SRP/EAP authentication and passphrase rollover.
-5. Build out the remaining upstream loss/mode matrix: Simple multicast,
+3. Implement SRP/EAP authentication and passphrase rollover.
+4. Build out the remaining upstream loss/mode matrix: Simple multicast,
    Main server/client and client/server modes, AES mismatch failures, sender
    restart behavior, and SRP-enabled integration.

@@ -9,7 +9,7 @@ use mio::net::UdpSocket;
 use mio::{Interest, Registry, Token};
 use rist_core::crypto::PskKey;
 use rist_core::packet::gre::{
-    BufferNegotiation, BufferNegotiationPacket, GreKeepalive, KeepalivePacket,
+    BufferNegotiation, GreKeepalive, OwnedBufferNegotiationPacket, OwnedKeepalivePacket,
 };
 use rist_core::packet::rtp::{encode_packet, RtpHeader, RtpPacket};
 use rist_core::{
@@ -468,10 +468,10 @@ impl MainMioSender {
         Ok(packet)
     }
 
-    pub fn try_recv_keepalive<'a>(
+    pub fn try_recv_keepalive(
         &mut self,
-        buf: &'a mut [u8],
-    ) -> io::Result<Option<(SocketAddr, KeepalivePacket<'a>)>> {
+        buf: &mut [u8],
+    ) -> io::Result<Option<(SocketAddr, OwnedKeepalivePacket)>> {
         let Some((from, packet)) = self.socket.recv_datagram(buf)? else {
             return Ok(None);
         };
@@ -482,10 +482,10 @@ impl MainMioSender {
         Ok(Some((from, keepalive)))
     }
 
-    pub fn try_recv_buffer_negotiation<'a>(
+    pub fn try_recv_buffer_negotiation(
         &mut self,
-        buf: &'a mut [u8],
-    ) -> io::Result<Option<(SocketAddr, BufferNegotiationPacket<'a>)>> {
+        buf: &mut [u8],
+    ) -> io::Result<Option<(SocketAddr, OwnedBufferNegotiationPacket)>> {
         let Some((from, packet)) = self.socket.recv_datagram(buf)? else {
             return Ok(None);
         };
@@ -624,10 +624,10 @@ impl MainMioReceiver {
         Ok(packet)
     }
 
-    pub fn try_recv_keepalive<'a>(
+    pub fn try_recv_keepalive(
         &mut self,
-        buf: &'a mut [u8],
-    ) -> io::Result<Option<(SocketAddr, KeepalivePacket<'a>)>> {
+        buf: &mut [u8],
+    ) -> io::Result<Option<(SocketAddr, OwnedKeepalivePacket)>> {
         let Some((from, packet)) = self.socket.recv_datagram(buf)? else {
             return Ok(None);
         };
@@ -639,10 +639,10 @@ impl MainMioReceiver {
         Ok(Some((from, keepalive)))
     }
 
-    pub fn try_recv_buffer_negotiation<'a>(
+    pub fn try_recv_buffer_negotiation(
         &mut self,
-        buf: &'a mut [u8],
-    ) -> io::Result<Option<(SocketAddr, BufferNegotiationPacket<'a>)>> {
+        buf: &mut [u8],
+    ) -> io::Result<Option<(SocketAddr, OwnedBufferNegotiationPacket)>> {
         let Some((from, packet)) = self.socket.recv_datagram(buf)? else {
             return Ok(None);
         };
@@ -920,6 +920,38 @@ mod tests {
         let mut rx_buf = [0u8; 1500];
         let negotiation = recv_buffer_negotiation_eventually(&mut receiver, &mut rx_buf);
         assert_eq!(negotiation.sequence, Some(0));
+        assert_eq!(negotiation.sender_max_buffer_ms, 1000);
+        assert_eq!(negotiation.receiver_current_buffer_ms, 250);
+    }
+
+    #[test]
+    fn main_profile_sends_encrypted_control_packets_over_udp() {
+        let flow_id = 0x1122_3344;
+        let mut receiver =
+            MainMioReceiver::bind(loopback_any(), flow_id, "rust", NackMode::Range).unwrap();
+        receiver.set_rx_key(PskKey::new(256, 0, b"secret", [0, 0, 0, 0]).unwrap());
+        let receiver_addr = receiver.local_addr().unwrap();
+        let mut sender =
+            MainMioSender::connect(loopback_any(), receiver_addr, flow_id, 64).unwrap();
+        sender.set_tx_key(PskKey::new(256, 0, b"secret", [1, 2, 3, 4]).unwrap());
+
+        let sent = sender
+            .send_keepalive(GreKeepalive::librist_default([1, 2, 3, 4, 5, 6]))
+            .unwrap();
+        assert_eq!(&sent.bytes[..8], &[0x30, 0x50, 0xcc, 0xe0, 1, 2, 3, 4]);
+
+        let mut rx_buf = [0u8; 1500];
+        let keepalive = recv_keepalive_eventually(&mut receiver, &mut rx_buf);
+        assert_eq!(keepalive.sequence, Some(0));
+        assert_eq!(keepalive.mac, [1, 2, 3, 4, 5, 6]);
+
+        let sent = sender
+            .send_buffer_negotiation(BufferNegotiation::session(1000, 250))
+            .unwrap();
+        assert_eq!(&sent.bytes[..8], &[0x30, 0x50, 0xcc, 0xe0, 1, 2, 3, 4]);
+
+        let negotiation = recv_buffer_negotiation_eventually(&mut receiver, &mut rx_buf);
+        assert_eq!(negotiation.sequence, Some(1));
         assert_eq!(negotiation.sender_max_buffer_ms, 1000);
         assert_eq!(negotiation.receiver_current_buffer_ms, 250);
     }

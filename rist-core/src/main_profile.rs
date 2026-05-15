@@ -1,9 +1,12 @@
 use crate::crypto::PskKey;
 use crate::packet::gre::{
+    decode_encrypted_buffer_negotiation_packet, decode_encrypted_keepalive_packet,
     decode_encrypted_reduced_packet, encode_buffer_negotiation_payload,
+    encode_encrypted_buffer_negotiation_payload, encode_encrypted_keepalive_payload,
     encode_encrypted_reduced_payload, encode_keepalive_payload, encode_reduced_payload,
     BufferNegotiation, BufferNegotiationPacket, GreHeader, GreKeepalive, KeepalivePacket,
-    OwnedReducedPacket, ReducedHeader, ReducedPacket,
+    OwnedBufferNegotiationPacket, OwnedKeepalivePacket, OwnedReducedPacket, ReducedHeader,
+    ReducedPacket,
 };
 use crate::packet::rtcp::NackMode;
 use crate::simple::{ReceivedPayload, SimpleReceiverCore, SimpleSenderCore};
@@ -136,9 +139,14 @@ impl MainSenderCore {
 
     pub fn build_keepalive(&mut self, keepalive: GreKeepalive<'_>) -> MainControlPacket {
         let gre_sequence = self.next_gre_sequence();
+        let bytes = if let Some(key) = &mut self.tx_key {
+            encode_encrypted_keepalive_payload(self.gre_version, gre_sequence, keepalive, key)
+        } else {
+            encode_keepalive_payload(self.gre_version, gre_sequence, keepalive)
+        };
         MainControlPacket {
             gre_sequence,
-            bytes: encode_keepalive_payload(self.gre_version, gre_sequence, keepalive),
+            bytes,
         }
     }
 
@@ -147,21 +155,40 @@ impl MainSenderCore {
         negotiation: BufferNegotiation<'_>,
     ) -> MainControlPacket {
         let gre_sequence = self.next_gre_sequence();
+        let bytes = if let Some(key) = &mut self.tx_key {
+            encode_encrypted_buffer_negotiation_payload(gre_sequence, negotiation, key)
+        } else {
+            encode_buffer_negotiation_payload(gre_sequence, negotiation)
+        };
         MainControlPacket {
             gre_sequence,
-            bytes: encode_buffer_negotiation_payload(gre_sequence, negotiation),
+            bytes,
         }
     }
 
-    pub fn accept_keepalive<'a>(&self, packet: &'a [u8]) -> Result<KeepalivePacket<'a>> {
-        KeepalivePacket::decode(packet)
+    pub fn accept_keepalive(&mut self, packet: &[u8]) -> Result<OwnedKeepalivePacket> {
+        let (gre, _) = GreHeader::decode(packet)?;
+        if gre.key.is_some() {
+            let Some(key) = &mut self.rx_key else {
+                return Err(crate::Error::UnsupportedGreProtocol(gre.protocol_type));
+            };
+            return decode_encrypted_keepalive_packet(packet, key);
+        }
+        Ok(KeepalivePacket::decode(packet)?.into_owned())
     }
 
-    pub fn accept_buffer_negotiation<'a>(
-        &self,
-        packet: &'a [u8],
-    ) -> Result<BufferNegotiationPacket<'a>> {
-        BufferNegotiationPacket::decode(packet)
+    pub fn accept_buffer_negotiation(
+        &mut self,
+        packet: &[u8],
+    ) -> Result<OwnedBufferNegotiationPacket> {
+        let (gre, _) = GreHeader::decode(packet)?;
+        if gre.key.is_some() {
+            let Some(key) = &mut self.rx_key else {
+                return Err(crate::Error::UnsupportedGreProtocol(gre.protocol_type));
+            };
+            return decode_encrypted_buffer_negotiation_packet(packet, key);
+        }
+        Ok(BufferNegotiationPacket::decode(packet)?.into_owned())
     }
 
     pub fn stats(&self) -> SenderStats {
@@ -347,9 +374,14 @@ impl MainReceiverCore {
 
     pub fn build_keepalive(&mut self, keepalive: GreKeepalive<'_>) -> MainControlPacket {
         let gre_sequence = self.next_gre_sequence();
+        let bytes = if let Some(key) = &mut self.tx_key {
+            encode_encrypted_keepalive_payload(self.gre_version, gre_sequence, keepalive, key)
+        } else {
+            encode_keepalive_payload(self.gre_version, gre_sequence, keepalive)
+        };
         MainControlPacket {
             gre_sequence,
-            bytes: encode_keepalive_payload(self.gre_version, gre_sequence, keepalive),
+            bytes,
         }
     }
 
@@ -358,21 +390,40 @@ impl MainReceiverCore {
         negotiation: BufferNegotiation<'_>,
     ) -> MainControlPacket {
         let gre_sequence = self.next_gre_sequence();
+        let bytes = if let Some(key) = &mut self.tx_key {
+            encode_encrypted_buffer_negotiation_payload(gre_sequence, negotiation, key)
+        } else {
+            encode_buffer_negotiation_payload(gre_sequence, negotiation)
+        };
         MainControlPacket {
             gre_sequence,
-            bytes: encode_buffer_negotiation_payload(gre_sequence, negotiation),
+            bytes,
         }
     }
 
-    pub fn accept_keepalive<'a>(&self, packet: &'a [u8]) -> Result<KeepalivePacket<'a>> {
-        KeepalivePacket::decode(packet)
+    pub fn accept_keepalive(&mut self, packet: &[u8]) -> Result<OwnedKeepalivePacket> {
+        let (gre, _) = GreHeader::decode(packet)?;
+        if gre.key.is_some() {
+            let Some(key) = &mut self.rx_key else {
+                return Err(crate::Error::UnsupportedGreProtocol(gre.protocol_type));
+            };
+            return decode_encrypted_keepalive_packet(packet, key);
+        }
+        Ok(KeepalivePacket::decode(packet)?.into_owned())
     }
 
-    pub fn accept_buffer_negotiation<'a>(
-        &self,
-        packet: &'a [u8],
-    ) -> Result<BufferNegotiationPacket<'a>> {
-        BufferNegotiationPacket::decode(packet)
+    pub fn accept_buffer_negotiation(
+        &mut self,
+        packet: &[u8],
+    ) -> Result<OwnedBufferNegotiationPacket> {
+        let (gre, _) = GreHeader::decode(packet)?;
+        if gre.key.is_some() {
+            let Some(key) = &mut self.rx_key else {
+                return Err(crate::Error::UnsupportedGreProtocol(gre.protocol_type));
+            };
+            return decode_encrypted_buffer_negotiation_packet(packet, key);
+        }
+        Ok(BufferNegotiationPacket::decode(packet)?.into_owned())
     }
 
     pub fn missing_sequences(&self) -> Vec<u32> {
@@ -579,7 +630,7 @@ mod tests {
     #[test]
     fn receiver_accepts_main_control_packets() {
         let mut sender = MainSenderCore::new(0x1122_3344, 64);
-        let receiver = MainReceiverCore::new(0x1122_3344, "rust", NackMode::Range);
+        let mut receiver = MainReceiverCore::new(0x1122_3344, "rust", NackMode::Range);
         let keepalive = sender.build_keepalive(GreKeepalive::librist_default([1, 2, 3, 4, 5, 6]));
         let negotiation = sender.build_buffer_negotiation(BufferNegotiation::session(1000, 250));
 
@@ -588,6 +639,33 @@ mod tests {
         let negotiation = receiver
             .accept_buffer_negotiation(&negotiation.bytes)
             .unwrap();
+        assert_eq!(negotiation.negotiation.receiver_current_buffer_ms, 250);
+    }
+
+    #[test]
+    fn main_profile_encrypts_and_decrypts_control_packets() {
+        let sender_tx = PskKey::new(256, 0, b"secret", [1, 2, 3, 4]).unwrap();
+        let receiver_rx = PskKey::new(256, 0, b"secret", [0, 0, 0, 0]).unwrap();
+        let mut sender = MainSenderCore::new(0x1122_3344, 64).with_tx_key(sender_tx);
+        let mut receiver =
+            MainReceiverCore::new(0x1122_3344, "rust", NackMode::Range).with_rx_key(receiver_rx);
+
+        let keepalive = sender.build_keepalive(GreKeepalive::librist_default([1, 2, 3, 4, 5, 6]));
+        let keepalive_header = GreHeader::decode(&keepalive.bytes).unwrap().0;
+        assert_eq!(keepalive_header.key, Some(0x0102_0304));
+        assert!(KeepalivePacket::decode(&keepalive.bytes).is_err());
+        let keepalive = receiver.accept_keepalive(&keepalive.bytes).unwrap();
+        assert_eq!(keepalive.keepalive.mac, [1, 2, 3, 4, 5, 6]);
+        assert!(keepalive.keepalive.supports_reduced_overhead());
+
+        let negotiation = sender.build_buffer_negotiation(BufferNegotiation::session(1000, 250));
+        let negotiation_header = GreHeader::decode(&negotiation.bytes).unwrap().0;
+        assert_eq!(negotiation_header.key, Some(0x0102_0304));
+        assert!(BufferNegotiationPacket::decode(&negotiation.bytes).is_err());
+        let negotiation = receiver
+            .accept_buffer_negotiation(&negotiation.bytes)
+            .unwrap();
+        assert_eq!(negotiation.negotiation.sender_max_buffer_ms, 1000);
         assert_eq!(negotiation.negotiation.receiver_current_buffer_ms, 250);
     }
 

@@ -225,7 +225,12 @@ pub struct KeepalivePacket<'a> {
 
 impl<'a> KeepalivePacket<'a> {
     pub fn decode(input: &'a [u8]) -> Result<Self> {
-        let (gre, mut offset) = GreHeader::decode(input)?;
+        let (gre, offset) = GreHeader::decode(input)?;
+        Self::decode_after_gre(gre, &input[offset..])
+    }
+
+    fn decode_after_gre(gre: GreHeader, input: &'a [u8]) -> Result<Self> {
+        let mut offset = 0;
         let vsf = match gre.protocol_type {
             GRE_PROTOCOL_TYPE_KEEPALIVE => None,
             GRE_PROTOCOL_TYPE_VSF => {
@@ -247,6 +252,50 @@ impl<'a> KeepalivePacket<'a> {
             keepalive: GreKeepalive::decode(&input[offset..])?,
         })
     }
+
+    pub fn into_owned(self) -> OwnedKeepalivePacket {
+        OwnedKeepalivePacket {
+            gre: self.gre,
+            vsf: self.vsf,
+            keepalive: self.keepalive.into_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedGreKeepalive {
+    pub mac: [u8; 6],
+    pub capabilities1: u8,
+    pub capabilities2: u8,
+    pub json: Vec<u8>,
+}
+
+impl GreKeepalive<'_> {
+    pub fn into_owned(self) -> OwnedGreKeepalive {
+        OwnedGreKeepalive {
+            mac: self.mac,
+            capabilities1: self.capabilities1,
+            capabilities2: self.capabilities2,
+            json: self.json.to_vec(),
+        }
+    }
+}
+
+impl OwnedGreKeepalive {
+    pub fn supports_null_packet_deletion(&self) -> bool {
+        self.capabilities1 & KEEPALIVE_CAP1_NULL_PACKET_DELETION != 0
+    }
+
+    pub fn supports_reduced_overhead(&self) -> bool {
+        self.capabilities2 & KEEPALIVE_CAP2_REDUCED_OVERHEAD != 0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedKeepalivePacket {
+    pub gre: GreHeader,
+    pub vsf: Option<VsfHeader>,
+    pub keepalive: OwnedGreKeepalive,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,7 +350,12 @@ pub struct BufferNegotiationPacket<'a> {
 
 impl<'a> BufferNegotiationPacket<'a> {
     pub fn decode(input: &'a [u8]) -> Result<Self> {
-        let (gre, mut offset) = GreHeader::decode(input)?;
+        let (gre, offset) = GreHeader::decode(input)?;
+        Self::decode_after_gre(gre, &input[offset..])
+    }
+
+    fn decode_after_gre(gre: GreHeader, input: &'a [u8]) -> Result<Self> {
+        let mut offset = 0;
         if gre.protocol_type != GRE_PROTOCOL_TYPE_VSF {
             return Err(Error::UnsupportedGreProtocol(gre.protocol_type));
         }
@@ -319,6 +373,40 @@ impl<'a> BufferNegotiationPacket<'a> {
             negotiation: BufferNegotiation::decode(&input[offset..])?,
         })
     }
+
+    pub fn into_owned(self) -> OwnedBufferNegotiationPacket {
+        OwnedBufferNegotiationPacket {
+            gre: self.gre,
+            vsf: self.vsf,
+            negotiation: self.negotiation.into_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedBufferNegotiation {
+    pub sender_max_buffer_ms: u16,
+    pub receiver_current_buffer_ms: u16,
+    pub protocol_type: u16,
+    pub protocol_data: Vec<u8>,
+}
+
+impl BufferNegotiation<'_> {
+    pub fn into_owned(self) -> OwnedBufferNegotiation {
+        OwnedBufferNegotiation {
+            sender_max_buffer_ms: self.sender_max_buffer_ms,
+            receiver_current_buffer_ms: self.receiver_current_buffer_ms,
+            protocol_type: self.protocol_type,
+            protocol_data: self.protocol_data.to_vec(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedBufferNegotiationPacket {
+    pub gre: GreHeader,
+    pub vsf: VsfHeader,
+    pub negotiation: OwnedBufferNegotiation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -486,6 +574,45 @@ pub fn decode_encrypted_reduced_packet(
     })
 }
 
+fn encode_encrypted_gre_payload(
+    gre_version: u8,
+    protocol_type: u16,
+    sequence: u32,
+    payload: &[u8],
+    key: &mut PskKey,
+) -> Vec<u8> {
+    let encrypted_payload = key.encrypt(gre_version, sequence, payload);
+    let mut out = Vec::with_capacity(12 + encrypted_payload.len());
+    GreHeader {
+        protocol_type,
+        version: gre_version,
+        key: Some(u32::from_be_bytes(key.nonce())),
+        sequence: Some(sequence),
+    }
+    .encode_with_flags2_extra(
+        &mut out,
+        if gre_version >= 1 && key.key_size() == AesKeySize::Aes256 {
+            1 << 6
+        } else {
+            0
+        },
+    );
+    out.extend_from_slice(&encrypted_payload);
+    out
+}
+
+fn decrypt_gre_payload(input: &[u8], key: &mut PskKey) -> Result<(GreHeader, Vec<u8>)> {
+    let (gre, offset) = GreHeader::decode(input)?;
+    let Some(nonce) = gre.key else {
+        return Err(Error::UnsupportedGreProtocol(gre.protocol_type));
+    };
+    let Some(sequence) = gre.sequence else {
+        return Err(Error::UnsupportedGreProtocol(gre.protocol_type));
+    };
+    let decrypted = key.decrypt(nonce.to_be_bytes(), gre.version, sequence, &input[offset..]);
+    Ok((gre, decrypted))
+}
+
 pub fn encode_keepalive_payload(
     gre_version: u8,
     sequence: u32,
@@ -511,6 +638,40 @@ pub fn encode_keepalive_payload(
     out
 }
 
+pub fn encode_encrypted_keepalive_payload(
+    gre_version: u8,
+    sequence: u32,
+    keepalive: GreKeepalive<'_>,
+    key: &mut PskKey,
+) -> Vec<u8> {
+    let use_vsf = gre_version >= 2;
+    let mut payload =
+        Vec::with_capacity(VsfHeader::LEN + GreKeepalive::MIN_LEN + keepalive.json.len());
+    if use_vsf {
+        VsfHeader::rist_keepalive().encode(&mut payload);
+    }
+    keepalive.encode(&mut payload);
+    encode_encrypted_gre_payload(
+        gre_version,
+        if use_vsf {
+            GRE_PROTOCOL_TYPE_VSF
+        } else {
+            GRE_PROTOCOL_TYPE_KEEPALIVE
+        },
+        sequence,
+        &payload,
+        key,
+    )
+}
+
+pub fn decode_encrypted_keepalive_packet(
+    input: &[u8],
+    key: &mut PskKey,
+) -> Result<OwnedKeepalivePacket> {
+    let (gre, decrypted) = decrypt_gre_payload(input, key)?;
+    Ok(KeepalivePacket::decode_after_gre(gre, &decrypted)?.into_owned())
+}
+
 pub fn encode_buffer_negotiation_payload(
     sequence: u32,
     negotiation: BufferNegotiation<'_>,
@@ -526,6 +687,27 @@ pub fn encode_buffer_negotiation_payload(
     VsfHeader::rist_buffer_negotiation().encode(&mut out);
     negotiation.encode(&mut out);
     out
+}
+
+pub fn encode_encrypted_buffer_negotiation_payload(
+    sequence: u32,
+    negotiation: BufferNegotiation<'_>,
+    key: &mut PskKey,
+) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(
+        VsfHeader::LEN + BufferNegotiation::MIN_LEN + negotiation.protocol_data.len(),
+    );
+    VsfHeader::rist_buffer_negotiation().encode(&mut payload);
+    negotiation.encode(&mut payload);
+    encode_encrypted_gre_payload(2, GRE_PROTOCOL_TYPE_VSF, sequence, &payload, key)
+}
+
+pub fn decode_encrypted_buffer_negotiation_packet(
+    input: &[u8],
+    key: &mut PskKey,
+) -> Result<OwnedBufferNegotiationPacket> {
+    let (gre, decrypted) = decrypt_gre_payload(input, key)?;
+    Ok(BufferNegotiationPacket::decode_after_gre(gre, &decrypted)?.into_owned())
 }
 
 #[cfg(test)]
@@ -694,5 +876,57 @@ mod tests {
         assert_eq!(decoded.reduced.src_port, 1971);
         assert_eq!(decoded.reduced.dst_port, 1968);
         assert_eq!(decoded.payload, b"payload");
+    }
+
+    #[test]
+    fn encrypted_keepalive_packet_round_trips() {
+        let mut tx_key = PskKey::new(256, 0, b"secret", [1, 2, 3, 4]).unwrap();
+        let mut rx_key = PskKey::new(256, 0, b"secret", [0, 0, 0, 0]).unwrap();
+        let keepalive = GreKeepalive {
+            mac: [1, 2, 3, 4, 5, 6],
+            capabilities1: KEEPALIVE_CAP1_NULL_PACKET_DELETION,
+            capabilities2: KEEPALIVE_CAP2_REDUCED_OVERHEAD,
+            json: br#"{"peer":"rust"}"#,
+        };
+        let packet = encode_encrypted_keepalive_payload(2, 42, keepalive, &mut tx_key);
+
+        let (gre, _) = GreHeader::decode(&packet).unwrap();
+        assert_eq!(gre.key, Some(0x0102_0304));
+        assert_eq!(gre.sequence, Some(42));
+        assert!(KeepalivePacket::decode(&packet).is_err());
+
+        let decoded = decode_encrypted_keepalive_packet(&packet, &mut rx_key).unwrap();
+        assert_eq!(decoded.gre.sequence, Some(42));
+        assert_eq!(decoded.vsf, Some(VsfHeader::rist_keepalive()));
+        assert_eq!(decoded.keepalive.mac, [1, 2, 3, 4, 5, 6]);
+        assert!(decoded.keepalive.supports_null_packet_deletion());
+        assert!(decoded.keepalive.supports_reduced_overhead());
+        assert_eq!(decoded.keepalive.json, br#"{"peer":"rust"}"#);
+    }
+
+    #[test]
+    fn encrypted_buffer_negotiation_packet_round_trips() {
+        let mut tx_key = PskKey::new(128, 0, b"secret", [5, 6, 7, 8]).unwrap();
+        let mut rx_key = PskKey::new(128, 0, b"secret", [0, 0, 0, 0]).unwrap();
+        let negotiation = BufferNegotiation {
+            sender_max_buffer_ms: 1000,
+            receiver_current_buffer_ms: 250,
+            protocol_type: 7,
+            protocol_data: b"data",
+        };
+        let packet = encode_encrypted_buffer_negotiation_payload(77, negotiation, &mut tx_key);
+
+        let (gre, _) = GreHeader::decode(&packet).unwrap();
+        assert_eq!(gre.key, Some(0x0506_0708));
+        assert_eq!(gre.sequence, Some(77));
+        assert!(BufferNegotiationPacket::decode(&packet).is_err());
+
+        let decoded = decode_encrypted_buffer_negotiation_packet(&packet, &mut rx_key).unwrap();
+        assert_eq!(decoded.gre.sequence, Some(77));
+        assert_eq!(decoded.vsf, VsfHeader::rist_buffer_negotiation());
+        assert_eq!(decoded.negotiation.sender_max_buffer_ms, 1000);
+        assert_eq!(decoded.negotiation.receiver_current_buffer_ms, 250);
+        assert_eq!(decoded.negotiation.protocol_type, 7);
+        assert_eq!(decoded.negotiation.protocol_data, b"data");
     }
 }
