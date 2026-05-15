@@ -97,6 +97,7 @@ pub struct SenderBuilder {
     virtual_ports: VirtualPorts,
     session_config: MainSessionConfig,
     multicast_interface_v4: Option<Ipv4Addr>,
+    initial_rtp_sequence: Option<u32>,
     null_packet_suppression: bool,
     psk: Option<PskOptions>,
     srp_client: Option<(String, Vec<u8>)>,
@@ -113,6 +114,7 @@ impl SenderBuilder {
             virtual_ports: VirtualPorts::default(),
             session_config: MainSessionConfig::default(),
             multicast_interface_v4: None,
+            initial_rtp_sequence: None,
             null_packet_suppression: false,
             psk: None,
             srp_client: None,
@@ -141,6 +143,7 @@ impl SenderBuilder {
             self.srp_client = Some((username.clone(), password.as_bytes().to_vec()));
         }
         self.multicast_interface_v4 = parse_miface_v4(config.endpoint.miface.as_deref())?;
+        self.initial_rtp_sequence = parse_nonnegative_i32(config.advanced.rtp_sequence);
         self.virtual_ports = config.virtual_ports;
         self.session_config = config.connection.into();
         self.peer = Some(resolve_endpoint(&config.endpoint)?);
@@ -169,6 +172,11 @@ impl SenderBuilder {
 
     pub fn multicast_interface_v4(mut self, interface: Ipv4Addr) -> Self {
         self.multicast_interface_v4 = Some(interface);
+        self
+    }
+
+    pub fn initial_rtp_sequence(mut self, sequence: u32) -> Self {
+        self.initial_rtp_sequence = Some(sequence);
         self
     }
 
@@ -218,6 +226,9 @@ impl SenderBuilder {
                 if let Some(interface) = self.multicast_interface_v4 {
                     sender.set_multicast_if_v4(interface)?;
                 }
+                if let Some(sequence) = self.initial_rtp_sequence {
+                    sender.set_next_sequence(sequence);
+                }
                 if self.null_packet_suppression {
                     sender.enable_null_packet_suppression();
                 }
@@ -234,6 +245,9 @@ impl SenderBuilder {
                 sender.set_session_config(self.session_config);
                 if let Some(interface) = self.multicast_interface_v4 {
                     sender.set_multicast_if_v4(interface)?;
+                }
+                if let Some(sequence) = self.initial_rtp_sequence {
+                    sender.set_next_rtp_sequence(sequence);
                 }
                 if self.null_packet_suppression {
                     sender.enable_null_packet_suppression();
@@ -389,6 +403,7 @@ pub struct MultiSenderBuilder {
     virtual_ports: VirtualPorts,
     session_config: MainSessionConfig,
     multicast_interface_v4: Option<Ipv4Addr>,
+    initial_rtp_sequence: Option<u32>,
     null_packet_suppression: bool,
     psk: Option<PskOptions>,
 }
@@ -404,6 +419,7 @@ impl MultiSenderBuilder {
             virtual_ports: VirtualPorts::default(),
             session_config: MainSessionConfig::default(),
             multicast_interface_v4: None,
+            initial_rtp_sequence: None,
             null_packet_suppression: false,
             psk: None,
         }
@@ -428,6 +444,7 @@ impl MultiSenderBuilder {
             self.psk = Some(PskOptions::from_config(encryption));
         }
         self.multicast_interface_v4 = parse_miface_v4(config.endpoint.miface.as_deref())?;
+        self.initial_rtp_sequence = parse_nonnegative_i32(config.advanced.rtp_sequence);
         self.virtual_ports = config.virtual_ports;
         self.session_config = config.connection.into();
         self.peers.push(MultiSenderPeer {
@@ -462,6 +479,11 @@ impl MultiSenderBuilder {
         self
     }
 
+    pub fn initial_rtp_sequence(mut self, sequence: u32) -> Self {
+        self.initial_rtp_sequence = Some(sequence);
+        self
+    }
+
     pub fn null_packet_suppression(mut self, enabled: bool) -> Self {
         self.null_packet_suppression = enabled;
         self
@@ -491,6 +513,9 @@ impl MultiSenderBuilder {
                 sender.set_session_config(self.session_config);
                 if let Some(interface) = self.multicast_interface_v4 {
                     sender.set_multicast_if_v4(interface)?;
+                }
+                if let Some(sequence) = self.initial_rtp_sequence {
+                    sender.set_next_rtp_sequence(sequence);
                 }
                 if self.null_packet_suppression {
                     sender.enable_null_packet_suppression();
@@ -847,6 +872,10 @@ fn parse_miface_v4(miface: Option<&str>) -> Result<Option<Ipv4Addr>> {
     Ok(miface.and_then(|value| value.parse().ok()))
 }
 
+fn parse_nonnegative_i32(value: Option<i32>) -> Option<u32> {
+    value.and_then(|value| u32::try_from(value).ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1006,7 +1035,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
         let url = format!(
-            "rist://127.0.0.1:{}?virt-src-port=9000&virt-dst-port=9001",
+            "rist://127.0.0.1:{}?virt-src-port=9000&virt-dst-port=9001&rtp-sequence=77",
             raw_receiver.local_addr().unwrap().port()
         );
         let mut sender = Sender::builder(Profile::Main)
@@ -1022,6 +1051,8 @@ mod tests {
         let reduced = ReducedPacket::decode(&buf[..len]).unwrap();
         assert_eq!(reduced.reduced.src_port, 9000);
         assert_eq!(reduced.reduced.dst_port, 9001);
+        let rtp = RtpPacket::decode(reduced.payload).unwrap();
+        assert_eq!(rtp.header.sequence_number, 77);
     }
 
     #[test]

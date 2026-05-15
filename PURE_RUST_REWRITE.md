@@ -66,7 +66,8 @@ The first milestone has grown into a usable pure-Rust prototype:
 - Typed parsing for librist peer URL options including bandwidth, retry,
   virtual-port, connection-timer, congestion-control, timing, multicast
   interface, SRP, and advanced/multiplex metadata, with pure Main Profile
-  senders applying virtual GRE ports from URLs.
+  senders applying virtual GRE ports, multicast IPv4 interfaces, and initial
+  RTP sequence numbers from URLs.
 - Sequence extension and missing-packet tracking.
 - Sender history and retransmission lookup.
 - Pure Rust sender/receiver statistics for send, receive, missing, recovered,

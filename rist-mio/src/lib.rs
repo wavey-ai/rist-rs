@@ -233,6 +233,10 @@ impl SimpleMioSender {
         self.core.null_packet_suppression_enabled()
     }
 
+    pub fn set_next_sequence(&mut self, sequence: u32) {
+        self.core.set_next_sequence(sequence);
+    }
+
     pub fn stats(&self) -> SenderStats {
         self.core.stats()
     }
@@ -503,6 +507,10 @@ impl MainMioSender {
 
     pub fn null_packet_suppression_enabled(&self) -> bool {
         self.core.null_packet_suppression_enabled()
+    }
+
+    pub fn set_next_rtp_sequence(&mut self, sequence: u32) {
+        self.core.set_next_rtp_sequence(sequence);
     }
 
     pub fn set_ports(&mut self, virt_src_port: u16, virt_dst_port: u16) {
@@ -888,6 +896,10 @@ impl MainMioMultiSender {
 
     pub fn set_ports(&mut self, virt_src_port: u16, virt_dst_port: u16) {
         self.core.set_ports(virt_src_port, virt_dst_port);
+    }
+
+    pub fn set_next_rtp_sequence(&mut self, sequence: u32) {
+        self.core.set_next_rtp_sequence(sequence);
     }
 
     pub fn enable_null_packet_suppression(&mut self) {

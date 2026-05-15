@@ -233,6 +233,10 @@ impl SimpleSenderCore {
         self.next_sequence
     }
 
+    pub fn set_next_sequence(&mut self, sequence: u32) {
+        self.next_sequence = sequence;
+    }
+
     pub fn stats(&self) -> SenderStats {
         self.stats
     }

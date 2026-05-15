@@ -239,6 +239,10 @@ impl MainSenderCore {
         self.simple.null_packet_suppression_enabled()
     }
 
+    pub fn set_next_rtp_sequence(&mut self, sequence: u32) {
+        self.simple.set_next_sequence(sequence);
+    }
+
     pub fn send_payload(
         &mut self,
         payload: &[u8],
