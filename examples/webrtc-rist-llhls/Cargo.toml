@@ -1,0 +1,28 @@
+[package]
+name = "webrtc-rist-llhls"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+base64 = "0.22"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
+http = "1"
+hyper = "1"
+hyper-util = "0.1"
+rist-core = { path = "../../rist-core" }
+rist-mio = { path = "../../rist-mio" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.27"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+web-service = { path = "../../../web-services/web-service" }
+webrtc = "0.14"

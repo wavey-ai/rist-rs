@@ -98,6 +98,14 @@ cd examples/browser-tab-stream
 python3 -m http.server 8787 --bind 127.0.0.1
 ```
 
+`examples/webrtc-rist-llhls` is the native browser pipeline example. It uses the `web-service` crate for HTTPS/WebSocket signaling and LL-HLS endpoints, terminates a browser WebRTC data channel with `webrtc-rs`, relays chunks over pure Rust RIST with `rist-mio`, and serves a receiver page backed by a low-latency HLS playlist.
+
+```sh
+cargo run --manifest-path examples/webrtc-rist-llhls/Cargo.toml
+```
+
+Open `https://127.0.0.1:9443/sender` and `https://127.0.0.1:9444/receiver`.
+
 ## API Comparison with SRT
 
 This library follows the same patterns as [sportsball-ai/av-rs](https://github.com/sportsball-ai/av-rs/tree/main/srt) SRT bindings for API consistency:
