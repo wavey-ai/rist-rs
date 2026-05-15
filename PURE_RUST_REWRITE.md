@@ -81,13 +81,13 @@ The first milestone has grown into a usable pure-Rust prototype:
   Profile. It covers pure Rust sender to librist receiver and librist sender to
   pure Rust receiver, including Simple Profile RTP/RTCP even-port pairing.
 - Environment-gated Main Profile `librist` payload interop in both directions
-  for clear traffic, including RTCP demux on the Rust receiver side and the
-  initial Main RTCP sender report needed by librist receivers.
+  for clear and AES-128 traffic, including RTCP demux on the Rust receiver side,
+  the initial Main RTCP sender report needed by librist receivers, and
+  wrong-secret failure coverage in both directions.
 - GitHub Actions CI that installs `librist-dev` and runs `RIST_INTEROP=1`
   interop coverage.
 
 ## Next Slices
 
 1. Build out the remaining upstream loss/mode matrix: Simple multicast,
-   Main Profile AES interop and mismatch failures, sender restart behavior, and
-   SRP-enabled payload integration.
+   sender restart behavior, and SRP-enabled payload integration.
