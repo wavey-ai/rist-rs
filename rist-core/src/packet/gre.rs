@@ -227,6 +227,9 @@ pub struct KeepalivePacket<'a> {
 impl<'a> KeepalivePacket<'a> {
     pub fn decode(input: &'a [u8]) -> Result<Self> {
         let (gre, offset) = GreHeader::decode(input)?;
+        if gre.key.is_some() {
+            return Err(Error::UnsupportedGreProtocol(gre.protocol_type));
+        }
         Self::decode_after_gre(gre, &input[offset..])
     }
 
@@ -352,6 +355,9 @@ pub struct BufferNegotiationPacket<'a> {
 impl<'a> BufferNegotiationPacket<'a> {
     pub fn decode(input: &'a [u8]) -> Result<Self> {
         let (gre, offset) = GreHeader::decode(input)?;
+        if gre.key.is_some() {
+            return Err(Error::UnsupportedGreProtocol(gre.protocol_type));
+        }
         Self::decode_after_gre(gre, &input[offset..])
     }
 
@@ -461,6 +467,9 @@ pub struct ReducedPacket<'a> {
 impl<'a> ReducedPacket<'a> {
     pub fn decode(input: &'a [u8]) -> Result<Self> {
         let (gre, offset) = GreHeader::decode(input)?;
+        if gre.key.is_some() {
+            return Err(Error::UnsupportedGreProtocol(gre.protocol_type));
+        }
         Self::decode_after_gre(gre, &input[offset..])
     }
 

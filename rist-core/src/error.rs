@@ -8,6 +8,9 @@ pub enum Error {
     #[error("unsupported RTP version {0}")]
     UnsupportedRtpVersion(u8),
 
+    #[error("unsupported RTP payload type {0}")]
+    UnsupportedRtpPayloadType(u8),
+
     #[error("invalid RTCP length: header advertises {advertised} bytes, got {actual}")]
     InvalidRtcpLength { advertised: usize, actual: usize },
 

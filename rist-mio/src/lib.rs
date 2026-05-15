@@ -11,13 +11,15 @@ use rist_core::auth::{EapSrpAuthenticatorSession, EapSrpClientSession, EapolFram
 use rist_core::crypto::PskKey;
 use rist_core::packet::gre::{
     BufferNegotiation, GreHeader, GreKeepalive, OwnedBufferNegotiationPacket, OwnedKeepalivePacket,
-    GRE_PROTOCOL_TYPE_EAPOL,
+    GRE_PROTOCOL_TYPE_EAPOL, GRE_PROTOCOL_TYPE_KEEPALIVE, VSF_SUBTYPE_BUFFER_NEGOTIATION,
+    VSF_SUBTYPE_KEEPALIVE,
 };
 use rist_core::packet::rtp::{encode_packet, RtpHeader, RtpPacket};
+use rist_core::time::ntp_now;
 use rist_core::{
-    packet::rtcp::NackMode, MainControlPacket, MainOutboundPacket, MainReceiverCore,
-    MainReceiverFeedback, MainSenderCore, OutboundPacket, ReceivedPayload, ReceiverStats,
-    SenderStats, SimpleReceiverCore, SimpleSenderCore, SrpCredentialStore,
+    packet::rtcp::NackMode, Error as CoreError, MainControlPacket, MainOutboundPacket,
+    MainReceiverCore, MainReceiverFeedback, MainSenderCore, OutboundPacket, ReceivedPayload,
+    ReceiverStats, SenderStats, SimpleReceiverCore, SimpleSenderCore, SrpCredentialStore,
 };
 use std::io;
 use std::net::SocketAddr;
@@ -573,10 +575,11 @@ impl MainMioSender {
         if !self.srp_authenticated() {
             return Ok(None);
         }
-        let retries = self
-            .core
-            .handle_feedback(feedback)
-            .map_err(core_to_io_error)?;
+        let retries = match self.core.handle_feedback(feedback) {
+            Ok(retries) => retries,
+            Err(err) if is_main_control_decode_error(&err) => return Ok(None),
+            Err(err) => return Err(core_to_io_error(err)),
+        };
         for retry in &retries {
             self.socket.send_packet(&retry.bytes)?;
         }
@@ -644,7 +647,25 @@ impl MainMioReceiver {
         if !self.srp_authenticated() {
             return Ok(None);
         }
-        let payload = self.core.accept_packet(packet).map_err(core_to_io_error)?;
+        let payload = match self.core.accept_packet(packet) {
+            Ok(payload) => payload,
+            Err(CoreError::UnsupportedRtpPayloadType(_)) => {
+                let responses = self
+                    .core
+                    .handle_rtcp(packet, ntp_now())
+                    .map_err(core_to_io_error)?;
+                for response in &responses {
+                    self.socket.send_packet_to(from, &response.bytes)?;
+                }
+                self.last_peer = Some(from);
+                return Ok(None);
+            }
+            Err(err) if is_main_control_decode_error(&err) => {
+                self.last_peer = Some(from);
+                return Ok(None);
+            }
+            Err(err) => return Err(core_to_io_error(err)),
+        };
         self.last_peer = Some(from);
         Ok(Some((from, payload)))
     }
@@ -716,10 +737,14 @@ impl MainMioReceiver {
         if !self.srp_authenticated() {
             return Ok(None);
         }
-        let responses = self
-            .core
-            .handle_rtcp(packet, now_ntp)
-            .map_err(core_to_io_error)?;
+        let responses = match self.core.handle_rtcp(packet, now_ntp) {
+            Ok(responses) => responses,
+            Err(err) if is_main_control_decode_error(&err) => {
+                self.last_peer = Some(from);
+                return Ok(None);
+            }
+            Err(err) => return Err(core_to_io_error(err)),
+        };
         for response in &responses {
             self.socket.send_packet_to(from, &response.bytes)?;
         }
@@ -863,6 +888,15 @@ fn srp_not_authenticated_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::PermissionDenied,
         "SRP authentication has not completed",
+    )
+}
+
+fn is_main_control_decode_error(err: &CoreError) -> bool {
+    matches!(
+        err,
+        CoreError::UnsupportedGreProtocol(GRE_PROTOCOL_TYPE_KEEPALIVE)
+            | CoreError::UnsupportedVsfSubtype(VSF_SUBTYPE_KEEPALIVE)
+            | CoreError::UnsupportedVsfSubtype(VSF_SUBTYPE_BUFFER_NEGOTIATION)
     )
 }
 
@@ -1036,7 +1070,7 @@ mod tests {
         let first = sender.build_payload(b"first", ntp, now);
         let _lost = sender.build_payload(b"lost", ntp, now);
         let third = sender.build_payload(b"third", ntp, now);
-        assert_eq!(&first.bytes[..4], &[0x30, 0x50, 0xcc, 0xe0]);
+        assert_eq!(&first.bytes[..4], &[0x30, 0x48, 0x88, 0xb6]);
         sender.send_outbound(&first).unwrap();
         sender.send_outbound(&third).unwrap();
 
@@ -1170,7 +1204,7 @@ mod tests {
         let sent = sender
             .send_keepalive(GreKeepalive::librist_default([1, 2, 3, 4, 5, 6]))
             .unwrap();
-        assert_eq!(&sent.bytes[..4], &[0x30, 0x50, 0xcc, 0xe0]);
+        assert_eq!(&sent.bytes[..4], &[0x30, 0x48, 0x88, 0xb5]);
 
         let mut rx_buf = [0u8; 1500];
         let keepalive = recv_keepalive_eventually(&mut receiver, &mut rx_buf);

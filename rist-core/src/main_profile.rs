@@ -54,7 +54,7 @@ impl MainSenderCore {
     pub fn new(flow_id: u32, history_packets: usize) -> Self {
         Self {
             simple: SimpleSenderCore::new(flow_id, history_packets),
-            gre_version: 2,
+            gre_version: 1,
             next_gre_sequence: 0,
             virt_src_port: DEFAULT_VIRT_SRC_PORT,
             virt_dst_port: DEFAULT_VIRT_DST_PORT,
@@ -290,7 +290,7 @@ impl MainReceiverCore {
     pub fn new(flow_id: u32, cname: impl Into<String>, nack_mode: NackMode) -> Self {
         Self {
             simple: SimpleReceiverCore::new(flow_id, cname, nack_mode),
-            gre_version: 2,
+            gre_version: 1,
             next_gre_sequence: 0,
             last_reduced: None,
             tx_key: None,
@@ -507,8 +507,9 @@ mod tests {
     use crate::auth::{EapPacket, EAPOL_VERSION_3};
     use crate::mpegts::{TS_NULL_PID, TS_PACKET_SIZE, TS_SYNC_BYTE};
     use crate::packet::gre::{
-        BufferNegotiationPacket, KeepalivePacket, GRE_PROTOCOL_TYPE_VSF,
-        KEEPALIVE_CAP1_NULL_PACKET_DELETION, KEEPALIVE_CAP2_REDUCED_OVERHEAD,
+        BufferNegotiationPacket, KeepalivePacket, GRE_PROTOCOL_TYPE_KEEPALIVE,
+        GRE_PROTOCOL_TYPE_REDUCED, KEEPALIVE_CAP1_NULL_PACKET_DELETION,
+        KEEPALIVE_CAP2_REDUCED_OVERHEAD,
     };
     use crate::packet::rtcp::{decode_compound, Echo, EchoKind, RtcpPacket, SenderReport};
     use crate::packet::rtp::RtpPacket;
@@ -522,6 +523,8 @@ mod tests {
         let mut sender = MainSenderCore::new(0x1122_3344, 64);
         let packet = sender.send_payload(b"payload", ntp, now);
         let decoded = ReducedPacket::decode(&packet.bytes).unwrap();
+        assert_eq!(decoded.gre.version, 1);
+        assert_eq!(decoded.gre.protocol_type, GRE_PROTOCOL_TYPE_REDUCED);
         assert_eq!(decoded.gre.sequence, Some(0));
         assert_eq!(decoded.reduced.src_port, DEFAULT_VIRT_SRC_PORT);
         assert_eq!(decoded.reduced.dst_port, DEFAULT_VIRT_DST_PORT);
@@ -597,8 +600,12 @@ mod tests {
         assert_eq!(negotiation.gre_sequence, 2);
 
         let decoded_keepalive = KeepalivePacket::decode(&keepalive.bytes).unwrap();
-        assert_eq!(decoded_keepalive.gre.protocol_type, GRE_PROTOCOL_TYPE_VSF);
+        assert_eq!(
+            decoded_keepalive.gre.protocol_type,
+            GRE_PROTOCOL_TYPE_KEEPALIVE
+        );
         assert_eq!(decoded_keepalive.gre.sequence, Some(1));
+        assert_eq!(decoded_keepalive.gre.version, 1);
         assert_eq!(decoded_keepalive.keepalive.mac, [1, 2, 3, 4, 5, 6]);
         assert_eq!(
             decoded_keepalive.keepalive.capabilities1 & KEEPALIVE_CAP1_NULL_PACKET_DELETION,
@@ -760,7 +767,7 @@ mod tests {
         assert_eq!(observed.newly_missing, vec![1]);
 
         let feedback = receiver.build_feedback();
-        assert_eq!(&feedback.bytes[..4], &[0x30, 0x50, 0xcc, 0xe0]);
+        assert_eq!(&feedback.bytes[..4], &[0x30, 0x48, 0x88, 0xb6]);
         let retries = sender.handle_feedback(&feedback.bytes).unwrap();
         assert_eq!(retries.len(), 1);
         assert_eq!(retries[0].rtp_sequence, lost.rtp_sequence);

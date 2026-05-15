@@ -43,6 +43,8 @@ The first milestone has grown into a usable pure-Rust prototype:
   and NACK feedback in the pure Rust cores, with Mio helpers to send due RTCP.
 - GRE reduced-header encode/decode for Main Profile v1 and v2 VSF wrapping.
 - GRE keepalive and buffer-negotiation packet encode/decode.
+- Main Profile defaults now use the librist-compatible GRE v1 reduced-packet
+  wire shape, while retaining explicit GRE v2 VSF support in the packet layer.
 - PSK crypto primitives matching librist's PBKDF2-HMAC-SHA256 + AES-CTR
   approach, with encrypted Main Profile reduced packets, feedback packets,
   keepalives, and buffer-negotiation packets.
@@ -78,12 +80,14 @@ The first milestone has grown into a usable pure-Rust prototype:
 - An environment-gated bidirectional `librist` interop harness for Simple
   Profile. It covers pure Rust sender to librist receiver and librist sender to
   pure Rust receiver, including Simple Profile RTP/RTCP even-port pairing.
+- Environment-gated Main Profile `librist` payload interop in both directions
+  for clear traffic, including RTCP demux on the Rust receiver side and the
+  initial Main RTCP sender report needed by librist receivers.
 - GitHub Actions CI that installs `librist-dev` and runs `RIST_INTEROP=1`
   interop coverage.
 
 ## Next Slices
 
 1. Build out the remaining upstream loss/mode matrix: Simple multicast,
-   Main Profile librist payload interop in server/client and client/server
-   modes, AES mismatch failures, sender restart behavior, and SRP-enabled
-   payload integration.
+   Main Profile AES interop and mismatch failures, sender restart behavior, and
+   SRP-enabled payload integration.

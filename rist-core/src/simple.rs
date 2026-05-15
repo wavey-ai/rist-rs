@@ -6,6 +6,7 @@ use crate::packet::rtcp::{
 };
 use crate::packet::rtp::{
     encode_packet, encode_packet_with_extension, RistRtpExtension, RtpHeader, RtpPacket,
+    RTP_PAYLOAD_TYPE_MPEGTS,
 };
 use crate::recovery::SenderHistory;
 use crate::stats::{ReceiverStats, SenderStats};
@@ -367,6 +368,11 @@ impl SimpleReceiverCore {
 
     pub fn accept_packet(&mut self, packet: &[u8]) -> Result<ReceivedPayload> {
         let packet = RtpPacket::decode(packet)?;
+        if packet.header.payload_type != RTP_PAYLOAD_TYPE_MPEGTS {
+            return Err(crate::Error::UnsupportedRtpPayloadType(
+                packet.header.payload_type,
+            ));
+        }
         let sequence = self.sequence_extender.extend(packet.header.sequence_number);
         self.peer_ssrc = Some(packet.header.ssrc);
         if self.base_sequence.is_none() {
@@ -536,7 +542,7 @@ impl SimpleReceiverCore {
 mod tests {
     use super::*;
     use crate::mpegts::{TS_NULL_PID, TS_PACKET_SIZE, TS_SYNC_BYTE};
-    use crate::packet::rtp::RIST_RTP_EXTENSION_NPD_FLAG;
+    use crate::packet::rtp::{encode_packet, RtpHeader, RIST_RTP_EXTENSION_NPD_FLAG};
     use crate::time::ntp_from_unix_duration;
     use std::time::Duration;
 
@@ -552,6 +558,17 @@ mod tests {
         assert_eq!(received.sequence, 0);
         assert_eq!(received.payload, b"payload");
         assert!(received.newly_missing.is_empty());
+    }
+
+    #[test]
+    fn rejects_non_mpegts_rtp_payload_type() {
+        let mut receiver = SimpleReceiverCore::new(0x1122_3344, "rust", NackMode::Range);
+        let mut header = RtpHeader::new_mpegts(0, 90_000, 0x1122_3344);
+        header.payload_type = 72;
+        let packet = encode_packet(header, b"not mpeg-ts");
+
+        let err = receiver.accept_packet(&packet).unwrap_err();
+        assert_eq!(err, crate::Error::UnsupportedRtpPayloadType(72));
     }
 
     #[test]
