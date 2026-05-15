@@ -20,10 +20,11 @@ pub mod mio {
 }
 
 pub use rist_core::{
-    AesKeySize, EncryptionConfig, Endpoint, MainControlPacket, MainOutboundPacket,
-    MainReceiverCore, MainReceiverFeedback, MainSenderCore, NullPacketSuppression, OutboundPacket,
-    PeerConfig, Profile, PskKey, ReceivedPayload, ReceiverStats, RecoveryConfig, RtcpIntervals,
-    SenderStats, SimpleReceiverCore, SimpleSenderCore,
+    AesKeySize, CongestionControlMode, ConnectionConfig, EncryptionConfig, Endpoint,
+    MainControlPacket, MainOutboundPacket, MainReceiverCore, MainReceiverFeedback, MainSenderCore,
+    MultiplexMode, NullPacketSuppression, OutboundPacket, PeerConfig, Profile, PskKey,
+    ReceivedPayload, ReceiverStats, RecoveryConfig, RecoveryMode, RtcpIntervals, SenderStats,
+    SimpleReceiverCore, SimpleSenderCore, TimingMode, VirtualPorts,
 };
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -91,6 +92,7 @@ pub struct SenderBuilder {
     peer: Option<SocketAddr>,
     flow_id: u32,
     history_packets: usize,
+    virtual_ports: VirtualPorts,
     null_packet_suppression: bool,
     psk: Option<PskOptions>,
 }
@@ -103,6 +105,7 @@ impl SenderBuilder {
             peer: None,
             flow_id: 0x1122_3344,
             history_packets: 1024,
+            virtual_ports: VirtualPorts::default(),
             null_packet_suppression: false,
             psk: None,
         }
@@ -126,6 +129,7 @@ impl SenderBuilder {
         if let Some(encryption) = &config.encryption {
             self.psk = Some(PskOptions::from_config(encryption));
         }
+        self.virtual_ports = config.virtual_ports;
         self.peer = Some(resolve_endpoint(&config.endpoint)?);
         Ok(self)
     }
@@ -137,6 +141,11 @@ impl SenderBuilder {
 
     pub fn history_packets(mut self, history_packets: usize) -> Self {
         self.history_packets = history_packets;
+        self
+    }
+
+    pub fn virtual_ports(mut self, src: u16, dst: u16) -> Self {
+        self.virtual_ports = VirtualPorts { src, dst };
         self
     }
 
@@ -190,6 +199,7 @@ impl SenderBuilder {
                     self.flow_id,
                     self.history_packets,
                 )?;
+                sender.set_ports(self.virtual_ports.src, self.virtual_ports.dst);
                 if self.null_packet_suppression {
                     sender.enable_null_packet_suppression();
                 }
@@ -471,6 +481,7 @@ fn resolve_endpoint(endpoint: &Endpoint) -> Result<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rist_core::packet::gre::ReducedPacket;
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -531,5 +542,30 @@ mod tests {
         let mut buf = [0; 1500];
         let payload = recv_eventually(&mut receiver, &mut buf);
         assert_eq!(payload.payload, b"payload");
+    }
+
+    #[test]
+    fn main_sender_url_virtual_ports_affect_reduced_header() {
+        let raw_receiver = std::net::UdpSocket::bind(loopback_any()).unwrap();
+        raw_receiver
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let url = format!(
+            "rist://127.0.0.1:{}?virt-src-port=9000&virt-dst-port=9001",
+            raw_receiver.local_addr().unwrap().port()
+        );
+        let mut sender = Sender::builder(Profile::Main)
+            .peer_url(&url)
+            .unwrap()
+            .connect()
+            .unwrap();
+
+        sender.send(b"payload").unwrap();
+
+        let mut buf = [0u8; 1500];
+        let (len, _) = raw_receiver.recv_from(&mut buf).unwrap();
+        let reduced = ReducedPacket::decode(&buf[..len]).unwrap();
+        assert_eq!(reduced.reduced.src_port, 9000);
+        assert_eq!(reduced.reduced.dst_port, 9001);
     }
 }

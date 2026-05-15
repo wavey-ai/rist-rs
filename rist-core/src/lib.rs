@@ -25,7 +25,10 @@ pub use auth::{
     SrpCredentialStore, SrpGroup, SrpHashVersion, SrpPassphrase, SrpUserRecord,
 };
 pub use crypto::{AesKeySize, PskKey};
-pub use endpoint::{EncryptionConfig, Endpoint, PeerConfig, RecoveryConfig};
+pub use endpoint::{
+    AdvancedUrlConfig, CongestionControlMode, ConnectionConfig, EncryptionConfig, Endpoint,
+    MultiplexMode, PeerConfig, RecoveryConfig, RecoveryMode, TimingMode, VirtualPorts,
+};
 pub use error::Error;
 pub use main_profile::{
     MainControlPacket, MainOutboundPacket, MainReceiverCore, MainReceiverFeedback, MainSenderCore,

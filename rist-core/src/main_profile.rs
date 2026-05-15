@@ -64,9 +64,13 @@ impl MainSenderCore {
     }
 
     pub fn with_ports(mut self, virt_src_port: u16, virt_dst_port: u16) -> Self {
+        self.set_ports(virt_src_port, virt_dst_port);
+        self
+    }
+
+    pub fn set_ports(&mut self, virt_src_port: u16, virt_dst_port: u16) {
         self.virt_src_port = virt_src_port;
         self.virt_dst_port = virt_dst_port;
-        self
     }
 
     pub fn with_gre_version(mut self, gre_version: u8) -> Self {

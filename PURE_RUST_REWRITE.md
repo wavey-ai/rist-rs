@@ -60,6 +60,10 @@ The first milestone has grown into a usable pure-Rust prototype:
   and payload interop in both directions.
 - RIST URL parsing for listen/client addresses and common recovery/crypto query
   options.
+- Typed parsing for librist peer URL options including bandwidth, retry,
+  virtual-port, connection-timer, congestion-control, timing, multicast
+  interface, SRP, and advanced/multiplex metadata, with pure Main Profile
+  senders applying virtual GRE ports from URLs.
 - Sequence extension and missing-packet tracking.
 - Sender history and retransmission lookup.
 - Pure Rust sender/receiver statistics for send, receive, missing, recovered,
@@ -95,4 +99,5 @@ The first milestone has grown into a usable pure-Rust prototype:
 
 1. Move beyond the upstream smoke matrix into remaining production gaps:
    Advanced Profile, bonding/load-balancing, full connection/session timers,
-   multicast SRP rollover, full URL option parity, and long-running soak tests.
+   multicast SRP rollover, applying the remaining parsed URL controls to runtime
+   behavior, and long-running soak tests.

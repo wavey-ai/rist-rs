@@ -449,6 +449,10 @@ impl MainMioSender {
         self.core.null_packet_suppression_enabled()
     }
 
+    pub fn set_ports(&mut self, virt_src_port: u16, virt_dst_port: u16) {
+        self.core.set_ports(virt_src_port, virt_dst_port);
+    }
+
     pub fn set_tx_key(&mut self, key: PskKey) {
         self.core.set_tx_key(key);
     }
