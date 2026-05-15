@@ -1,3 +1,4 @@
+use crate::auth::EapolFrame;
 use crate::crypto::{AesKeySize, PskKey};
 use crate::{Error, Result};
 
@@ -409,6 +410,18 @@ pub struct OwnedBufferNegotiationPacket {
     pub negotiation: OwnedBufferNegotiation,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EapolGrePacket {
+    pub gre: GreHeader,
+    pub frame: EapolFrame,
+}
+
+impl EapolGrePacket {
+    pub fn decode(input: &[u8]) -> Result<Self> {
+        decode_eapol_payload(input)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReducedHeader {
     pub src_port: u16,
@@ -710,9 +723,35 @@ pub fn decode_encrypted_buffer_negotiation_packet(
     Ok(BufferNegotiationPacket::decode_after_gre(gre, &decrypted)?.into_owned())
 }
 
+pub fn encode_eapol_payload(gre_version: u8, sequence: u32, frame: &EapolFrame) -> Result<Vec<u8>> {
+    let payload = frame.encode()?;
+    let mut out = Vec::with_capacity(8 + payload.len());
+    GreHeader {
+        protocol_type: GRE_PROTOCOL_TYPE_EAPOL,
+        version: gre_version,
+        key: None,
+        sequence: Some(sequence),
+    }
+    .encode(&mut out);
+    out.extend_from_slice(&payload);
+    Ok(out)
+}
+
+pub fn decode_eapol_payload(input: &[u8]) -> Result<EapolGrePacket> {
+    let (gre, offset) = GreHeader::decode(input)?;
+    if gre.protocol_type != GRE_PROTOCOL_TYPE_EAPOL {
+        return Err(Error::UnsupportedGreProtocol(gre.protocol_type));
+    }
+    Ok(EapolGrePacket {
+        gre,
+        frame: EapolFrame::decode(&input[offset..])?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::{EapPacket, EAPOL_VERSION_3, EAP_TYPE_IDENTITY};
 
     #[test]
     fn gre_header_round_trips_sequence_shape() {
@@ -928,5 +967,21 @@ mod tests {
         assert_eq!(decoded.negotiation.receiver_current_buffer_ms, 250);
         assert_eq!(decoded.negotiation.protocol_type, 7);
         assert_eq!(decoded.negotiation.protocol_data, b"data");
+    }
+
+    #[test]
+    fn eapol_packet_round_trips_without_vsf_or_encryption() {
+        let eap = EapPacket::identity_response(9, b"rist");
+        let frame = EapolFrame::eap(EAPOL_VERSION_3, &eap).unwrap();
+        let packet = encode_eapol_payload(2, 88, &frame).unwrap();
+
+        assert_eq!(&packet[..8], &[0x10, 0x10, 0x88, 0x8e, 0, 0, 0, 88]);
+        let decoded = decode_eapol_payload(&packet).unwrap();
+        assert_eq!(decoded.gre.protocol_type, GRE_PROTOCOL_TYPE_EAPOL);
+        assert_eq!(decoded.gre.sequence, Some(88));
+        assert_eq!(decoded.frame.version, EAPOL_VERSION_3);
+        let eap = decoded.frame.eap_packet().unwrap();
+        assert_eq!(eap.eap_type, Some(EAP_TYPE_IDENTITY));
+        assert_eq!(eap.data, b"rist");
     }
 }

@@ -1,7 +1,9 @@
+use crate::auth::EapolFrame;
 use crate::crypto::PskKey;
 use crate::packet::gre::{
-    decode_encrypted_buffer_negotiation_packet, decode_encrypted_keepalive_packet,
-    decode_encrypted_reduced_packet, encode_buffer_negotiation_payload,
+    decode_eapol_payload, decode_encrypted_buffer_negotiation_packet,
+    decode_encrypted_keepalive_packet, decode_encrypted_reduced_packet,
+    encode_buffer_negotiation_payload, encode_eapol_payload,
     encode_encrypted_buffer_negotiation_payload, encode_encrypted_keepalive_payload,
     encode_encrypted_reduced_payload, encode_keepalive_payload, encode_reduced_payload,
     BufferNegotiation, BufferNegotiationPacket, GreHeader, GreKeepalive, KeepalivePacket,
@@ -166,6 +168,14 @@ impl MainSenderCore {
         }
     }
 
+    pub fn build_eapol(&mut self, frame: &EapolFrame) -> Result<MainControlPacket> {
+        let gre_sequence = self.next_gre_sequence();
+        Ok(MainControlPacket {
+            gre_sequence,
+            bytes: encode_eapol_payload(self.gre_version, gre_sequence, frame)?,
+        })
+    }
+
     pub fn accept_keepalive(&mut self, packet: &[u8]) -> Result<OwnedKeepalivePacket> {
         let (gre, _) = GreHeader::decode(packet)?;
         if gre.key.is_some() {
@@ -189,6 +199,10 @@ impl MainSenderCore {
             return decode_encrypted_buffer_negotiation_packet(packet, key);
         }
         Ok(BufferNegotiationPacket::decode(packet)?.into_owned())
+    }
+
+    pub fn accept_eapol(&mut self, packet: &[u8]) -> Result<EapolFrame> {
+        Ok(decode_eapol_payload(packet)?.frame)
     }
 
     pub fn stats(&self) -> SenderStats {
@@ -401,6 +415,14 @@ impl MainReceiverCore {
         }
     }
 
+    pub fn build_eapol(&mut self, frame: &EapolFrame) -> Result<MainControlPacket> {
+        let gre_sequence = self.next_gre_sequence();
+        Ok(MainControlPacket {
+            gre_sequence,
+            bytes: encode_eapol_payload(self.gre_version, gre_sequence, frame)?,
+        })
+    }
+
     pub fn accept_keepalive(&mut self, packet: &[u8]) -> Result<OwnedKeepalivePacket> {
         let (gre, _) = GreHeader::decode(packet)?;
         if gre.key.is_some() {
@@ -424,6 +446,10 @@ impl MainReceiverCore {
             return decode_encrypted_buffer_negotiation_packet(packet, key);
         }
         Ok(BufferNegotiationPacket::decode(packet)?.into_owned())
+    }
+
+    pub fn accept_eapol(&mut self, packet: &[u8]) -> Result<EapolFrame> {
+        Ok(decode_eapol_payload(packet)?.frame)
     }
 
     pub fn missing_sequences(&self) -> Vec<u32> {
@@ -478,6 +504,7 @@ impl DecodedReduced<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::{EapPacket, EAPOL_VERSION_3};
     use crate::mpegts::{TS_NULL_PID, TS_PACKET_SIZE, TS_SYNC_BYTE};
     use crate::packet::gre::{
         BufferNegotiationPacket, KeepalivePacket, GRE_PROTOCOL_TYPE_VSF,
@@ -667,6 +694,28 @@ mod tests {
             .unwrap();
         assert_eq!(negotiation.negotiation.sender_max_buffer_ms, 1000);
         assert_eq!(negotiation.negotiation.receiver_current_buffer_ms, 250);
+    }
+
+    #[test]
+    fn main_profile_sends_eapol_control_packets_in_clear() {
+        let sender_tx = PskKey::new(256, b"secret").unwrap();
+        let receiver_rx = PskKey::receiver(256, b"secret").unwrap();
+        let mut sender = MainSenderCore::new(0x1122_3344, 64).with_tx_key(sender_tx);
+        let mut receiver =
+            MainReceiverCore::new(0x1122_3344, "rust", NackMode::Range).with_rx_key(receiver_rx);
+        let frame =
+            EapolFrame::eap(EAPOL_VERSION_3, &EapPacket::identity_response(3, b"rist")).unwrap();
+
+        let packet = sender.build_eapol(&frame).unwrap();
+        let header = GreHeader::decode(&packet.bytes).unwrap().0;
+        assert_eq!(
+            header.protocol_type,
+            crate::packet::gre::GRE_PROTOCOL_TYPE_EAPOL
+        );
+        assert!(header.key.is_none());
+
+        let accepted = receiver.accept_eapol(&packet.bytes).unwrap();
+        assert_eq!(accepted.eap_packet().unwrap().data, b"rist");
     }
 
     #[test]

@@ -32,6 +32,15 @@ pub enum Error {
     #[error("unsupported GRE protocol type 0x{0:04x}")]
     UnsupportedGreProtocol(u16),
 
+    #[error("invalid EAP packet")]
+    InvalidEapPacket,
+
+    #[error("invalid SRP group")]
+    InvalidSrpGroup,
+
+    #[error("unsupported SRP hash version {0}")]
+    UnsupportedSrpHashVersion(u8),
+
     #[error("unsupported VSF subtype 0x{0:04x}")]
     UnsupportedVsfSubtype(u16),
 

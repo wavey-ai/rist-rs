@@ -49,6 +49,10 @@ The first milestone has grown into a usable pure-Rust prototype:
 - Production PSK transmit keys generate nonces from OS randomness and rotate
   nonce/key material after a configurable packet count. Deterministic nonces are
   confined to known-vector tests.
+- EAPOL/EAP-SRP framing, librist-compatible SRP-SHA256 verifier and handshake
+  primitives, generation-based credential lookup for re-authentication,
+  passphrase rollover helpers, and unencrypted EAPOL GRE control packets for
+  Main Profile authentication.
 - RIST URL parsing for listen/client addresses and common recovery/crypto query
   options.
 - Sequence extension and missing-packet tracking.
@@ -76,7 +80,8 @@ The first milestone has grown into a usable pure-Rust prototype:
 
 ## Next Slices
 
-1. Implement SRP/EAP authentication and passphrase rollover.
+1. Integrate the SRP/EAP state machine into the Mio Main Profile transport and
+   add SRP-enabled librist interop coverage.
 2. Build out the remaining upstream loss/mode matrix: Simple multicast,
    Main server/client and client/server modes, AES mismatch failures, sender
    restart behavior, and SRP-enabled integration.
