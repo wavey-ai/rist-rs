@@ -431,7 +431,7 @@ fn librist_main_aes_sender_wrong_secret_does_not_reach_pure_rust_receiver() {
 }
 
 #[test]
-fn pure_rust_main_srp_client_authenticates_with_librist_receiver() {
+fn pure_rust_main_srp_client_sends_payload_to_librist_receiver() {
     if !interop_enabled() {
         return;
     }
@@ -458,10 +458,35 @@ fn pure_rust_main_srp_client_authenticates_with_librist_receiver() {
     sender.start_srp_authentication().unwrap();
     drive_main_srp_client(&mut sender);
     assert!(sender.srp_authenticated());
+
+    send_main_session_probe(&mut sender);
+    let payload = mpegts_payload_7("PURE RUST SRP TO LIBRIST");
+    for _ in 0..20 {
+        sender
+            .send_payload(&payload, ntp_now(), Instant::now())
+            .unwrap();
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(block) = receiver.read(Duration::from_millis(50)).unwrap() {
+            assert!(block.payload().starts_with(&[0x47]));
+            assert!(block
+                .payload()
+                .windows(b"PURE RUST SRP TO LIBRIST".len())
+                .any(|window| window == b"PURE RUST SRP TO LIBRIST"));
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for SRP-authenticated librist Main receiver"
+        );
+    }
 }
 
 #[test]
-fn librist_main_srp_client_authenticates_with_pure_rust_receiver() {
+fn librist_main_srp_client_sends_payload_to_pure_rust_receiver() {
     if !interop_enabled() {
         return;
     }
@@ -488,6 +513,30 @@ fn librist_main_srp_client_authenticates_with_pure_rust_receiver() {
 
     drive_main_srp_authenticator(&mut receiver);
     assert!(receiver.srp_authenticated());
+
+    let payload = mpegts_payload_7("LIBRIST SRP TO PURE RUST");
+    for _ in 0..20 {
+        sender.send(&payload).unwrap();
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let mut buf = [0; 1500];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some((_from, received)) = receiver.try_recv_payload(&mut buf).unwrap() {
+            assert!(received.payload.starts_with(&[0x47]));
+            assert!(received
+                .payload
+                .windows(b"LIBRIST SRP TO PURE RUST".len())
+                .any(|window| window == b"LIBRIST SRP TO PURE RUST"));
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for SRP-authenticated pure Rust Main receiver"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
 }
 
 fn send_main_session_probe(sender: &mut MainMioSender) {

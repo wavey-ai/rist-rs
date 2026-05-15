@@ -57,7 +57,7 @@ The first milestone has grown into a usable pure-Rust prototype:
   Main Profile authentication.
 - Mio Main Profile SRP client/authenticator integration that gates data until
   authentication completes, plus environment-gated librist SRP handshake
-  interop in both directions.
+  and payload interop in both directions.
 - RIST URL parsing for listen/client addresses and common recovery/crypto query
   options.
 - Sequence extension and missing-packet tracking.
@@ -89,5 +89,5 @@ The first milestone has grown into a usable pure-Rust prototype:
 
 ## Next Slices
 
-1. Build out the remaining upstream loss/mode matrix: Simple multicast,
-   sender restart behavior, and SRP-enabled payload integration.
+1. Build out the remaining upstream loss/mode matrix: Simple multicast and
+   sender restart behavior.

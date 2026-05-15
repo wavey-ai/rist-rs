@@ -592,8 +592,13 @@ impl MainMioSender {
 
     fn handle_eapol_datagram(&mut self, packet: &[u8]) -> io::Result<Option<EapolFrame>> {
         let frame = self.core.accept_eapol(packet).map_err(core_to_io_error)?;
+        let authenticated = self.srp_authenticated();
         let response = match &mut self.srp {
-            Some(session) => session.handle_frame(&frame).map_err(core_to_io_error)?,
+            Some(session) => match session.handle_frame(&frame) {
+                Ok(response) => response,
+                Err(rist_core::Error::InvalidEapPacket) if authenticated => None,
+                Err(err) => return Err(core_to_io_error(err)),
+            },
             None => None,
         };
         if let Some(response) = response {
@@ -854,8 +859,13 @@ impl MainMioReceiver {
         packet: &[u8],
     ) -> io::Result<Option<EapolFrame>> {
         let frame = self.core.accept_eapol(packet).map_err(core_to_io_error)?;
+        let authenticated = self.srp_authenticated();
         let response = match &mut self.srp {
-            Some(session) => session.handle_frame(&frame).map_err(core_to_io_error)?,
+            Some(session) => match session.handle_frame(&frame) {
+                Ok(response) => response,
+                Err(rist_core::Error::InvalidEapPacket) if authenticated => None,
+                Err(err) => return Err(core_to_io_error(err)),
+            },
             None => None,
         };
         if let Some(response) = response {
