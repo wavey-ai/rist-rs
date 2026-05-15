@@ -32,6 +32,7 @@ pub use endpoint::{
 pub use error::Error;
 pub use main_profile::{
     MainControlPacket, MainOutboundPacket, MainReceiverCore, MainReceiverFeedback, MainSenderCore,
+    MainSessionConfig, MainSessionPoll, MainSessionTimers,
 };
 pub use mpegts::{expand_null_packets, suppress_null_packets, NullPacketSuppression};
 pub use profile::Profile;

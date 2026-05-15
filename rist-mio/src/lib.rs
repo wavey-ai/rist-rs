@@ -18,8 +18,9 @@ use rist_core::packet::rtp::{encode_packet, RtpHeader, RtpPacket};
 use rist_core::time::ntp_now;
 use rist_core::{
     packet::rtcp::NackMode, Error as CoreError, MainControlPacket, MainOutboundPacket,
-    MainReceiverCore, MainReceiverFeedback, MainSenderCore, OutboundPacket, ReceivedPayload,
-    ReceiverStats, SenderStats, SimpleReceiverCore, SimpleSenderCore, SrpCredentialStore,
+    MainReceiverCore, MainReceiverFeedback, MainSenderCore, MainSessionConfig, MainSessionPoll,
+    MainSessionTimers, OutboundPacket, ReceivedPayload, ReceiverStats, SenderStats,
+    SimpleReceiverCore, SimpleSenderCore, SrpCredentialStore,
 };
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -411,7 +412,14 @@ impl SimpleMioReceiver {
 pub struct MainMioSender {
     socket: RtpUdpSocket,
     core: MainSenderCore,
+    timers: MainSessionTimers,
     srp: Option<EapSrpClientSession>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MainMioSessionPoll {
+    pub poll: MainSessionPoll,
+    pub keepalive: Option<MainControlPacket>,
 }
 
 impl MainMioSender {
@@ -424,6 +432,7 @@ impl MainMioSender {
         Ok(Self {
             socket: RtpUdpSocket::connect(local, peer, flow_id)?,
             core: MainSenderCore::new(flow_id, history_packets),
+            timers: MainSessionTimers::new(),
             srp: None,
         })
     }
@@ -451,6 +460,36 @@ impl MainMioSender {
 
     pub fn set_ports(&mut self, virt_src_port: u16, virt_dst_port: u16) {
         self.core.set_ports(virt_src_port, virt_dst_port);
+    }
+
+    pub fn session_config(&self) -> MainSessionConfig {
+        self.timers.config()
+    }
+
+    pub fn set_session_config(&mut self, config: MainSessionConfig) {
+        self.timers.set_config(config);
+    }
+
+    pub fn observe_peer_activity(&mut self, now: Instant) {
+        self.timers.observe_peer_activity(now);
+    }
+
+    pub fn poll_session(&mut self, now: Instant) -> MainSessionPoll {
+        self.timers.poll(now)
+    }
+
+    pub fn poll_session_and_send_keepalive(
+        &mut self,
+        now: Instant,
+        keepalive: GreKeepalive<'_>,
+    ) -> io::Result<MainMioSessionPoll> {
+        let poll = self.poll_session(now);
+        let keepalive = if poll.keepalive_due {
+            Some(self.send_keepalive(keepalive)?)
+        } else {
+            None
+        };
+        Ok(MainMioSessionPoll { poll, keepalive })
     }
 
     pub fn set_tx_key(&mut self, key: PskKey) {
@@ -557,6 +596,7 @@ impl MainMioSender {
         let Some((_from, packet)) = self.socket.recv_datagram(buf)? else {
             return Ok(None);
         };
+        self.timers.observe_peer_activity(Instant::now());
         if !is_eapol_datagram(packet) {
             return Ok(None);
         }
@@ -570,6 +610,7 @@ impl MainMioSender {
         let Some((from, packet)) = self.socket.recv_datagram(buf)? else {
             return Ok(None);
         };
+        self.timers.observe_peer_activity(Instant::now());
         if is_eapol_datagram(packet) {
             self.handle_eapol_datagram(packet)?;
             return Ok(None);
@@ -591,6 +632,7 @@ impl MainMioSender {
         let Some((from, packet)) = self.socket.recv_datagram(buf)? else {
             return Ok(None);
         };
+        self.timers.observe_peer_activity(Instant::now());
         if is_eapol_datagram(packet) {
             self.handle_eapol_datagram(packet)?;
             return Ok(None);
@@ -612,6 +654,7 @@ impl MainMioSender {
         let Some((_from, feedback)) = self.socket.recv_datagram(buf)? else {
             return Ok(None);
         };
+        self.timers.observe_peer_activity(Instant::now());
         if is_eapol_datagram(feedback) {
             self.handle_eapol_datagram(feedback)?;
             return Ok(None);
@@ -663,6 +706,7 @@ impl MainMioSender {
 pub struct MainMioReceiver {
     socket: RtpUdpSocket,
     core: MainReceiverCore,
+    timers: MainSessionTimers,
     last_peer: Option<SocketAddr>,
     srp: Option<EapSrpAuthenticatorSession>,
 }
@@ -677,6 +721,7 @@ impl MainMioReceiver {
         Ok(Self {
             socket: RtpUdpSocket::bind(local, flow_id)?,
             core: MainReceiverCore::new(flow_id, cname, nack_mode),
+            timers: MainSessionTimers::new(),
             last_peer: None,
             srp: None,
         })
@@ -689,6 +734,7 @@ impl MainMioReceiver {
         let Some((from, packet)) = self.socket.recv_datagram(buf)? else {
             return Ok(None);
         };
+        self.timers.observe_peer_activity(Instant::now());
         if is_eapol_datagram(packet) {
             self.handle_eapol_datagram(from, packet)?;
             return Ok(None);
@@ -725,6 +771,39 @@ impl MainMioReceiver {
 
     pub fn set_rx_key(&mut self, key: PskKey) {
         self.core.set_rx_key(key);
+    }
+
+    pub fn session_config(&self) -> MainSessionConfig {
+        self.timers.config()
+    }
+
+    pub fn set_session_config(&mut self, config: MainSessionConfig) {
+        self.timers.set_config(config);
+    }
+
+    pub fn observe_peer_activity(&mut self, now: Instant) {
+        self.timers.observe_peer_activity(now);
+    }
+
+    pub fn poll_session(&mut self, now: Instant) -> MainSessionPoll {
+        self.timers.poll(now)
+    }
+
+    pub fn poll_session_and_send_keepalive(
+        &mut self,
+        now: Instant,
+        keepalive: GreKeepalive<'_>,
+    ) -> io::Result<MainMioSessionPoll> {
+        let poll = self.poll_session(now);
+        let keepalive = if poll.keepalive_due {
+            match self.last_peer {
+                Some(peer) => Some(self.send_keepalive_to(peer, keepalive)?),
+                None => None,
+            }
+        } else {
+            None
+        };
+        Ok(MainMioSessionPoll { poll, keepalive })
     }
 
     pub fn enable_srp_authenticator(&mut self, store: SrpCredentialStore) {
@@ -779,6 +858,7 @@ impl MainMioReceiver {
         let Some((from, packet)) = self.socket.recv_datagram(buf)? else {
             return Ok(None);
         };
+        self.timers.observe_peer_activity(Instant::now());
         if is_eapol_datagram(packet) {
             self.handle_eapol_datagram(from, packet)?;
             return Ok(None);
@@ -835,6 +915,7 @@ impl MainMioReceiver {
         let Some((from, packet)) = self.socket.recv_datagram(buf)? else {
             return Ok(None);
         };
+        self.timers.observe_peer_activity(Instant::now());
         if !is_eapol_datagram(packet) {
             return Ok(None);
         }
@@ -848,6 +929,7 @@ impl MainMioReceiver {
         let Some((from, packet)) = self.socket.recv_datagram(buf)? else {
             return Ok(None);
         };
+        self.timers.observe_peer_activity(Instant::now());
         if is_eapol_datagram(packet) {
             self.handle_eapol_datagram(from, packet)?;
             return Ok(None);
@@ -870,6 +952,7 @@ impl MainMioReceiver {
         let Some((from, packet)) = self.socket.recv_datagram(buf)? else {
             return Ok(None);
         };
+        self.timers.observe_peer_activity(Instant::now());
         if is_eapol_datagram(packet) {
             self.handle_eapol_datagram(from, packet)?;
             return Ok(None);
@@ -1271,6 +1354,34 @@ mod tests {
         assert_eq!(keepalive.mac, [1, 2, 3, 4, 5, 6]);
         assert!(keepalive.supports_null_packet_deletion);
         assert!(keepalive.supports_reduced_overhead);
+    }
+
+    #[test]
+    fn main_profile_session_timer_sends_due_keepalive_over_udp() {
+        let flow_id = 0x1122_3344;
+        let mut receiver =
+            MainMioReceiver::bind(loopback_any(), flow_id, "rust", NackMode::Range).unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+        let mut sender =
+            MainMioSender::connect(loopback_any(), receiver_addr, flow_id, 64).unwrap();
+        sender.set_session_config(MainSessionConfig {
+            keepalive_interval: Duration::ZERO,
+            session_timeout: Duration::from_millis(50),
+        });
+
+        let sent = sender
+            .poll_session_and_send_keepalive(
+                Instant::now(),
+                GreKeepalive::librist_default([1, 2, 3, 4, 5, 6]),
+            )
+            .unwrap();
+        assert!(sent.poll.keepalive_due);
+        assert_eq!(sent.keepalive.unwrap().gre_sequence, 0);
+
+        let mut rx_buf = [0u8; 1500];
+        let keepalive = recv_keepalive_eventually(&mut receiver, &mut rx_buf);
+        assert_eq!(keepalive.sequence, Some(0));
+        assert_eq!(keepalive.mac, [1, 2, 3, 4, 5, 6]);
     }
 
     #[test]

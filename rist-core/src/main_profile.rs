@@ -14,10 +14,130 @@ use crate::packet::rtcp::NackMode;
 use crate::simple::{ReceivedPayload, SimpleReceiverCore, SimpleSenderCore};
 use crate::stats::{ReceiverStats, SenderStats};
 use crate::Result;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub const DEFAULT_VIRT_SRC_PORT: u16 = 1971;
 pub const DEFAULT_VIRT_DST_PORT: u16 = 1968;
+pub const DEFAULT_MAIN_KEEPALIVE_INTERVAL: Duration = Duration::from_millis(1000);
+pub const DEFAULT_MAIN_SESSION_TIMEOUT: Duration = Duration::from_millis(2000);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MainSessionConfig {
+    pub keepalive_interval: Duration,
+    pub session_timeout: Duration,
+}
+
+impl Default for MainSessionConfig {
+    fn default() -> Self {
+        Self {
+            keepalive_interval: DEFAULT_MAIN_KEEPALIVE_INTERVAL,
+            session_timeout: DEFAULT_MAIN_SESSION_TIMEOUT,
+        }
+    }
+}
+
+impl From<crate::endpoint::ConnectionConfig> for MainSessionConfig {
+    fn from(config: crate::endpoint::ConnectionConfig) -> Self {
+        Self {
+            keepalive_interval: config.keepalive_interval,
+            session_timeout: config.session_timeout,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MainSessionPoll {
+    pub keepalive_due: bool,
+    pub timed_out: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct MainSessionTimers {
+    config: MainSessionConfig,
+    next_keepalive: Option<Instant>,
+    last_peer_activity: Option<Instant>,
+}
+
+impl MainSessionTimers {
+    pub fn new() -> Self {
+        Self::with_config(MainSessionConfig::default())
+    }
+
+    pub fn with_config(config: MainSessionConfig) -> Self {
+        Self {
+            config,
+            next_keepalive: None,
+            last_peer_activity: None,
+        }
+    }
+
+    pub fn config(&self) -> MainSessionConfig {
+        self.config
+    }
+
+    pub fn set_config(&mut self, config: MainSessionConfig) {
+        self.config = config;
+        self.next_keepalive = None;
+    }
+
+    pub fn observe_peer_activity(&mut self, now: Instant) {
+        self.last_peer_activity = Some(now);
+    }
+
+    pub fn last_peer_activity(&self) -> Option<Instant> {
+        self.last_peer_activity
+    }
+
+    pub fn poll(&mut self, now: Instant) -> MainSessionPoll {
+        MainSessionPoll {
+            keepalive_due: self.poll_keepalive(now),
+            timed_out: self.peer_timed_out(now),
+        }
+    }
+
+    fn poll_keepalive(&mut self, now: Instant) -> bool {
+        let interval = self.config.keepalive_interval;
+        let Some(due) = self.next_keepalive else {
+            self.next_keepalive = Some(now + interval);
+            return interval.is_zero();
+        };
+        if now < due {
+            return false;
+        }
+        self.next_keepalive = Some(next_due_after(due, now, interval));
+        true
+    }
+
+    fn peer_timed_out(&self, now: Instant) -> bool {
+        let Some(last_activity) = self.last_peer_activity else {
+            return false;
+        };
+        elapsed_at_least(now, last_activity, self.config.session_timeout)
+    }
+}
+
+impl Default for MainSessionTimers {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn next_due_after(due: Instant, now: Instant, interval: Duration) -> Instant {
+    if interval.is_zero() {
+        return now;
+    }
+    let mut next = due + interval;
+    while next <= now {
+        next += interval;
+    }
+    next
+}
+
+fn elapsed_at_least(now: Instant, then: Instant, duration: Duration) -> bool {
+    now.checked_duration_since(then)
+        .map(|elapsed| elapsed >= duration)
+        .unwrap_or(false)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MainOutboundPacket {
@@ -534,6 +654,28 @@ mod tests {
         assert_eq!(decoded.reduced.dst_port, DEFAULT_VIRT_DST_PORT);
         assert_eq!(decoded.payload[0], 0x80);
         assert_eq!(decoded.payload[1], 0x21);
+    }
+
+    #[test]
+    fn main_session_timers_schedule_keepalive_and_timeout() {
+        let start = Instant::now();
+        let mut timers = MainSessionTimers::with_config(MainSessionConfig {
+            keepalive_interval: Duration::from_millis(10),
+            session_timeout: Duration::from_millis(30),
+        });
+
+        assert_eq!(
+            timers.poll(start),
+            MainSessionPoll {
+                keepalive_due: false,
+                timed_out: false,
+            }
+        );
+        assert!(timers.poll(start + Duration::from_millis(10)).keepalive_due);
+
+        timers.observe_peer_activity(start + Duration::from_millis(15));
+        assert!(!timers.poll(start + Duration::from_millis(44)).timed_out);
+        assert!(timers.poll(start + Duration::from_millis(45)).timed_out);
     }
 
     #[test]

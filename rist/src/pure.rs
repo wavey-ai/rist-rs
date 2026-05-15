@@ -15,16 +15,17 @@ pub mod core {
 
 pub mod mio {
     pub use rist_mio::{
-        MainMioReceiver, MainMioSender, RtpUdpSocket, SimpleMioReceiver, SimpleMioSender,
+        MainMioReceiver, MainMioSender, MainMioSessionPoll, RtpUdpSocket, SimpleMioReceiver,
+        SimpleMioSender,
     };
 }
 
 pub use rist_core::{
     AesKeySize, CongestionControlMode, ConnectionConfig, EncryptionConfig, Endpoint,
     MainControlPacket, MainOutboundPacket, MainReceiverCore, MainReceiverFeedback, MainSenderCore,
-    MultiplexMode, NullPacketSuppression, OutboundPacket, PeerConfig, Profile, PskKey,
-    ReceivedPayload, ReceiverStats, RecoveryConfig, RecoveryMode, RtcpIntervals, SenderStats,
-    SimpleReceiverCore, SimpleSenderCore, TimingMode, VirtualPorts,
+    MainSessionConfig, MainSessionPoll, MultiplexMode, NullPacketSuppression, OutboundPacket,
+    PeerConfig, Profile, PskKey, ReceivedPayload, ReceiverStats, RecoveryConfig, RecoveryMode,
+    RtcpIntervals, SenderStats, SimpleReceiverCore, SimpleSenderCore, TimingMode, VirtualPorts,
 };
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -93,6 +94,7 @@ pub struct SenderBuilder {
     flow_id: u32,
     history_packets: usize,
     virtual_ports: VirtualPorts,
+    session_config: MainSessionConfig,
     null_packet_suppression: bool,
     psk: Option<PskOptions>,
 }
@@ -106,6 +108,7 @@ impl SenderBuilder {
             flow_id: 0x1122_3344,
             history_packets: 1024,
             virtual_ports: VirtualPorts::default(),
+            session_config: MainSessionConfig::default(),
             null_packet_suppression: false,
             psk: None,
         }
@@ -130,6 +133,7 @@ impl SenderBuilder {
             self.psk = Some(PskOptions::from_config(encryption));
         }
         self.virtual_ports = config.virtual_ports;
+        self.session_config = config.connection.into();
         self.peer = Some(resolve_endpoint(&config.endpoint)?);
         Ok(self)
     }
@@ -146,6 +150,11 @@ impl SenderBuilder {
 
     pub fn virtual_ports(mut self, src: u16, dst: u16) -> Self {
         self.virtual_ports = VirtualPorts { src, dst };
+        self
+    }
+
+    pub fn session_config(mut self, config: MainSessionConfig) -> Self {
+        self.session_config = config;
         self
     }
 
@@ -200,6 +209,7 @@ impl SenderBuilder {
                     self.history_packets,
                 )?;
                 sender.set_ports(self.virtual_ports.src, self.virtual_ports.dst);
+                sender.set_session_config(self.session_config);
                 if self.null_packet_suppression {
                     sender.enable_null_packet_suppression();
                 }
@@ -262,6 +272,26 @@ impl Sender {
         }
     }
 
+    pub fn poll_session(&mut self) -> Result<MainSessionPoll> {
+        match self {
+            Self::Main(sender) => Ok(sender.poll_session(Instant::now())),
+            Self::Simple(_) => Err(Error::UnsupportedProfile(Profile::Simple)),
+        }
+    }
+
+    pub fn poll_keepalive(&mut self, mac: [u8; 6]) -> Result<Option<usize>> {
+        match self {
+            Self::Main(sender) => Ok(sender
+                .poll_session_and_send_keepalive(
+                    Instant::now(),
+                    rist_core::packet::gre::GreKeepalive::librist_default(mac),
+                )?
+                .keepalive
+                .map(|packet| packet.bytes.len())),
+            Self::Simple(_) => Err(Error::UnsupportedProfile(Profile::Simple)),
+        }
+    }
+
     pub fn try_recv_feedback_and_retransmit(&mut self, buf: &mut [u8]) -> Result<Option<usize>> {
         match self {
             Self::Simple(sender) => Ok(sender
@@ -295,6 +325,7 @@ pub struct ReceiverBuilder {
     flow_id: u32,
     cname: String,
     nack_mode: rist_core::packet::rtcp::NackMode,
+    session_config: MainSessionConfig,
     psk: Option<PskOptions>,
 }
 
@@ -306,6 +337,7 @@ impl ReceiverBuilder {
             flow_id: 0x1122_3344,
             cname: "rust".to_string(),
             nack_mode: rist_core::packet::rtcp::NackMode::Range,
+            session_config: MainSessionConfig::default(),
             psk: None,
         }
     }
@@ -326,6 +358,7 @@ impl ReceiverBuilder {
         if let Some(encryption) = &config.encryption {
             self.psk = Some(PskOptions::from_config(encryption));
         }
+        self.session_config = config.connection.into();
         self.local = resolve_endpoint(&config.endpoint)?;
         Ok(self)
     }
@@ -342,6 +375,11 @@ impl ReceiverBuilder {
 
     pub fn nack_mode(mut self, nack_mode: rist_core::packet::rtcp::NackMode) -> Self {
         self.nack_mode = nack_mode;
+        self
+    }
+
+    pub fn session_config(mut self, config: MainSessionConfig) -> Self {
+        self.session_config = config;
         self
     }
 
@@ -383,6 +421,7 @@ impl ReceiverBuilder {
                     self.cname,
                     self.nack_mode,
                 )?;
+                receiver.set_session_config(self.session_config);
                 if let Some(psk) = self.psk {
                     receiver.set_tx_key(psk.tx_key()?);
                     receiver.set_rx_key(psk.rx_key()?);
@@ -444,6 +483,26 @@ impl Receiver {
         }
     }
 
+    pub fn poll_session(&mut self) -> Result<MainSessionPoll> {
+        match self {
+            Self::Main(receiver) => Ok(receiver.poll_session(Instant::now())),
+            Self::Simple(_) => Err(Error::UnsupportedProfile(Profile::Simple)),
+        }
+    }
+
+    pub fn poll_keepalive(&mut self, mac: [u8; 6]) -> Result<Option<usize>> {
+        match self {
+            Self::Main(receiver) => Ok(receiver
+                .poll_session_and_send_keepalive(
+                    Instant::now(),
+                    rist_core::packet::gre::GreKeepalive::librist_default(mac),
+                )?
+                .keepalive
+                .map(|packet| packet.bytes.len())),
+            Self::Simple(_) => Err(Error::UnsupportedProfile(Profile::Simple)),
+        }
+    }
+
     pub fn local_addr(&self) -> Result<SocketAddr> {
         Ok(match self {
             Self::Simple(receiver) => receiver.local_addr()?,
@@ -481,7 +540,7 @@ fn resolve_endpoint(endpoint: &Endpoint) -> Result<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rist_core::packet::gre::ReducedPacket;
+    use rist_core::packet::gre::{KeepalivePacket, ReducedPacket};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -567,5 +626,30 @@ mod tests {
         let reduced = ReducedPacket::decode(&buf[..len]).unwrap();
         assert_eq!(reduced.reduced.src_port, 9000);
         assert_eq!(reduced.reduced.dst_port, 9001);
+    }
+
+    #[test]
+    fn main_sender_url_keepalive_interval_drives_poll_keepalive() {
+        let raw_receiver = std::net::UdpSocket::bind(loopback_any()).unwrap();
+        raw_receiver
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let url = format!(
+            "rist://127.0.0.1:{}?keepalive-interval=0&session-timeout=50",
+            raw_receiver.local_addr().unwrap().port()
+        );
+        let mut sender = Sender::builder(Profile::Main)
+            .peer_url(&url)
+            .unwrap()
+            .connect()
+            .unwrap();
+
+        assert!(sender.poll_keepalive([1, 2, 3, 4, 5, 6]).unwrap().is_some());
+
+        let mut buf = [0u8; 1500];
+        let (len, _) = raw_receiver.recv_from(&mut buf).unwrap();
+        let keepalive = KeepalivePacket::decode(&buf[..len]).unwrap();
+        assert_eq!(keepalive.gre.sequence, Some(0));
+        assert_eq!(keepalive.keepalive.mac, [1, 2, 3, 4, 5, 6]);
     }
 }

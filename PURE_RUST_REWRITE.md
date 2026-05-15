@@ -72,6 +72,9 @@ The first milestone has grown into a usable pure-Rust prototype:
   NACK feedback, retransmit, and mark recovery.
 - Main Profile sender/receiver core for GRE reduced data, NACK feedback,
   keepalive, buffer negotiation, NPD, PSK encryption, and encrypted feedback.
+- Main Profile session timers for keepalive scheduling and peer inactivity
+  timeout detection, wired through the Mio transport and pure builder URL
+  options.
 - Mio UDP transport for Simple and Main profiles, including packet loss recovery,
   NPD, RTCP echo RTT, Main Profile keepalive/buffer negotiation, and encrypted
   Main Profile recovery.
@@ -98,6 +101,6 @@ The first milestone has grown into a usable pure-Rust prototype:
 ## Next Slices
 
 1. Move beyond the upstream smoke matrix into remaining production gaps:
-   Advanced Profile, bonding/load-balancing, full connection/session timers,
-   multicast SRP rollover, applying the remaining parsed URL controls to runtime
-   behavior, and long-running soak tests.
+   Advanced Profile, bonding/load-balancing, multicast SRP rollover, applying
+   the remaining parsed URL controls to runtime behavior, and long-running soak
+   tests.
