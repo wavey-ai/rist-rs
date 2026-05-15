@@ -101,6 +101,9 @@ The first milestone has grown into a usable pure-Rust prototype:
   APIs over the Mio transport, with socket-address and RIST URL setup, PSK
   options, SRP URL credentials and handshake helpers, send/receive helpers,
   feedback, RTCP polling, stats, and local address access.
+- `Profile::Advanced` is accepted by the pure builders for the implemented
+  Main-compatible subset, with advanced-only policy still tracked as remaining
+  work.
 - An environment-gated bidirectional `librist` interop harness for Simple
   Profile. It covers pure Rust sender to librist receiver and librist sender to
   pure Rust receiver, including Simple Profile RTP/RTCP even-port pairing.
@@ -114,6 +117,6 @@ The first milestone has grown into a usable pure-Rust prototype:
 ## Next Slices
 
 1. Move beyond the upstream smoke matrix into remaining production gaps:
-   Advanced Profile policy/API completeness, multicast-specific SRP rollover
-   coverage on non-Darwin hosts, applying the remaining parsed URL controls to
-   runtime behavior, and long-running soak tests.
+   Advanced-only policy completeness, multicast-specific SRP rollover coverage
+   on non-Darwin hosts, applying the remaining parsed URL controls to runtime
+   behavior, and long-running soak tests.

@@ -223,7 +223,7 @@ impl SenderBuilder {
                 }
                 Ok(Sender::Simple(sender))
             }
-            Profile::Main => {
+            Profile::Main | Profile::Advanced => {
                 let mut sender = rist_mio::MainMioSender::connect(
                     self.local,
                     peer,
@@ -247,7 +247,6 @@ impl SenderBuilder {
                 }
                 Ok(Sender::Main(sender))
             }
-            other => Err(Error::UnsupportedProfile(other)),
         }
     }
 }
@@ -482,7 +481,7 @@ impl MultiSenderBuilder {
             return Err(Error::MissingPeer);
         }
         match self.profile {
-            Profile::Main => {
+            Profile::Main | Profile::Advanced => {
                 let mut sender = rist_mio::MainMioMultiSender::bind(
                     self.local,
                     self.flow_id,
@@ -505,7 +504,7 @@ impl MultiSenderBuilder {
                 }
                 Ok(MultiSender::Main(sender))
             }
-            other => Err(Error::UnsupportedProfile(other)),
+            Profile::Simple => Err(Error::UnsupportedProfile(Profile::Simple)),
         }
     }
 }
@@ -678,7 +677,7 @@ impl ReceiverBuilder {
                 self.cname,
                 self.nack_mode,
             )?)),
-            Profile::Main => {
+            Profile::Main | Profile::Advanced => {
                 let mut receiver = rist_mio::MainMioReceiver::bind(
                     self.local,
                     self.flow_id,
@@ -695,7 +694,6 @@ impl ReceiverBuilder {
                 }
                 Ok(Receiver::Main(receiver))
             }
-            other => Err(Error::UnsupportedProfile(other)),
         }
     }
 }
@@ -939,6 +937,27 @@ mod tests {
         let mut buf = [0; 1500];
         let payload = recv_eventually(&mut receiver, &mut buf);
         assert_eq!(payload.payload, b"payload");
+    }
+
+    #[test]
+    fn advanced_profile_round_trip_uses_main_compatible_subset() {
+        let flow_id = 0x1122_3344;
+        let mut receiver = Receiver::builder(Profile::Advanced)
+            .flow_id(flow_id)
+            .bind()
+            .unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+        let mut sender = Sender::builder(Profile::Advanced)
+            .peer_addr(receiver_addr)
+            .flow_id(flow_id)
+            .connect()
+            .unwrap();
+
+        assert_eq!(sender.send(b"advanced-subset").unwrap(), 15);
+
+        let mut buf = [0; 1500];
+        let payload = recv_eventually(&mut receiver, &mut buf);
+        assert_eq!(payload.payload, b"advanced-subset");
     }
 
     #[test]
