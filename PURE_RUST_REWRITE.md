@@ -93,6 +93,8 @@ The first milestone has grown into a usable pure-Rust prototype:
   literal interfaces.
 - Main Profile sender restart regression coverage that repeatedly creates,
   uses, drops, and recreates a sender while exercising a sustained send loop.
+- Sans-I/O Main Profile sustained periodic-loss recovery coverage over hundreds
+  of packets, exercising larger NACK feedback and retransmission batches.
 - A `rist` crate `pure-rust` feature that exposes the Rust implementation under
   `rist::pure` while leaving the existing librist-backed API unchanged by
   default. `rist::pure::Sender` and `rist::pure::Receiver` now provide builder

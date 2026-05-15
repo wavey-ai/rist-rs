@@ -710,6 +710,42 @@ mod tests {
     }
 
     #[test]
+    fn main_profile_recovers_sustained_periodic_loss() {
+        let now = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut sender = MainSenderCore::new(0x1122_3344, 256);
+        let mut receiver = MainReceiverCore::new(0x1122_3344, "rust", NackMode::Range);
+        let mut lost_sequences = Vec::new();
+
+        for index in 0..200u32 {
+            let payload = index.to_be_bytes();
+            let packet = sender.send_payload(&payload, ntp, now);
+            if index % 10 == 3 {
+                lost_sequences.push(packet.rtp_sequence);
+            } else {
+                receiver.accept_packet(&packet.bytes).unwrap();
+            }
+        }
+
+        assert_eq!(receiver.missing_sequences(), lost_sequences);
+
+        let feedback = receiver.build_feedback();
+        let retries = sender.handle_feedback(&feedback.bytes).unwrap();
+        assert_eq!(retries.len(), lost_sequences.len());
+
+        for retry in retries {
+            let recovered = receiver.accept_packet(&retry.bytes).unwrap();
+            assert!(recovered.recovered);
+        }
+
+        assert!(receiver.missing_sequences().is_empty());
+        assert_eq!(
+            receiver.stats().recovered_packets,
+            lost_sequences.len() as u64
+        );
+    }
+
+    #[test]
     fn main_profile_preserves_npd_through_gre() {
         let now = Instant::now();
         let ntp = ntp_from_unix_duration(Duration::from_secs(1));
