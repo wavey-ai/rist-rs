@@ -7,15 +7,17 @@
 use mio::event::Source;
 use mio::net::UdpSocket;
 use mio::{Interest, Registry, Token};
+use rist_core::auth::{EapSrpAuthenticatorSession, EapSrpClientSession, EapolFrame};
 use rist_core::crypto::PskKey;
 use rist_core::packet::gre::{
-    BufferNegotiation, GreKeepalive, OwnedBufferNegotiationPacket, OwnedKeepalivePacket,
+    BufferNegotiation, GreHeader, GreKeepalive, OwnedBufferNegotiationPacket, OwnedKeepalivePacket,
+    GRE_PROTOCOL_TYPE_EAPOL,
 };
 use rist_core::packet::rtp::{encode_packet, RtpHeader, RtpPacket};
 use rist_core::{
     packet::rtcp::NackMode, MainControlPacket, MainOutboundPacket, MainReceiverCore,
     MainReceiverFeedback, MainSenderCore, OutboundPacket, ReceivedPayload, ReceiverStats,
-    SenderStats, SimpleReceiverCore, SimpleSenderCore,
+    SenderStats, SimpleReceiverCore, SimpleSenderCore, SrpCredentialStore,
 };
 use std::io;
 use std::net::SocketAddr;
@@ -367,6 +369,7 @@ impl SimpleMioReceiver {
 pub struct MainMioSender {
     socket: RtpUdpSocket,
     core: MainSenderCore,
+    srp: Option<EapSrpClientSession>,
 }
 
 impl MainMioSender {
@@ -379,6 +382,7 @@ impl MainMioSender {
         Ok(Self {
             socket: RtpUdpSocket::connect(local, peer, flow_id)?,
             core: MainSenderCore::new(flow_id, history_packets),
+            srp: None,
         })
     }
 
@@ -411,11 +415,28 @@ impl MainMioSender {
         self.core.set_rx_key(key);
     }
 
+    pub fn enable_srp_client(&mut self, username: impl Into<String>, password: impl AsRef<[u8]>) {
+        self.srp =
+            Some(EapSrpClientSession::new(username, password).with_session_key_passphrase(false));
+    }
+
+    pub fn set_srp_client_session(&mut self, session: EapSrpClientSession) {
+        self.srp = Some(session);
+    }
+
+    pub fn srp_authenticated(&self) -> bool {
+        self.srp
+            .as_ref()
+            .map(|session| session.authenticated())
+            .unwrap_or(true)
+    }
+
     pub fn stats(&self) -> SenderStats {
         self.core.stats()
     }
 
     pub fn send_outbound(&mut self, packet: &MainOutboundPacket) -> io::Result<usize> {
+        self.ensure_srp_authenticated()?;
         self.socket.send_packet(&packet.bytes)
     }
 
@@ -425,6 +446,7 @@ impl MainMioSender {
         ntp_timestamp: u64,
         now: Instant,
     ) -> io::Result<MainOutboundPacket> {
+        self.ensure_srp_authenticated()?;
         let packet = self.build_payload(payload, ntp_timestamp, now);
         self.send_outbound(&packet)?;
         Ok(packet)
@@ -435,6 +457,7 @@ impl MainMioSender {
         now: Instant,
         ntp_timestamp: u64,
     ) -> io::Result<Option<MainControlPacket>> {
+        self.ensure_srp_authenticated()?;
         let Some(packet) = self.core.poll_rtcp(now, ntp_timestamp) else {
             return Ok(None);
         };
@@ -468,6 +491,32 @@ impl MainMioSender {
         Ok(packet)
     }
 
+    pub fn start_srp_authentication(&mut self) -> io::Result<MainControlPacket> {
+        let Some(session) = &self.srp else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SRP client session is not configured",
+            ));
+        };
+        self.send_eapol_frame(&session.start())
+    }
+
+    pub fn send_eapol_frame(&mut self, frame: &EapolFrame) -> io::Result<MainControlPacket> {
+        let packet = self.core.build_eapol(frame).map_err(core_to_io_error)?;
+        self.socket.send_packet(&packet.bytes)?;
+        Ok(packet)
+    }
+
+    pub fn try_recv_eapol_and_respond(&mut self, buf: &mut [u8]) -> io::Result<Option<EapolFrame>> {
+        let Some((_from, packet)) = self.socket.recv_datagram(buf)? else {
+            return Ok(None);
+        };
+        if !is_eapol_datagram(packet) {
+            return Ok(None);
+        }
+        self.handle_eapol_datagram(packet)
+    }
+
     pub fn try_recv_keepalive(
         &mut self,
         buf: &mut [u8],
@@ -475,6 +524,13 @@ impl MainMioSender {
         let Some((from, packet)) = self.socket.recv_datagram(buf)? else {
             return Ok(None);
         };
+        if is_eapol_datagram(packet) {
+            self.handle_eapol_datagram(packet)?;
+            return Ok(None);
+        }
+        if !self.srp_authenticated() {
+            return Ok(None);
+        }
         let keepalive = self
             .core
             .accept_keepalive(packet)
@@ -489,6 +545,13 @@ impl MainMioSender {
         let Some((from, packet)) = self.socket.recv_datagram(buf)? else {
             return Ok(None);
         };
+        if is_eapol_datagram(packet) {
+            self.handle_eapol_datagram(packet)?;
+            return Ok(None);
+        }
+        if !self.srp_authenticated() {
+            return Ok(None);
+        }
         let negotiation = self
             .core
             .accept_buffer_negotiation(packet)
@@ -503,6 +566,13 @@ impl MainMioSender {
         let Some((_from, feedback)) = self.socket.recv_datagram(buf)? else {
             return Ok(None);
         };
+        if is_eapol_datagram(feedback) {
+            self.handle_eapol_datagram(feedback)?;
+            return Ok(None);
+        }
+        if !self.srp_authenticated() {
+            return Ok(None);
+        }
         let retries = self
             .core
             .handle_feedback(feedback)
@@ -516,12 +586,33 @@ impl MainMioSender {
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
     }
+
+    fn handle_eapol_datagram(&mut self, packet: &[u8]) -> io::Result<Option<EapolFrame>> {
+        let frame = self.core.accept_eapol(packet).map_err(core_to_io_error)?;
+        let response = match &mut self.srp {
+            Some(session) => session.handle_frame(&frame).map_err(core_to_io_error)?,
+            None => None,
+        };
+        if let Some(response) = response {
+            self.send_eapol_frame(&response)?;
+        }
+        Ok(Some(frame))
+    }
+
+    fn ensure_srp_authenticated(&self) -> io::Result<()> {
+        if self.srp_authenticated() {
+            Ok(())
+        } else {
+            Err(srp_not_authenticated_error())
+        }
+    }
 }
 
 pub struct MainMioReceiver {
     socket: RtpUdpSocket,
     core: MainReceiverCore,
     last_peer: Option<SocketAddr>,
+    srp: Option<EapSrpAuthenticatorSession>,
 }
 
 impl MainMioReceiver {
@@ -535,6 +626,7 @@ impl MainMioReceiver {
             socket: RtpUdpSocket::bind(local, flow_id)?,
             core: MainReceiverCore::new(flow_id, cname, nack_mode),
             last_peer: None,
+            srp: None,
         })
     }
 
@@ -545,6 +637,13 @@ impl MainMioReceiver {
         let Some((from, packet)) = self.socket.recv_datagram(buf)? else {
             return Ok(None);
         };
+        if is_eapol_datagram(packet) {
+            self.handle_eapol_datagram(from, packet)?;
+            return Ok(None);
+        }
+        if !self.srp_authenticated() {
+            return Ok(None);
+        }
         let payload = self.core.accept_packet(packet).map_err(core_to_io_error)?;
         self.last_peer = Some(from);
         Ok(Some((from, payload)))
@@ -558,6 +657,21 @@ impl MainMioReceiver {
         self.core.set_rx_key(key);
     }
 
+    pub fn enable_srp_authenticator(&mut self, store: SrpCredentialStore) {
+        self.srp = Some(EapSrpAuthenticatorSession::new(store).with_session_key_passphrase(false));
+    }
+
+    pub fn set_srp_authenticator_session(&mut self, session: EapSrpAuthenticatorSession) {
+        self.srp = Some(session);
+    }
+
+    pub fn srp_authenticated(&self) -> bool {
+        self.srp
+            .as_ref()
+            .map(|session| session.authenticated())
+            .unwrap_or(true)
+    }
+
     pub fn send_feedback(&mut self) -> io::Result<Option<usize>> {
         let Some(peer) = self.last_peer else {
             return Ok(None);
@@ -566,6 +680,7 @@ impl MainMioReceiver {
     }
 
     pub fn send_feedback_to(&mut self, peer: SocketAddr) -> io::Result<usize> {
+        self.ensure_srp_authenticated()?;
         let feedback = self.core.build_feedback();
         self.socket.send_packet_to(peer, &feedback.bytes)
     }
@@ -578,6 +693,7 @@ impl MainMioReceiver {
         let Some(peer) = self.last_peer else {
             return Ok(None);
         };
+        self.ensure_srp_authenticated()?;
         let Some(packet) = self.core.poll_rtcp(now, now_ntp) else {
             return Ok(None);
         };
@@ -593,6 +709,13 @@ impl MainMioReceiver {
         let Some((from, packet)) = self.socket.recv_datagram(buf)? else {
             return Ok(None);
         };
+        if is_eapol_datagram(packet) {
+            self.handle_eapol_datagram(from, packet)?;
+            return Ok(None);
+        }
+        if !self.srp_authenticated() {
+            return Ok(None);
+        }
         let responses = self
             .core
             .handle_rtcp(packet, now_ntp)
@@ -624,6 +747,26 @@ impl MainMioReceiver {
         Ok(packet)
     }
 
+    pub fn send_eapol_frame_to(
+        &mut self,
+        peer: SocketAddr,
+        frame: &EapolFrame,
+    ) -> io::Result<MainControlPacket> {
+        let packet = self.core.build_eapol(frame).map_err(core_to_io_error)?;
+        self.socket.send_packet_to(peer, &packet.bytes)?;
+        Ok(packet)
+    }
+
+    pub fn try_recv_eapol_and_respond(&mut self, buf: &mut [u8]) -> io::Result<Option<EapolFrame>> {
+        let Some((from, packet)) = self.socket.recv_datagram(buf)? else {
+            return Ok(None);
+        };
+        if !is_eapol_datagram(packet) {
+            return Ok(None);
+        }
+        self.handle_eapol_datagram(from, packet)
+    }
+
     pub fn try_recv_keepalive(
         &mut self,
         buf: &mut [u8],
@@ -631,6 +774,13 @@ impl MainMioReceiver {
         let Some((from, packet)) = self.socket.recv_datagram(buf)? else {
             return Ok(None);
         };
+        if is_eapol_datagram(packet) {
+            self.handle_eapol_datagram(from, packet)?;
+            return Ok(None);
+        }
+        if !self.srp_authenticated() {
+            return Ok(None);
+        }
         let keepalive = self
             .core
             .accept_keepalive(packet)
@@ -646,6 +796,13 @@ impl MainMioReceiver {
         let Some((from, packet)) = self.socket.recv_datagram(buf)? else {
             return Ok(None);
         };
+        if is_eapol_datagram(packet) {
+            self.handle_eapol_datagram(from, packet)?;
+            return Ok(None);
+        }
+        if !self.srp_authenticated() {
+            return Ok(None);
+        }
         let negotiation = self
             .core
             .accept_buffer_negotiation(packet)
@@ -665,10 +822,48 @@ impl MainMioReceiver {
     pub fn stats(&self) -> ReceiverStats {
         self.core.stats()
     }
+
+    fn handle_eapol_datagram(
+        &mut self,
+        from: SocketAddr,
+        packet: &[u8],
+    ) -> io::Result<Option<EapolFrame>> {
+        let frame = self.core.accept_eapol(packet).map_err(core_to_io_error)?;
+        let response = match &mut self.srp {
+            Some(session) => session.handle_frame(&frame).map_err(core_to_io_error)?,
+            None => None,
+        };
+        if let Some(response) = response {
+            self.send_eapol_frame_to(from, &response)?;
+        }
+        self.last_peer = Some(from);
+        Ok(Some(frame))
+    }
+
+    fn ensure_srp_authenticated(&self) -> io::Result<()> {
+        if self.srp_authenticated() {
+            Ok(())
+        } else {
+            Err(srp_not_authenticated_error())
+        }
+    }
 }
 
 fn core_to_io_error(err: rist_core::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, err)
+}
+
+fn is_eapol_datagram(packet: &[u8]) -> bool {
+    GreHeader::decode(packet)
+        .map(|(gre, _)| gre.protocol_type == GRE_PROTOCOL_TYPE_EAPOL)
+        .unwrap_or(false)
+}
+
+fn srp_not_authenticated_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "SRP authentication has not completed",
+    )
 }
 
 #[cfg(test)]
@@ -862,6 +1057,39 @@ mod tests {
         let recovered = recv_main_payload_eventually(&mut receiver, &mut rx_buf);
         assert!(recovered.recovered);
         assert_eq!(recovered.payload, b"lost");
+    }
+
+    #[test]
+    fn main_profile_srp_authenticates_before_payload() {
+        let flow_id = 0x1122_3344;
+        let now = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut receiver =
+            MainMioReceiver::bind(loopback_any(), flow_id, "rust", NackMode::Range).unwrap();
+        let mut store = SrpCredentialStore::new();
+        store.stage_password("rist", b"mainprofile").unwrap();
+        receiver.enable_srp_authenticator(store);
+        let receiver_addr = receiver.local_addr().unwrap();
+        let mut sender =
+            MainMioSender::connect(loopback_any(), receiver_addr, flow_id, 64).unwrap();
+        sender.enable_srp_client("rist", b"mainprofile");
+
+        let err = sender.send_payload(b"too-early", ntp, now).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+
+        sender.start_srp_authentication().unwrap();
+        let mut sender_buf = [0u8; 1500];
+        let mut receiver_buf = [0u8; 1500];
+        drive_main_srp_authentication(
+            &mut sender,
+            &mut receiver,
+            &mut sender_buf,
+            &mut receiver_buf,
+        );
+
+        sender.send_payload(b"payload", ntp, now).unwrap();
+        let received = recv_main_payload_eventually(&mut receiver, &mut receiver_buf);
+        assert_eq!(received.payload, b"payload");
     }
 
     #[test]
@@ -1059,6 +1287,24 @@ mod tests {
                 return retries;
             }
             assert!(Instant::now() < deadline, "timed out waiting for feedback");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn drive_main_srp_authentication(
+        sender: &mut MainMioSender,
+        receiver: &mut MainMioReceiver,
+        sender_buf: &mut [u8],
+        receiver_buf: &mut [u8],
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !sender.srp_authenticated() || !receiver.srp_authenticated() {
+            receiver.try_recv_eapol_and_respond(receiver_buf).unwrap();
+            sender.try_recv_eapol_and_respond(sender_buf).unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for SRP authentication"
+            );
             thread::sleep(Duration::from_millis(1));
         }
     }

@@ -53,6 +53,9 @@ The first milestone has grown into a usable pure-Rust prototype:
   primitives, generation-based credential lookup for re-authentication,
   passphrase rollover helpers, and unencrypted EAPOL GRE control packets for
   Main Profile authentication.
+- Mio Main Profile SRP client/authenticator integration that gates data until
+  authentication completes, plus environment-gated librist SRP handshake
+  interop in both directions.
 - RIST URL parsing for listen/client addresses and common recovery/crypto query
   options.
 - Sequence extension and missing-packet tracking.
@@ -80,8 +83,7 @@ The first milestone has grown into a usable pure-Rust prototype:
 
 ## Next Slices
 
-1. Integrate the SRP/EAP state machine into the Mio Main Profile transport and
-   add SRP-enabled librist interop coverage.
-2. Build out the remaining upstream loss/mode matrix: Simple multicast,
-   Main server/client and client/server modes, AES mismatch failures, sender
-   restart behavior, and SRP-enabled integration.
+1. Build out the remaining upstream loss/mode matrix: Simple multicast,
+   Main Profile librist payload interop in server/client and client/server
+   modes, AES mismatch failures, sender restart behavior, and SRP-enabled
+   payload integration.

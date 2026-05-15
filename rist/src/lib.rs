@@ -27,6 +27,7 @@ mod options;
 mod profile;
 mod receiver;
 mod sender;
+mod srp;
 pub mod stats;
 
 #[cfg(feature = "tokio")]

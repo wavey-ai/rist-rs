@@ -746,6 +746,11 @@ impl EapSrpClientSession {
         self
     }
 
+    pub fn with_session_key_passphrase(mut self, enabled: bool) -> Self {
+        self.use_session_key_as_passphrase = enabled;
+        self
+    }
+
     pub fn start(&self) -> EapolFrame {
         EapolFrame::start(self.eap_version)
     }
@@ -909,6 +914,11 @@ impl EapSrpAuthenticatorSession {
 
     pub fn with_explicit_passphrase(mut self) -> Self {
         self.use_session_key_as_passphrase = false;
+        self
+    }
+
+    pub fn with_session_key_passphrase(mut self, enabled: bool) -> Self {
+        self.use_session_key_as_passphrase = enabled;
         self
     }
 

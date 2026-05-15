@@ -1,10 +1,12 @@
 #![forbid(unsafe_code)]
 
+use rist_core::packet::gre::GreKeepalive;
 use rist_core::packet::rtcp::{
     encode_echo, encode_empty_receiver_report, encode_sdes_cname, Echo, EchoKind, NackMode,
 };
 use rist_core::time::ntp_now;
-use rist_mio::{SimpleMioReceiver, SimpleMioSender};
+use rist_core::{PskKey, SrpCredentialStore};
+use rist_mio::{MainMioReceiver, MainMioSender, SimpleMioReceiver, SimpleMioSender};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::sync::Mutex;
 use std::thread;
@@ -150,6 +152,92 @@ fn librist_simple_sender_to_pure_rust_receiver() {
         assert!(
             Instant::now() < deadline,
             "timed out waiting for pure Rust receiver"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn pure_rust_main_srp_client_authenticates_with_librist_receiver() {
+    if !interop_enabled() {
+        return;
+    }
+    let _guard = INTEROP_MUTEX.lock().unwrap();
+
+    let port = next_even_test_port_pair();
+    let receiver_url = format!(
+        "rist://@127.0.0.1:{port}?secret=12345678&aes-type=128&username=testuser&password=testpassword"
+    );
+    let receiver_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+
+    let mut receiver = rist::Receiver::new(rist::Profile::Main).unwrap();
+    receiver.add_peer(&receiver_url).unwrap();
+    receiver.start().unwrap();
+
+    let mut sender =
+        MainMioSender::connect(loopback_any(), receiver_addr, 0x1122_3344, 64).unwrap();
+    sender.set_tx_key(PskKey::new(128, b"12345678").unwrap());
+    sender.enable_srp_client("testuser", b"testpassword");
+    sender
+        .send_keepalive(GreKeepalive::librist_default([1, 2, 3, 4, 5, 6]))
+        .unwrap();
+    thread::sleep(Duration::from_millis(20));
+    sender.start_srp_authentication().unwrap();
+    drive_main_srp_client(&mut sender);
+    assert!(sender.srp_authenticated());
+}
+
+#[test]
+fn librist_main_srp_client_authenticates_with_pure_rust_receiver() {
+    if !interop_enabled() {
+        return;
+    }
+    let _guard = INTEROP_MUTEX.lock().unwrap();
+
+    let flow_id = 0x1122_3344;
+    let receiver_port = next_even_test_port_pair();
+    let receiver_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, receiver_port));
+    let mut receiver =
+        MainMioReceiver::bind(receiver_addr, flow_id, "rust", NackMode::Range).unwrap();
+    receiver.set_rx_key(PskKey::receiver(128, b"12345678").unwrap());
+    let mut store = SrpCredentialStore::new();
+    store.stage_password("testuser", b"testpassword").unwrap();
+    receiver.enable_srp_authenticator(store);
+    let receiver_addr = receiver.local_addr().unwrap();
+
+    let sender_url = format!(
+        "rist://127.0.0.1:{}?secret=12345678&aes-type=128&username=testuser&password=testpassword",
+        receiver_addr.port()
+    );
+    let mut sender = rist::Sender::new(rist::Profile::Main).unwrap();
+    sender.add_peer(&sender_url).unwrap();
+    sender.start().unwrap();
+
+    drive_main_srp_authenticator(&mut receiver);
+    assert!(receiver.srp_authenticated());
+}
+
+fn drive_main_srp_client(sender: &mut MainMioSender) {
+    let mut buf = [0; 1500];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !sender.srp_authenticated() {
+        sender.try_recv_eapol_and_respond(&mut buf).unwrap();
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for pure Rust SRP client"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn drive_main_srp_authenticator(receiver: &mut MainMioReceiver) {
+    let mut buf = [0; 1500];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !receiver.srp_authenticated() {
+        receiver.try_recv_eapol_and_respond(&mut buf).unwrap();
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for pure Rust SRP authenticator"
         );
         thread::sleep(Duration::from_millis(1));
     }

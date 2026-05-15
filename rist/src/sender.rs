@@ -48,6 +48,11 @@ impl Sender {
 
         let mut peer: *mut rist_sys::rist_peer = ptr::null_mut();
         let ret = unsafe { rist_sys::rist_peer_create(self.ctx, &mut peer, peer_config) };
+        let srp_result = if ret == 0 {
+            unsafe { crate::srp::enable_from_peer_config(peer, &*peer_config) }
+        } else {
+            Ok(())
+        };
 
         unsafe {
             rist_sys::rist_peer_config_free2(&mut peer_config);
@@ -57,6 +62,7 @@ impl Sender {
             return Err(Error::PeerCreation(url.to_string()));
         }
 
+        srp_result?;
         Ok(())
     }
 
