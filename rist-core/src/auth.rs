@@ -759,6 +759,13 @@ impl EapSrpClientSession {
         self.authenticated
     }
 
+    pub fn set_password(&mut self, password: impl AsRef<[u8]>) {
+        self.password = password.as_ref().to_vec();
+        self.srp = None;
+        self.authenticated = false;
+        self.rx_passphrase = None;
+    }
+
     pub fn session_key(&self) -> Option<&[u8; SRP_SHA256_DIGEST_LENGTH]> {
         self.srp.as_ref().and_then(SrpClient::session_key)
     }
@@ -924,6 +931,22 @@ impl EapSrpAuthenticatorSession {
 
     pub fn authenticated(&self) -> bool {
         self.authenticated
+    }
+
+    pub fn stage_password(
+        &mut self,
+        username: impl Into<String>,
+        password: impl AsRef<[u8]>,
+    ) -> Result<SrpUserRecord> {
+        self.store.stage_password(username, password)
+    }
+
+    pub fn retire_generations_before(&mut self, username: &str, generation: u64) {
+        self.store.retire_before(username, generation);
+    }
+
+    pub fn current_generation(&self, username: &str) -> Option<u64> {
+        self.store.current(username).map(|record| record.generation)
     }
 
     pub fn session_key(&self) -> Option<&[u8; SRP_SHA256_DIGEST_LENGTH]> {

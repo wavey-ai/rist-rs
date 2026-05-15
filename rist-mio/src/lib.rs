@@ -7,7 +7,7 @@
 use mio::event::Source;
 use mio::net::UdpSocket;
 use mio::{Interest, Registry, Token};
-use rist_core::auth::{EapSrpAuthenticatorSession, EapSrpClientSession, EapolFrame};
+use rist_core::auth::{EapSrpAuthenticatorSession, EapSrpClientSession, EapolFrame, SrpUserRecord};
 use rist_core::crypto::PskKey;
 use rist_core::packet::gre::{
     BufferNegotiation, GreHeader, GreKeepalive, OwnedBufferNegotiationPacket, OwnedKeepalivePacket,
@@ -505,6 +505,17 @@ impl MainMioSender {
             Some(EapSrpClientSession::new(username, password).with_session_key_passphrase(false));
     }
 
+    pub fn update_srp_client_password(&mut self, password: impl AsRef<[u8]>) -> io::Result<()> {
+        let Some(session) = &mut self.srp else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SRP client session is not configured",
+            ));
+        };
+        session.set_password(password);
+        Ok(())
+    }
+
     pub fn set_srp_client_session(&mut self, session: EapSrpClientSession) {
         self.srp = Some(session);
     }
@@ -675,6 +686,14 @@ impl MainMioSender {
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
+    }
+
+    pub fn set_multicast_loop_v4(&self, on: bool) -> io::Result<()> {
+        self.socket.set_multicast_loop_v4(on)
+    }
+
+    pub fn set_multicast_ttl_v4(&self, ttl: u32) -> io::Result<()> {
+        self.socket.set_multicast_ttl_v4(ttl)
     }
 
     fn handle_eapol_datagram(&mut self, packet: &[u8]) -> io::Result<Option<EapolFrame>> {
@@ -859,6 +878,14 @@ impl MainMioMultiSender {
         self.socket.local_addr()
     }
 
+    pub fn set_multicast_loop_v4(&self, on: bool) -> io::Result<()> {
+        self.socket.set_multicast_loop_v4(on)
+    }
+
+    pub fn set_multicast_ttl_v4(&self, ttl: u32) -> io::Result<()> {
+        self.socket.set_multicast_ttl_v4(ttl)
+    }
+
     pub fn stats(&self) -> SenderStats {
         self.core.stats()
     }
@@ -1004,6 +1031,43 @@ impl MainMioReceiver {
 
     pub fn enable_srp_authenticator(&mut self, store: SrpCredentialStore) {
         self.srp = Some(EapSrpAuthenticatorSession::new(store).with_session_key_passphrase(false));
+    }
+
+    pub fn stage_srp_password(
+        &mut self,
+        username: impl Into<String>,
+        password: impl AsRef<[u8]>,
+    ) -> io::Result<SrpUserRecord> {
+        let Some(session) = &mut self.srp else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SRP authenticator session is not configured",
+            ));
+        };
+        session
+            .stage_password(username, password)
+            .map_err(core_to_io_error)
+    }
+
+    pub fn retire_srp_generations_before(
+        &mut self,
+        username: &str,
+        generation: u64,
+    ) -> io::Result<()> {
+        let Some(session) = &mut self.srp else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SRP authenticator session is not configured",
+            ));
+        };
+        session.retire_generations_before(username, generation);
+        Ok(())
+    }
+
+    pub fn current_srp_generation(&self, username: &str) -> Option<u64> {
+        self.srp
+            .as_ref()
+            .and_then(|session| session.current_generation(username))
     }
 
     pub fn set_srp_authenticator_session(&mut self, session: EapSrpAuthenticatorSession) {
@@ -1166,6 +1230,14 @@ impl MainMioReceiver {
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
+    }
+
+    pub fn join_multicast_v4(&self, multiaddr: Ipv4Addr, interface: Ipv4Addr) -> io::Result<()> {
+        self.socket.join_multicast_v4(multiaddr, interface)
+    }
+
+    pub fn leave_multicast_v4(&self, multiaddr: Ipv4Addr, interface: Ipv4Addr) -> io::Result<()> {
+        self.socket.leave_multicast_v4(multiaddr, interface)
     }
 
     pub fn missing_sequences(&self) -> Vec<u32> {
@@ -1581,6 +1653,56 @@ mod tests {
         sender.send_payload(b"payload", ntp, now).unwrap();
         let received = recv_main_payload_eventually(&mut receiver, &mut receiver_buf);
         assert_eq!(received.payload, b"payload");
+    }
+
+    #[test]
+    fn main_profile_srp_reauthenticates_after_password_rollover() {
+        let flow_id = 0x1122_3344;
+        let now = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut receiver =
+            MainMioReceiver::bind(loopback_any(), flow_id, "rust", NackMode::Range).unwrap();
+        let mut store = SrpCredentialStore::new();
+        store.stage_password("rist", b"old-password").unwrap();
+        receiver.enable_srp_authenticator(store);
+        let receiver_addr = receiver.local_addr().unwrap();
+        let mut sender =
+            MainMioSender::connect(loopback_any(), receiver_addr, flow_id, 64).unwrap();
+        sender.enable_srp_client("rist", b"old-password");
+
+        sender.start_srp_authentication().unwrap();
+        let mut sender_buf = [0u8; 1500];
+        let mut receiver_buf = [0u8; 1500];
+        drive_main_srp_authentication(
+            &mut sender,
+            &mut receiver,
+            &mut sender_buf,
+            &mut receiver_buf,
+        );
+        sender.send_payload(b"before-rollover", ntp, now).unwrap();
+        let received = recv_main_payload_eventually(&mut receiver, &mut receiver_buf);
+        assert_eq!(received.payload, b"before-rollover");
+
+        let generation = receiver
+            .stage_srp_password("rist", b"new-password")
+            .unwrap()
+            .generation;
+        receiver
+            .retire_srp_generations_before("rist", generation)
+            .unwrap();
+        assert_eq!(receiver.current_srp_generation("rist"), Some(generation));
+        sender.update_srp_client_password(b"new-password").unwrap();
+
+        sender.start_srp_authentication().unwrap();
+        drive_main_srp_authentication(
+            &mut sender,
+            &mut receiver,
+            &mut sender_buf,
+            &mut receiver_buf,
+        );
+        sender.send_payload(b"after-rollover", ntp, now).unwrap();
+        let received = recv_main_payload_eventually(&mut receiver, &mut receiver_buf);
+        assert_eq!(received.payload, b"after-rollover");
     }
 
     #[test]

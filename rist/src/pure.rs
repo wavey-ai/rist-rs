@@ -25,8 +25,8 @@ pub use rist_core::{
     MainControlPacket, MainOutboundPacket, MainReceiverCore, MainReceiverFeedback, MainSenderCore,
     MainSessionConfig, MainSessionPoll, MultiplexMode, NullPacketSuppression, OutboundPacket,
     PeerConfig, PeerSelection, Profile, PskKey, ReceivedPayload, ReceiverStats, RecoveryConfig,
-    RecoveryMode, RtcpIntervals, SenderStats, SimpleReceiverCore, SimpleSenderCore, TimingMode,
-    VirtualPorts, WeightedPeerSelector,
+    RecoveryMode, RtcpIntervals, SenderStats, SimpleReceiverCore, SimpleSenderCore,
+    SrpCredentialStore, SrpUserRecord, TimingMode, VirtualPorts, WeightedPeerSelector,
 };
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -98,6 +98,7 @@ pub struct SenderBuilder {
     session_config: MainSessionConfig,
     null_packet_suppression: bool,
     psk: Option<PskOptions>,
+    srp_client: Option<(String, Vec<u8>)>,
 }
 
 impl SenderBuilder {
@@ -112,6 +113,7 @@ impl SenderBuilder {
             session_config: MainSessionConfig::default(),
             null_packet_suppression: false,
             psk: None,
+            srp_client: None,
         }
     }
 
@@ -132,6 +134,9 @@ impl SenderBuilder {
         }
         if let Some(encryption) = &config.encryption {
             self.psk = Some(PskOptions::from_config(encryption));
+        }
+        if let (Some(username), Some(password)) = (&config.srp_username, &config.srp_password) {
+            self.srp_client = Some((username.clone(), password.as_bytes().to_vec()));
         }
         self.virtual_ports = config.virtual_ports;
         self.session_config = config.connection.into();
@@ -187,6 +192,11 @@ impl SenderBuilder {
         self
     }
 
+    pub fn srp_client(mut self, username: impl Into<String>, password: impl AsRef<[u8]>) -> Self {
+        self.srp_client = Some((username.into(), password.as_ref().to_vec()));
+        self
+    }
+
     pub fn connect(self) -> Result<Sender> {
         let peer = self.peer.ok_or(Error::MissingPeer)?;
         match self.profile {
@@ -217,6 +227,9 @@ impl SenderBuilder {
                 if let Some(psk) = self.psk {
                     sender.set_tx_key(psk.tx_key()?);
                     sender.set_rx_key(psk.rx_key()?);
+                }
+                if let Some((username, password)) = self.srp_client {
+                    sender.enable_srp_client(username, password);
                 }
                 Ok(Sender::Main(sender))
             }
@@ -289,6 +302,34 @@ impl Sender {
                 )?
                 .keepalive
                 .map(|packet| packet.bytes.len())),
+            Self::Simple(_) => Err(Error::UnsupportedProfile(Profile::Simple)),
+        }
+    }
+
+    pub fn start_srp_authentication(&mut self) -> Result<Option<usize>> {
+        match self {
+            Self::Main(sender) => Ok(Some(sender.start_srp_authentication()?.bytes.len())),
+            Self::Simple(_) => Err(Error::UnsupportedProfile(Profile::Simple)),
+        }
+    }
+
+    pub fn try_recv_eapol_and_respond(&mut self, buf: &mut [u8]) -> Result<Option<()>> {
+        match self {
+            Self::Main(sender) => Ok(sender.try_recv_eapol_and_respond(buf)?.map(|_| ())),
+            Self::Simple(_) => Err(Error::UnsupportedProfile(Profile::Simple)),
+        }
+    }
+
+    pub fn srp_authenticated(&self) -> bool {
+        match self {
+            Self::Main(sender) => sender.srp_authenticated(),
+            Self::Simple(_) => true,
+        }
+    }
+
+    pub fn update_srp_client_password(&mut self, password: impl AsRef<[u8]>) -> Result<()> {
+        match self {
+            Self::Main(sender) => Ok(sender.update_srp_client_password(password)?),
             Self::Simple(_) => Err(Error::UnsupportedProfile(Profile::Simple)),
         }
     }
@@ -502,6 +543,7 @@ pub struct ReceiverBuilder {
     nack_mode: rist_core::packet::rtcp::NackMode,
     session_config: MainSessionConfig,
     psk: Option<PskOptions>,
+    srp_store: Option<SrpCredentialStore>,
 }
 
 impl ReceiverBuilder {
@@ -514,6 +556,7 @@ impl ReceiverBuilder {
             nack_mode: rist_core::packet::rtcp::NackMode::Range,
             session_config: MainSessionConfig::default(),
             psk: None,
+            srp_store: None,
         }
     }
 
@@ -532,6 +575,11 @@ impl ReceiverBuilder {
         }
         if let Some(encryption) = &config.encryption {
             self.psk = Some(PskOptions::from_config(encryption));
+        }
+        if let (Some(username), Some(password)) = (&config.srp_username, &config.srp_password) {
+            let mut store = SrpCredentialStore::new();
+            store.stage_password(username, password.as_bytes())?;
+            self.srp_store = Some(store);
         }
         self.session_config = config.connection.into();
         self.local = resolve_endpoint(&config.endpoint)?;
@@ -581,6 +629,22 @@ impl ReceiverBuilder {
         self
     }
 
+    pub fn srp_password(
+        mut self,
+        username: impl Into<String>,
+        password: impl AsRef<[u8]>,
+    ) -> Result<Self> {
+        let mut store = self.srp_store.unwrap_or_default();
+        store.stage_password(username, password)?;
+        self.srp_store = Some(store);
+        Ok(self)
+    }
+
+    pub fn srp_store(mut self, store: SrpCredentialStore) -> Self {
+        self.srp_store = Some(store);
+        self
+    }
+
     pub fn bind(self) -> Result<Receiver> {
         match self.profile {
             Profile::Simple => Ok(Receiver::Simple(rist_mio::SimpleMioReceiver::bind(
@@ -600,6 +664,9 @@ impl ReceiverBuilder {
                 if let Some(psk) = self.psk {
                     receiver.set_tx_key(psk.tx_key()?);
                     receiver.set_rx_key(psk.rx_key()?);
+                }
+                if let Some(store) = self.srp_store {
+                    receiver.enable_srp_authenticator(store);
                 }
                 Ok(Receiver::Main(receiver))
             }
@@ -678,6 +745,47 @@ impl Receiver {
         }
     }
 
+    pub fn try_recv_eapol_and_respond(&mut self, buf: &mut [u8]) -> Result<Option<()>> {
+        match self {
+            Self::Main(receiver) => Ok(receiver.try_recv_eapol_and_respond(buf)?.map(|_| ())),
+            Self::Simple(_) => Err(Error::UnsupportedProfile(Profile::Simple)),
+        }
+    }
+
+    pub fn srp_authenticated(&self) -> bool {
+        match self {
+            Self::Main(receiver) => receiver.srp_authenticated(),
+            Self::Simple(_) => true,
+        }
+    }
+
+    pub fn stage_srp_password(
+        &mut self,
+        username: impl Into<String>,
+        password: impl AsRef<[u8]>,
+    ) -> Result<SrpUserRecord> {
+        match self {
+            Self::Main(receiver) => Ok(receiver.stage_srp_password(username, password)?),
+            Self::Simple(_) => Err(Error::UnsupportedProfile(Profile::Simple)),
+        }
+    }
+
+    pub fn retire_srp_generations_before(&mut self, username: &str, generation: u64) -> Result<()> {
+        match self {
+            Self::Main(receiver) => {
+                Ok(receiver.retire_srp_generations_before(username, generation)?)
+            }
+            Self::Simple(_) => Err(Error::UnsupportedProfile(Profile::Simple)),
+        }
+    }
+
+    pub fn current_srp_generation(&self, username: &str) -> Option<u64> {
+        match self {
+            Self::Main(receiver) => receiver.current_srp_generation(username),
+            Self::Simple(_) => None,
+        }
+    }
+
     pub fn local_addr(&self) -> Result<SocketAddr> {
         Ok(match self {
             Self::Simple(receiver) => receiver.local_addr()?,
@@ -738,6 +846,24 @@ mod tests {
         rtp.payload.to_vec()
     }
 
+    fn drive_srp_authentication(
+        sender: &mut Sender,
+        receiver: &mut Receiver,
+        sender_buf: &mut [u8],
+        receiver_buf: &mut [u8],
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !sender.srp_authenticated() || !receiver.srp_authenticated() {
+            receiver.try_recv_eapol_and_respond(receiver_buf).unwrap();
+            sender.try_recv_eapol_and_respond(sender_buf).unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for SRP authentication"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     #[test]
     fn simple_sender_receiver_round_trip_through_builder() {
         let flow_id = 0x1122_3344;
@@ -778,6 +904,45 @@ mod tests {
             .flow_id(flow_id)
             .connect()
             .unwrap();
+
+        assert_eq!(sender.send(b"payload").unwrap(), 7);
+
+        let mut buf = [0; 1500];
+        let payload = recv_eventually(&mut receiver, &mut buf);
+        assert_eq!(payload.payload, b"payload");
+    }
+
+    #[test]
+    fn main_sender_receiver_round_trip_with_url_srp() {
+        let flow_id = 0x1122_3344;
+        let mut receiver = Receiver::builder(Profile::Main)
+            .listen_url("rist://@:0?username=rist&password=secret")
+            .unwrap()
+            .flow_id(flow_id)
+            .bind()
+            .unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+        let url = format!(
+            "rist://127.0.0.1:{}?username=rist&password=secret",
+            receiver_addr.port()
+        );
+        let mut sender = Sender::builder(Profile::Main)
+            .peer_url(&url)
+            .unwrap()
+            .flow_id(flow_id)
+            .connect()
+            .unwrap();
+
+        assert!(sender.send(b"too-early").is_err());
+        sender.start_srp_authentication().unwrap();
+        let mut sender_buf = [0u8; 1500];
+        let mut receiver_buf = [0u8; 1500];
+        drive_srp_authentication(
+            &mut sender,
+            &mut receiver,
+            &mut sender_buf,
+            &mut receiver_buf,
+        );
 
         assert_eq!(sender.send(b"payload").unwrap(), 7);
 

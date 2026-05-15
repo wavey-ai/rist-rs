@@ -58,6 +58,9 @@ The first milestone has grown into a usable pure-Rust prototype:
 - Mio Main Profile SRP client/authenticator integration that gates data until
   authentication completes, plus environment-gated librist SRP handshake
   and payload interop in both directions.
+- SRP credential rollover hooks through the Mio Main transport, including
+  client password reset, authenticator credential staging/retirement, and
+  re-authentication after rotating to a new generation.
 - RIST URL parsing for listen/client addresses and common recovery/crypto query
   options.
 - Typed parsing for librist peer URL options including bandwidth, retry,
@@ -91,8 +94,8 @@ The first milestone has grown into a usable pure-Rust prototype:
   `rist::pure` while leaving the existing librist-backed API unchanged by
   default. `rist::pure::Sender` and `rist::pure::Receiver` now provide builder
   APIs over the Mio transport, with socket-address and RIST URL setup, PSK
-  options, send/receive helpers, feedback, RTCP polling, stats, and local
-  address access.
+  options, SRP URL credentials and handshake helpers, send/receive helpers,
+  feedback, RTCP polling, stats, and local address access.
 - An environment-gated bidirectional `librist` interop harness for Simple
   Profile. It covers pure Rust sender to librist receiver and librist sender to
   pure Rust receiver, including Simple Profile RTP/RTCP even-port pairing.
@@ -106,6 +109,6 @@ The first milestone has grown into a usable pure-Rust prototype:
 ## Next Slices
 
 1. Move beyond the upstream smoke matrix into remaining production gaps:
-   Advanced Profile policy/API completeness, multicast SRP rollover, applying
-   the remaining parsed URL controls to runtime behavior, and long-running soak
-   tests.
+   Advanced Profile policy/API completeness, multicast-specific SRP rollover
+   coverage on non-Darwin hosts, applying the remaining parsed URL controls to
+   runtime behavior, and long-running soak tests.
