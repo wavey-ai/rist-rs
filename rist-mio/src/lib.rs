@@ -1503,6 +1503,33 @@ mod tests {
     }
 
     #[test]
+    fn main_profile_receiver_flags_bonded_duplicate_payload() {
+        let flow_id = 0x1122_3344;
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut receiver =
+            MainMioReceiver::bind(loopback_any(), flow_id, "rust", NackMode::Range).unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+        let mut sender = MainMioMultiSender::bind(loopback_any(), flow_id, 64).unwrap();
+        sender.add_peer(receiver_addr, 0);
+        sender.add_peer(receiver_addr, 0);
+
+        let sent = sender
+            .send_payload(b"bonded-duplicate", ntp, Instant::now())
+            .unwrap();
+        assert_eq!(sent.peers, vec![0, 1]);
+
+        let mut rx_buf = [0u8; 1500];
+        let first = recv_main_payload_eventually(&mut receiver, &mut rx_buf);
+        let duplicate = recv_main_payload_eventually(&mut receiver, &mut rx_buf);
+        assert!(!first.duplicate);
+        assert!(duplicate.duplicate);
+        assert_eq!(first.sequence, duplicate.sequence);
+        assert_eq!(duplicate.payload, b"bonded-duplicate");
+        assert_eq!(receiver.stats().duplicate_packets, 1);
+        assert_eq!(receiver.stats().unique_received_packets(), 1);
+    }
+
+    #[test]
     fn main_profile_multi_sender_load_balances_positive_weights() {
         let flow_id = 0x1122_3344;
         let ntp = ntp_from_unix_duration(Duration::from_secs(1));

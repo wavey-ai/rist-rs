@@ -78,6 +78,8 @@ The first milestone has grown into a usable pure-Rust prototype:
 - A pure Rust peer-selection core plus Mio/Main and `rist::pure` multi-peer
   sender surfaces for duplicate mode (`weight=0`) and smooth weighted
   load-balancing with shared Main Profile sequence state.
+- Receiver duplicate accounting for bonded duplicate paths, with receiver
+  quality based on unique received packets rather than duplicate datagrams.
 - Mio UDP transport for Simple and Main profiles, including packet loss recovery,
   NPD, RTCP echo RTT, Main Profile keepalive/buffer negotiation, and encrypted
   Main Profile recovery.
@@ -104,6 +106,6 @@ The first milestone has grown into a usable pure-Rust prototype:
 ## Next Slices
 
 1. Move beyond the upstream smoke matrix into remaining production gaps:
-   Advanced Profile receiver-side bonding semantics, multicast SRP rollover,
-   applying the remaining parsed URL controls to runtime behavior, and
-   long-running soak tests.
+   Advanced Profile policy/API completeness, multicast SRP rollover, applying
+   the remaining parsed URL controls to runtime behavior, and long-running soak
+   tests.

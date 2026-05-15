@@ -81,11 +81,16 @@ impl ReceiverStats {
     }
 
     pub fn quality(self) -> f64 {
-        let denominator = self.received_packets + self.currently_missing_packets;
+        let received_packets = self.unique_received_packets();
+        let denominator = received_packets + self.currently_missing_packets;
         if denominator == 0 {
             return 100.0;
         }
-        (100.0 * self.received_packets as f64 / denominator as f64).clamp(0.0, 100.0)
+        (100.0 * received_packets as f64 / denominator as f64).clamp(0.0, 100.0)
+    }
+
+    pub fn unique_received_packets(self) -> u64 {
+        self.received_packets.saturating_sub(self.duplicate_packets)
     }
 
     pub(crate) fn record_receive(
@@ -137,5 +142,18 @@ mod tests {
         stats.record_receive(100, false, true, 0, 1);
         assert_eq!(stats.recovered_packets, 1);
         assert_eq!(stats.quality(), 75.0);
+    }
+
+    #[test]
+    fn receiver_quality_excludes_duplicate_packets() {
+        let mut stats = ReceiverStats::new(1);
+        stats.record_receive(100, false, false, 0, 0);
+        stats.record_receive(100, true, false, 0, 0);
+        stats.record_receive(100, false, false, 1, 1);
+
+        assert_eq!(stats.received_packets, 3);
+        assert_eq!(stats.duplicate_packets, 1);
+        assert_eq!(stats.unique_received_packets(), 2);
+        assert_eq!(stats.quality(), 100.0 * 2.0 / 3.0);
     }
 }
