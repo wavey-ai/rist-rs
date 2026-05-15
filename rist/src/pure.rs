@@ -15,8 +15,8 @@ pub mod core {
 
 pub mod mio {
     pub use rist_mio::{
-        MainMioReceiver, MainMioSender, MainMioSessionPoll, RtpUdpSocket, SimpleMioReceiver,
-        SimpleMioSender,
+        MainMioMultiSend, MainMioMultiSender, MainMioPeer, MainMioReceiver, MainMioSender,
+        MainMioSessionPoll, RtpUdpSocket, SimpleMioReceiver, SimpleMioSender,
     };
 }
 
@@ -24,8 +24,9 @@ pub use rist_core::{
     AesKeySize, CongestionControlMode, ConnectionConfig, EncryptionConfig, Endpoint,
     MainControlPacket, MainOutboundPacket, MainReceiverCore, MainReceiverFeedback, MainSenderCore,
     MainSessionConfig, MainSessionPoll, MultiplexMode, NullPacketSuppression, OutboundPacket,
-    PeerConfig, Profile, PskKey, ReceivedPayload, ReceiverStats, RecoveryConfig, RecoveryMode,
-    RtcpIntervals, SenderStats, SimpleReceiverCore, SimpleSenderCore, TimingMode, VirtualPorts,
+    PeerConfig, PeerSelection, Profile, PskKey, ReceivedPayload, ReceiverStats, RecoveryConfig,
+    RecoveryMode, RtcpIntervals, SenderStats, SimpleReceiverCore, SimpleSenderCore, TimingMode,
+    VirtualPorts, WeightedPeerSelector,
 };
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -319,6 +320,180 @@ impl Sender {
 }
 
 #[derive(Debug, Clone)]
+struct MultiSenderPeer {
+    addr: SocketAddr,
+    weight: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct MultiSenderBuilder {
+    profile: Profile,
+    local: SocketAddr,
+    peers: Vec<MultiSenderPeer>,
+    flow_id: u32,
+    history_packets: usize,
+    virtual_ports: VirtualPorts,
+    session_config: MainSessionConfig,
+    null_packet_suppression: bool,
+    psk: Option<PskOptions>,
+}
+
+impl MultiSenderBuilder {
+    pub fn new(profile: Profile) -> Self {
+        Self {
+            profile,
+            local: loopback_any(),
+            peers: Vec::new(),
+            flow_id: 0x1122_3344,
+            history_packets: 1024,
+            virtual_ports: VirtualPorts::default(),
+            session_config: MainSessionConfig::default(),
+            null_packet_suppression: false,
+            psk: None,
+        }
+    }
+
+    pub fn local_addr(mut self, local: SocketAddr) -> Self {
+        self.local = local;
+        self
+    }
+
+    pub fn peer_addr(mut self, peer: SocketAddr, weight: u32) -> Self {
+        self.peers.push(MultiSenderPeer { addr: peer, weight });
+        self
+    }
+
+    pub fn peer_url(mut self, url: &str) -> Result<Self> {
+        let config = PeerConfig::parse(url)?;
+        if config.endpoint.listen {
+            return Err(Error::ExpectedPeerUrl);
+        }
+        if let Some(encryption) = &config.encryption {
+            self.psk = Some(PskOptions::from_config(encryption));
+        }
+        self.virtual_ports = config.virtual_ports;
+        self.session_config = config.connection.into();
+        self.peers.push(MultiSenderPeer {
+            addr: resolve_endpoint(&config.endpoint)?,
+            weight: config.advanced.weight,
+        });
+        Ok(self)
+    }
+
+    pub fn flow_id(mut self, flow_id: u32) -> Self {
+        self.flow_id = flow_id;
+        self
+    }
+
+    pub fn history_packets(mut self, history_packets: usize) -> Self {
+        self.history_packets = history_packets;
+        self
+    }
+
+    pub fn virtual_ports(mut self, src: u16, dst: u16) -> Self {
+        self.virtual_ports = VirtualPorts { src, dst };
+        self
+    }
+
+    pub fn session_config(mut self, config: MainSessionConfig) -> Self {
+        self.session_config = config;
+        self
+    }
+
+    pub fn null_packet_suppression(mut self, enabled: bool) -> Self {
+        self.null_packet_suppression = enabled;
+        self
+    }
+
+    pub fn psk(mut self, key_size_bits: u32, password: impl AsRef<[u8]>) -> Self {
+        self.psk = Some(PskOptions {
+            key_size_bits,
+            key_rotation: None,
+            password: password.as_ref().to_vec(),
+        });
+        self
+    }
+
+    pub fn connect(self) -> Result<MultiSender> {
+        if self.peers.is_empty() {
+            return Err(Error::MissingPeer);
+        }
+        match self.profile {
+            Profile::Main => {
+                let mut sender = rist_mio::MainMioMultiSender::bind(
+                    self.local,
+                    self.flow_id,
+                    self.history_packets,
+                )?;
+                sender.set_ports(self.virtual_ports.src, self.virtual_ports.dst);
+                sender.set_session_config(self.session_config);
+                if self.null_packet_suppression {
+                    sender.enable_null_packet_suppression();
+                }
+                if let Some(psk) = self.psk {
+                    sender.set_tx_key(psk.tx_key()?);
+                    sender.set_rx_key(psk.rx_key()?);
+                }
+                for peer in self.peers {
+                    sender.add_peer(peer.addr, peer.weight);
+                }
+                Ok(MultiSender::Main(sender))
+            }
+            other => Err(Error::UnsupportedProfile(other)),
+        }
+    }
+}
+
+pub enum MultiSender {
+    Main(rist_mio::MainMioMultiSender),
+}
+
+impl MultiSender {
+    pub fn builder(profile: Profile) -> MultiSenderBuilder {
+        MultiSenderBuilder::new(profile)
+    }
+
+    pub fn send(&mut self, payload: &[u8]) -> Result<Vec<usize>> {
+        self.send_at(payload, rist_core::time::ntp_now(), Instant::now())
+    }
+
+    pub fn send_at(
+        &mut self,
+        payload: &[u8],
+        ntp_timestamp: u64,
+        now: Instant,
+    ) -> Result<Vec<usize>> {
+        match self {
+            Self::Main(sender) => Ok(sender.send_payload(payload, ntp_timestamp, now)?.peers),
+        }
+    }
+
+    pub fn poll_keepalive(&mut self, mac: [u8; 6]) -> Result<Option<usize>> {
+        match self {
+            Self::Main(sender) => Ok(sender
+                .poll_session_and_send_keepalive(
+                    Instant::now(),
+                    rist_core::packet::gre::GreKeepalive::librist_default(mac),
+                )?
+                .keepalive
+                .map(|packet| packet.bytes.len())),
+        }
+    }
+
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        match self {
+            Self::Main(sender) => Ok(sender.local_addr()?),
+        }
+    }
+
+    pub fn stats(&self) -> SenderStats {
+        match self {
+            Self::Main(sender) => sender.stats(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct ReceiverBuilder {
     profile: Profile,
     local: SocketAddr,
@@ -541,6 +716,7 @@ fn resolve_endpoint(endpoint: &Endpoint) -> Result<SocketAddr> {
 mod tests {
     use super::*;
     use rist_core::packet::gre::{KeepalivePacket, ReducedPacket};
+    use rist_core::packet::rtp::RtpPacket;
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -553,6 +729,13 @@ mod tests {
             assert!(Instant::now() < deadline, "timed out waiting for payload");
             thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    fn recv_raw_main_payload(socket: &std::net::UdpSocket, buf: &mut [u8]) -> Vec<u8> {
+        let (len, _) = socket.recv_from(buf).unwrap();
+        let reduced = ReducedPacket::decode(&buf[..len]).unwrap();
+        let rtp = RtpPacket::decode(reduced.payload).unwrap();
+        rtp.payload.to_vec()
     }
 
     #[test]
@@ -651,5 +834,35 @@ mod tests {
         let keepalive = KeepalivePacket::decode(&buf[..len]).unwrap();
         assert_eq!(keepalive.gre.sequence, Some(0));
         assert_eq!(keepalive.keepalive.mac, [1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn main_multi_sender_uses_url_weights() {
+        let rx_a = std::net::UdpSocket::bind(loopback_any()).unwrap();
+        let rx_b = std::net::UdpSocket::bind(loopback_any()).unwrap();
+        rx_a.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        rx_b.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let url_a = format!(
+            "rist://127.0.0.1:{}?weight=0",
+            rx_a.local_addr().unwrap().port()
+        );
+        let url_b = format!(
+            "rist://127.0.0.1:{}?weight=0",
+            rx_b.local_addr().unwrap().port()
+        );
+        let mut sender = MultiSender::builder(Profile::Main)
+            .peer_url(&url_a)
+            .unwrap()
+            .peer_url(&url_b)
+            .unwrap()
+            .connect()
+            .unwrap();
+
+        assert_eq!(sender.send(b"duplicate").unwrap(), vec![0, 1]);
+
+        let mut buf_a = [0u8; 1500];
+        let mut buf_b = [0u8; 1500];
+        assert_eq!(recv_raw_main_payload(&rx_a, &mut buf_a), b"duplicate");
+        assert_eq!(recv_raw_main_payload(&rx_b, &mut buf_b), b"duplicate");
     }
 }

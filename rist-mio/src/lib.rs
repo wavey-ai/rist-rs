@@ -19,8 +19,8 @@ use rist_core::time::ntp_now;
 use rist_core::{
     packet::rtcp::NackMode, Error as CoreError, MainControlPacket, MainOutboundPacket,
     MainReceiverCore, MainReceiverFeedback, MainSenderCore, MainSessionConfig, MainSessionPoll,
-    MainSessionTimers, OutboundPacket, ReceivedPayload, ReceiverStats, SenderStats,
-    SimpleReceiverCore, SimpleSenderCore, SrpCredentialStore,
+    MainSessionTimers, OutboundPacket, PeerSelection, ReceivedPayload, ReceiverStats, SenderStats,
+    SimpleReceiverCore, SimpleSenderCore, SrpCredentialStore, WeightedPeerSelector,
 };
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -703,6 +703,202 @@ impl MainMioSender {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MainMioPeer {
+    pub addr: SocketAddr,
+    pub weight: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MainMioMultiSend {
+    pub packet: MainOutboundPacket,
+    pub peers: Vec<usize>,
+}
+
+pub struct MainMioMultiSender {
+    socket: RtpUdpSocket,
+    core: MainSenderCore,
+    timers: MainSessionTimers,
+    peers: Vec<MainMioPeer>,
+    selector: WeightedPeerSelector,
+}
+
+impl MainMioMultiSender {
+    pub fn bind(local: SocketAddr, flow_id: u32, history_packets: usize) -> io::Result<Self> {
+        Ok(Self {
+            socket: RtpUdpSocket::bind(local, flow_id)?,
+            core: MainSenderCore::new(flow_id, history_packets),
+            timers: MainSessionTimers::new(),
+            peers: Vec::new(),
+            selector: WeightedPeerSelector::new(),
+        })
+    }
+
+    pub fn add_peer(&mut self, peer: SocketAddr, weight: u32) -> usize {
+        let index = self.peers.len();
+        self.peers.push(MainMioPeer { addr: peer, weight });
+        self.selector.add_peer(weight);
+        index
+    }
+
+    pub fn peers(&self) -> &[MainMioPeer] {
+        &self.peers
+    }
+
+    pub fn set_peer_weight(&mut self, index: usize, weight: u32) -> bool {
+        let Some(peer) = self.peers.get_mut(index) else {
+            return false;
+        };
+        peer.weight = weight;
+        self.selector.set_weight(index, weight)
+    }
+
+    pub fn build_payload(
+        &mut self,
+        payload: &[u8],
+        ntp_timestamp: u64,
+        now: Instant,
+    ) -> MainOutboundPacket {
+        self.core.send_payload(payload, ntp_timestamp, now)
+    }
+
+    pub fn send_payload(
+        &mut self,
+        payload: &[u8],
+        ntp_timestamp: u64,
+        now: Instant,
+    ) -> io::Result<MainMioMultiSend> {
+        let packet = self.build_payload(payload, ntp_timestamp, now);
+        let peers = self.send_selected(&packet.bytes)?;
+        Ok(MainMioMultiSend { packet, peers })
+    }
+
+    pub fn poll_rtcp_and_send(
+        &mut self,
+        now: Instant,
+        ntp_timestamp: u64,
+    ) -> io::Result<Option<(MainControlPacket, Vec<usize>)>> {
+        let Some(packet) = self.core.poll_rtcp(now, ntp_timestamp) else {
+            return Ok(None);
+        };
+        let peers = self.send_selected(&packet.bytes)?;
+        Ok(Some((packet, peers)))
+    }
+
+    pub fn poll_session(&mut self, now: Instant) -> MainSessionPoll {
+        self.timers.poll(now)
+    }
+
+    pub fn set_session_config(&mut self, config: MainSessionConfig) {
+        self.timers.set_config(config);
+    }
+
+    pub fn poll_session_and_send_keepalive(
+        &mut self,
+        now: Instant,
+        keepalive: GreKeepalive<'_>,
+    ) -> io::Result<MainMioSessionPoll> {
+        let poll = self.poll_session(now);
+        let keepalive = if poll.keepalive_due {
+            Some(self.send_keepalive_to_all(keepalive)?)
+        } else {
+            None
+        };
+        Ok(MainMioSessionPoll { poll, keepalive })
+    }
+
+    pub fn send_keepalive_to_all(
+        &mut self,
+        keepalive: GreKeepalive<'_>,
+    ) -> io::Result<MainControlPacket> {
+        let packet = self.core.build_keepalive(keepalive);
+        self.send_all(&packet.bytes)?;
+        Ok(packet)
+    }
+
+    pub fn set_ports(&mut self, virt_src_port: u16, virt_dst_port: u16) {
+        self.core.set_ports(virt_src_port, virt_dst_port);
+    }
+
+    pub fn enable_null_packet_suppression(&mut self) {
+        self.core.enable_null_packet_suppression();
+    }
+
+    pub fn disable_null_packet_suppression(&mut self) {
+        self.core.disable_null_packet_suppression();
+    }
+
+    pub fn set_tx_key(&mut self, key: PskKey) {
+        self.core.set_tx_key(key);
+    }
+
+    pub fn set_rx_key(&mut self, key: PskKey) {
+        self.core.set_rx_key(key);
+    }
+
+    pub fn try_recv_feedback_and_retransmit(
+        &mut self,
+        buf: &mut [u8],
+    ) -> io::Result<Option<Vec<MainOutboundPacket>>> {
+        let Some((from, feedback)) = self.socket.recv_datagram(buf)? else {
+            return Ok(None);
+        };
+        self.timers.observe_peer_activity(Instant::now());
+        let retries = match self.core.handle_feedback(feedback) {
+            Ok(retries) => retries,
+            Err(err) if is_main_control_decode_error(&err) => return Ok(None),
+            Err(err) => return Err(core_to_io_error(err)),
+        };
+        for retry in &retries {
+            self.socket.send_packet_to(from, &retry.bytes)?;
+        }
+        Ok(Some(retries))
+    }
+
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+
+    pub fn stats(&self) -> SenderStats {
+        self.core.stats()
+    }
+
+    fn send_selected(&mut self, packet: &[u8]) -> io::Result<Vec<usize>> {
+        if self.peers.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "no remote peers configured",
+            ));
+        }
+
+        match self.selector.select() {
+            PeerSelection::DuplicateAll => self.send_all(packet),
+            PeerSelection::Peer(index) => {
+                let peer = self.peers[index];
+                self.socket.send_packet_to(peer.addr, packet)?;
+                Ok(vec![index])
+            }
+        }
+    }
+
+    fn send_all(&mut self, packet: &[u8]) -> io::Result<Vec<usize>> {
+        if self.peers.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "no remote peers configured",
+            ));
+        }
+
+        let peers = self.peers.iter().copied().enumerate().collect::<Vec<_>>();
+        let mut sent = Vec::with_capacity(peers.len());
+        for (index, peer) in peers {
+            self.socket.send_packet_to(peer.addr, packet)?;
+            sent.push(index);
+        }
+        Ok(sent)
+    }
+}
+
 pub struct MainMioReceiver {
     socket: RtpUdpSocket,
     core: MainReceiverCore,
@@ -1041,6 +1237,8 @@ fn is_main_control_decode_error(err: &CoreError) -> bool {
 mod tests {
     use super::*;
     use rist_core::mpegts::{TS_NULL_PID, TS_PACKET_SIZE, TS_SYNC_BYTE};
+    use rist_core::packet::gre::ReducedPacket;
+    use rist_core::packet::rtp::RtpPacket;
     use rist_core::time::ntp_from_unix_duration;
     use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket as StdUdpSocket};
     use std::thread;
@@ -1281,6 +1479,51 @@ mod tests {
     }
 
     #[test]
+    fn main_profile_multi_sender_duplicates_zero_weight_peers() {
+        let flow_id = 0x1122_3344;
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let rx_a = StdUdpSocket::bind(loopback_any()).unwrap();
+        let rx_b = StdUdpSocket::bind(loopback_any()).unwrap();
+        rx_a.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        rx_b.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+
+        let mut sender = MainMioMultiSender::bind(loopback_any(), flow_id, 64).unwrap();
+        sender.add_peer(rx_a.local_addr().unwrap(), 0);
+        sender.add_peer(rx_b.local_addr().unwrap(), 0);
+
+        let sent = sender
+            .send_payload(b"duplicate", ntp, Instant::now())
+            .unwrap();
+        assert_eq!(sent.peers, vec![0, 1]);
+
+        let mut buf_a = [0u8; 1500];
+        let mut buf_b = [0u8; 1500];
+        assert_eq!(recv_raw_main_payload(&rx_a, &mut buf_a), b"duplicate");
+        assert_eq!(recv_raw_main_payload(&rx_b, &mut buf_b), b"duplicate");
+    }
+
+    #[test]
+    fn main_profile_multi_sender_load_balances_positive_weights() {
+        let flow_id = 0x1122_3344;
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let rx_a = StdUdpSocket::bind(loopback_any()).unwrap();
+        let rx_b = StdUdpSocket::bind(loopback_any()).unwrap();
+
+        let mut sender = MainMioMultiSender::bind(loopback_any(), flow_id, 64).unwrap();
+        sender.add_peer(rx_a.local_addr().unwrap(), 2);
+        sender.add_peer(rx_b.local_addr().unwrap(), 1);
+
+        let mut counts = [0usize; 2];
+        for payload in [b"one".as_slice(), b"two".as_slice(), b"three".as_slice()] {
+            let sent = sender.send_payload(payload, ntp, Instant::now()).unwrap();
+            assert_eq!(sent.peers.len(), 1);
+            counts[sent.peers[0]] += 1;
+        }
+
+        assert_eq!(counts, [2, 1]);
+    }
+
+    #[test]
     fn main_profile_srp_authenticates_before_payload() {
         let flow_id = 0x1122_3344;
         let now = Instant::now();
@@ -1487,6 +1730,13 @@ mod tests {
                 Err(err) => panic!("failed to drain UDP sink: {err}"),
             }
         }
+    }
+
+    fn recv_raw_main_payload(socket: &StdUdpSocket, buf: &mut [u8]) -> Vec<u8> {
+        let (len, _) = socket.recv_from(buf).unwrap();
+        let reduced = ReducedPacket::decode(&buf[..len]).unwrap();
+        let rtp = RtpPacket::decode(reduced.payload).unwrap();
+        rtp.payload.to_vec()
     }
 
     fn recv_payload_eventually(

@@ -6,6 +6,7 @@
 //! transport, and a Tokio transport can all share the same protocol core.
 
 pub mod auth;
+pub mod bonding;
 pub mod crypto;
 pub mod endpoint;
 pub mod error;
@@ -24,6 +25,7 @@ pub use auth::{
     EapSrpMessage, EapSrpSubtype, EapolFrame, PassphraseRollover, SrpAuthenticator, SrpClient,
     SrpCredentialStore, SrpGroup, SrpHashVersion, SrpPassphrase, SrpUserRecord,
 };
+pub use bonding::{PeerSelection, WeightedPeerSelector};
 pub use crypto::{AesKeySize, PskKey};
 pub use endpoint::{
     AdvancedUrlConfig, CongestionControlMode, ConnectionConfig, EncryptionConfig, Endpoint,
