@@ -248,6 +248,58 @@ async fn pure_rust_main_sender_to_async_librist_receiver() {
     }
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn av_contrib_style_main_sender_to_async_librist_receiver() {
+    if !interop_enabled() {
+        return;
+    }
+    let _guard = INTEROP_MUTEX.lock().unwrap();
+
+    let flow_id = 0x1122_3344;
+    let port = next_even_test_port_pair();
+    let receiver_url = format!("rist://@127.0.0.1:{port}");
+    let receiver_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+
+    let receiver = rist::tokio::AsyncReceiver::bind(rist::Profile::Main, &receiver_url).unwrap();
+
+    let mut sender = MainMioSender::connect(loopback_any(), receiver_addr, flow_id, 8192).unwrap();
+    send_main_session_probe(&mut sender);
+
+    let payload = mpegts_payload_7("AV CONTRIB STYLE RUST TO ASYNC LIBRIST");
+    let mut feedback_buf = [0u8; 65_536];
+    for _ in 0..20 {
+        sender
+            .send_payload(&payload, ntp_now(), Instant::now())
+            .unwrap();
+        sender
+            .try_recv_feedback_and_retransmit(&mut feedback_buf)
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(block) = receiver
+            .recv_timeout(Duration::from_millis(50))
+            .await
+            .unwrap()
+        {
+            assert!(block.payload().starts_with(&[0x47]));
+            assert!(block
+                .payload()
+                .windows(b"AV CONTRIB STYLE RUST TO ASYNC LIBRIST".len())
+                .any(|window| window == b"AV CONTRIB STYLE RUST TO ASYNC LIBRIST"));
+            return;
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for av-contrib-style async librist Main receiver"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
 #[test]
 fn librist_main_sender_to_pure_rust_receiver() {
     if !interop_enabled() {
