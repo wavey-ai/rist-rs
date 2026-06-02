@@ -12,4 +12,5 @@ rist-core = { path = "../rist-core" }
 socket2 = { version = "0.6", features = ["all"] }
 
 [dev-dependencies]
-rist = { path = "../rist" }
+rist = { path = "../rist", features = ["tokio"] }
+tokio = { version = "1", features = ["macros", "rt", "time"] }
