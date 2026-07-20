@@ -38,7 +38,10 @@ pub use main_profile::{
 };
 pub use mpegts::{expand_null_packets, suppress_null_packets, NullPacketSuppression};
 pub use profile::Profile;
-pub use recovery::{MissingTracker, ReceiverObservation, SenderHistory};
+pub use recovery::{
+    MissingTracker, OrderedPayloadBuffer, OrderedPayloadBufferError, ReceiverObservation,
+    SenderHistory,
+};
 pub use sequence::SequenceExtender;
 pub use simple::{
     OutboundPacket, ReceivedPayload, RtcpIntervals, SimpleReceiverCore, SimpleSenderCore,
