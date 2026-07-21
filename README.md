@@ -117,7 +117,7 @@ This library follows the same patterns as [sportsball-ai/av-rs](https://github.c
 
 ## Requirements
 
-- librist 0.2+ installed (`pkg-config` must find it)
+- librist 0.2.8 or later (`pkg-config` must find it)
 - Rust 1.70+
 
 ## License
