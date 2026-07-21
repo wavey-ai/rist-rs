@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 description = "Safe Rust bindings for librist (RIST protocol)"
 
+[lib]
+name = "rist"
+
 [features]
 default = []
 pure-rust = ["dep:rist-core", "dep:rist-mio"]
