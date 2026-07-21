@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["rist-sys", "rist", "rist-core", "rist-mio"]
+members = ["rist", "rist-core", "rist-mio"]
+exclude = ["rist-sys"]
 
 [workspace.package]
 version = "0.1.0"
