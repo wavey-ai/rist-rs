@@ -471,10 +471,12 @@ It sends 1,316-byte MPEG-TS payloads with flow ID `0x11223344`.
 The pure protocol path now has the required roles, recovery, URL controls,
 backpressure, socket sizing, truncation handling, and current-C interoperability.
 
-Two product-level work items remain:
+`av-contrib` production ingest now selects `rist-pure`.
+Its dependencies pin the hardened RIST transport revision.
 
-1. Select `rist-pure` for `av-contrib` production ingest.
-2. Pass live 4K, sustained-loss, recovery, CPU, memory, and continuity gates.
+One product-level work item remains:
+
+1. Pass live 4K, sustained-loss, recovery, CPU, memory, and continuity gates.
 
 Multicast, multipath, reflector, and Advanced profile do not block Needletail's
 current contribution path.

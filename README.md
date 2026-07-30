@@ -65,10 +65,10 @@ Media uses 1,316-byte MPEG-TS payloads and flow ID `0x11223344`.
 - ✅ Main caller-to-listener data and control interoperate with current librist.
 - ✅ Bounded recovery supports Needletail's buffer, bandwidth, RTT, reorder, retry, and congestion controls.
 - ✅ Socket buffers, backpressure, exact recovery bytes, and truncated-datagram handling are ready.
-- ❌ `av-contrib` production ingest still selects the librist-backed receiver.
+- ✅ `av-contrib` production ingest selects the pure Rust receiver.
 - ❌ Live 4K, sustained-loss, recovery, CPU, memory, and continuity qualification remains.
 
-Two product-level work items remain before Needletail can select pure RIST by default.
+One product-level qualification gate remains before Needletail can use pure RIST in production.
 
 ## Usage
 
