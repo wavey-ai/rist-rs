@@ -3,6 +3,8 @@
 //!
 //! This is intentionally small. The protocol state lives in `rist-core`; this
 //! crate only owns nonblocking UDP readiness and datagram movement.
+//! UDP send operations report `ENOBUFS` as `WouldBlock` so callers can use one
+//! backpressure path.
 
 use mio::event::Source;
 use mio::net::UdpSocket;
@@ -88,7 +90,7 @@ impl RtpUdpSocket {
 
     pub fn send_packet(&mut self, packet: &[u8]) -> io::Result<usize> {
         match self.peer {
-            Some(_) => self.socket.send(packet),
+            Some(_) => self.socket.send(packet).map_err(normalize_udp_send_error),
             None => Err(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "no remote peer configured",
@@ -97,7 +99,9 @@ impl RtpUdpSocket {
     }
 
     pub fn send_packet_to(&mut self, peer: SocketAddr, packet: &[u8]) -> io::Result<usize> {
-        self.socket.send_to(packet, peer)
+        self.socket
+            .send_to(packet, peer)
+            .map_err(normalize_udp_send_error)
     }
 
     pub fn set_multicast_loop_v4(&self, on: bool) -> io::Result<()> {
@@ -136,7 +140,9 @@ impl RtpUdpSocket {
         let header = RtpHeader::new_mpegts(self.next_sequence, timestamp, self.ssrc);
         self.next_sequence = self.next_sequence.wrapping_add(1);
         let packet = encode_packet(header, payload);
-        self.socket.send_to(&packet, peer)
+        self.socket
+            .send_to(&packet, peer)
+            .map_err(normalize_udp_send_error)
     }
 
     pub fn recv_packet<'a>(
@@ -165,6 +171,24 @@ impl RtpUdpSocket {
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
     }
+}
+
+fn normalize_udp_send_error(error: io::Error) -> io::Error {
+    if is_udp_enobufs(&error) {
+        io::Error::new(io::ErrorKind::WouldBlock, error)
+    } else {
+        error
+    }
+}
+
+#[cfg(unix)]
+fn is_udp_enobufs(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ENOBUFS)
+}
+
+#[cfg(not(unix))]
+fn is_udp_enobufs(_error: &io::Error) -> bool {
+    false
 }
 
 fn bind_reuse_udp(local: SocketAddr) -> io::Result<UdpSocket> {
@@ -1400,6 +1424,27 @@ mod tests {
 
     fn loopback_any() -> SocketAddr {
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normalizes_enobufs_to_would_block() {
+        let error = normalize_udp_send_error(io::Error::from_raw_os_error(libc::ENOBUFS));
+
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        let source = error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<io::Error>())
+            .expect("normalized error must retain the operating-system error");
+        assert_eq!(source.raw_os_error(), Some(libc::ENOBUFS));
+    }
+
+    #[test]
+    fn preserves_non_enobufs_send_errors() {
+        let error = normalize_udp_send_error(io::Error::from(io::ErrorKind::NetworkUnreachable));
+
+        assert_eq!(error.kind(), io::ErrorKind::NetworkUnreachable);
+        assert!(error.get_ref().is_none());
     }
 
     #[test]

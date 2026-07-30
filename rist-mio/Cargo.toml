@@ -11,5 +11,8 @@ mio = { version = "1", features = ["net", "os-poll"] }
 rist-core = "0.1.0"
 socket2 = { version = "0.6", features = ["all"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "time"] }
