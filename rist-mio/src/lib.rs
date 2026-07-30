@@ -73,6 +73,7 @@ impl RtpUdpSocket {
     }
 
     pub fn connect(local: SocketAddr, peer: SocketAddr, ssrc: u32) -> io::Result<Self> {
+        ensure_same_address_family(local, peer)?;
         let socket = UdpSocket::bind(local)?;
         socket.connect(peer)?;
         Ok(Self {
@@ -202,6 +203,16 @@ fn simple_rtcp_addr(rtp: SocketAddr) -> io::Result<SocketAddr> {
     Ok(rtcp)
 }
 
+fn ensure_same_address_family(local: SocketAddr, peer: SocketAddr) -> io::Result<()> {
+    if local.is_ipv4() == peer.is_ipv4() {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("local address {local} and peer address {peer} use different IP families"),
+    ))
+}
+
 fn simple_rtp_addr(rtcp: SocketAddr) -> io::Result<SocketAddr> {
     if rtcp.port() % 2 == 0 {
         return Err(io::Error::new(
@@ -307,6 +318,7 @@ impl SimpleMioSender {
         ssrc: u32,
         history_packets: usize,
     ) -> io::Result<Self> {
+        ensure_same_address_family(local, peer)?;
         simple_rtcp_addr(peer)?;
         let (rtp_socket, rtcp_socket) = bind_simple_pair(local, ssrc, false)?;
         Ok(Self {
@@ -653,6 +665,7 @@ impl SimpleMioReceiver {
         cname: impl Into<String>,
         nack_mode: NackMode,
     ) -> io::Result<Self> {
+        ensure_same_address_family(local, peer)?;
         let rtcp_peer = simple_rtcp_addr(peer)?;
         let (rtp_socket, rtcp_socket) = bind_simple_pair(local, flow_id, false)?;
         Ok(Self {
@@ -1058,6 +1071,7 @@ impl MainMioSender {
         flow_id: u32,
         history_packets: usize,
     ) -> io::Result<Self> {
+        ensure_same_address_family(local, peer)?;
         Ok(Self {
             socket: RtpUdpSocket::bind(local, flow_id)?,
             core: MainSenderCore::new(flow_id, history_packets),
@@ -1680,7 +1694,8 @@ impl MainMioMultiSender {
         })
     }
 
-    pub fn add_peer(&mut self, peer: SocketAddr, weight: u32) -> usize {
+    pub fn add_peer(&mut self, peer: SocketAddr, weight: u32) -> io::Result<usize> {
+        ensure_same_address_family(self.socket.local_addr()?, peer)?;
         let index = self.peers.len();
         self.peers.push(MainMioPeer { addr: peer, weight });
         self.peer_runtime.push(MainMultiSenderPeerRuntime {
@@ -1690,7 +1705,7 @@ impl MainMioMultiSender {
             last_reauthentication: None,
         });
         self.selector.add_peer(weight);
-        index
+        Ok(index)
     }
 
     pub fn peers(&self) -> &[MainMioPeer] {
@@ -2290,6 +2305,7 @@ impl MainMioReceiver {
         cname: impl Into<String>,
         nack_mode: NackMode,
     ) -> io::Result<Self> {
+        ensure_same_address_family(local, peer)?;
         Ok(Self {
             socket: RtpUdpSocket::bind(local, flow_id)?,
             core: MainReceiverCore::new(flow_id, cname, nack_mode),
@@ -3016,12 +3032,16 @@ mod tests {
     use rist_core::packet::gre::{GreHeader, ReducedPacket};
     use rist_core::packet::rtp::RtpPacket;
     use rist_core::time::ntp_from_unix_duration;
-    use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket as StdUdpSocket};
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6, UdpSocket as StdUdpSocket};
     use std::thread;
     use std::time::Duration;
 
     fn loopback_any() -> SocketAddr {
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+    }
+
+    fn ipv6_loopback_any() -> SocketAddr {
+        SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0))
     }
 
     #[cfg(unix)]
@@ -3635,6 +3655,175 @@ mod tests {
     }
 
     #[test]
+    fn simple_and_main_profiles_send_over_ipv6() {
+        let flow_id = 0x1122_3344;
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+
+        let mut simple_receiver =
+            SimpleMioReceiver::bind(ipv6_loopback_any(), flow_id, "ipv6", NackMode::Range).unwrap();
+        let mut simple_sender = SimpleMioSender::connect(
+            ipv6_loopback_any(),
+            simple_receiver.local_addr().unwrap(),
+            flow_id,
+            64,
+        )
+        .unwrap();
+        simple_sender
+            .send_payload(b"simple-ipv6", ntp, Instant::now())
+            .unwrap();
+        let mut simple_buf = [0u8; 1500];
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Some((from, payload)) =
+                simple_receiver.try_recv_payload(&mut simple_buf).unwrap()
+            {
+                assert!(from.is_ipv6());
+                assert_eq!(payload.payload, b"simple-ipv6");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the Simple IPv6 payload"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        let mut main_receiver =
+            MainMioReceiver::bind(ipv6_loopback_any(), flow_id, "ipv6", NackMode::Range).unwrap();
+        let mut main_sender = MainMioSender::connect(
+            ipv6_loopback_any(),
+            main_receiver.local_addr().unwrap(),
+            flow_id,
+            64,
+        )
+        .unwrap();
+        main_sender
+            .send_payload(b"main-ipv6", ntp, Instant::now())
+            .unwrap();
+        let mut main_buf = [0u8; 1500];
+        let payload = recv_main_payload_eventually(&mut main_receiver, &mut main_buf);
+        assert_eq!(payload.payload, b"main-ipv6");
+    }
+
+    #[test]
+    fn receiver_callers_discover_sender_listeners_over_ipv6() {
+        let flow_id = 0x1122_3344;
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+
+        let mut simple_sender = SimpleMioSender::listen(ipv6_loopback_any(), flow_id, 64).unwrap();
+        let simple_sender_addr = simple_sender.local_addr().unwrap();
+        let mut simple_receiver = SimpleMioReceiver::connect(
+            ipv6_loopback_any(),
+            simple_sender_addr,
+            flow_id,
+            "ipv6-caller",
+            NackMode::Range,
+        )
+        .unwrap();
+        simple_receiver.send_feedback().unwrap().unwrap();
+        let mut simple_control_buf = [0u8; 1500];
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while simple_sender.peer_addr().is_none() {
+            simple_sender
+                .try_recv_feedback_and_retransmit(&mut simple_control_buf)
+                .unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "timed out discovering the Simple IPv6 caller"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        simple_sender
+            .send_payload(b"simple-ipv6-reverse", ntp, Instant::now())
+            .unwrap();
+        let mut simple_payload_buf = [0u8; 1500];
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Some((_from, payload)) = simple_receiver
+                .try_recv_payload(&mut simple_payload_buf)
+                .unwrap()
+            {
+                assert_eq!(payload.payload, b"simple-ipv6-reverse");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the reverse Simple IPv6 payload"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        let mut main_sender = MainMioSender::listen(ipv6_loopback_any(), flow_id, 64).unwrap();
+        let main_sender_addr = main_sender.local_addr().unwrap();
+        let mut main_receiver = MainMioReceiver::connect(
+            ipv6_loopback_any(),
+            main_sender_addr,
+            flow_id,
+            "ipv6-caller",
+            NackMode::Range,
+        )
+        .unwrap();
+        main_receiver
+            .send_keepalive_to(
+                main_sender_addr,
+                GreKeepalive::librist_default([1, 2, 3, 4, 5, 6]),
+            )
+            .unwrap();
+        let mut main_control_buf = [0u8; 1500];
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while main_sender.peer_addr().is_none() {
+            main_sender.try_recv_event(&mut main_control_buf).unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "timed out discovering the Main IPv6 caller"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        main_sender
+            .send_payload(b"main-ipv6-reverse", ntp, Instant::now())
+            .unwrap();
+        let mut main_payload_buf = [0u8; 1500];
+        let payload = recv_main_payload_eventually(&mut main_receiver, &mut main_payload_buf);
+        assert_eq!(payload.payload, b"main-ipv6-reverse");
+    }
+
+    #[test]
+    fn constructors_reject_mixed_ip_address_families() {
+        let ipv4 = loopback_any();
+        let ipv6 = ipv6_loopback_any();
+
+        let error = match SimpleMioSender::connect(ipv4, ipv6, 1, 64) {
+            Ok(_) => panic!("mixed-family Simple sender unexpectedly connected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        let error = match SimpleMioReceiver::connect(ipv4, ipv6, 1, "mixed-family", NackMode::Range)
+        {
+            Ok(_) => panic!("mixed-family Simple receiver unexpectedly connected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        let error = match MainMioSender::connect(ipv4, ipv6, 1, 64) {
+            Ok(_) => panic!("mixed-family Main sender unexpectedly connected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        let error = match MainMioReceiver::connect(ipv4, ipv6, 1, "mixed-family", NackMode::Range) {
+            Ok(_) => panic!("mixed-family Main receiver unexpectedly connected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        let mut sender = MainMioMultiSender::bind(ipv4, 1, 64).unwrap();
+        let error = sender.add_peer(ipv6, 1).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(sender.peers().is_empty());
+    }
+
+    #[test]
     fn rtp_udp_socket_supports_reuse_bind_and_multicast_interface() {
         let first = RtpUdpSocket::bind_reuse(loopback_any(), 1).unwrap();
         let first_addr = first.local_addr().unwrap();
@@ -3869,8 +4058,8 @@ mod tests {
         rx_b.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
 
         let mut sender = MainMioMultiSender::bind(loopback_any(), flow_id, 64).unwrap();
-        sender.add_peer(rx_a.local_addr().unwrap(), 0);
-        sender.add_peer(rx_b.local_addr().unwrap(), 0);
+        sender.add_peer(rx_a.local_addr().unwrap(), 0).unwrap();
+        sender.add_peer(rx_b.local_addr().unwrap(), 0).unwrap();
 
         let sent = sender
             .send_payload(b"duplicate", ntp, Instant::now())
@@ -3891,8 +4080,8 @@ mod tests {
             MainMioReceiver::bind(loopback_any(), flow_id, "rust", NackMode::Range).unwrap();
         let receiver_addr = receiver.local_addr().unwrap();
         let mut sender = MainMioMultiSender::bind(loopback_any(), flow_id, 64).unwrap();
-        sender.add_peer(receiver_addr, 0);
-        sender.add_peer(receiver_addr, 0);
+        sender.add_peer(receiver_addr, 0).unwrap();
+        sender.add_peer(receiver_addr, 0).unwrap();
 
         let sent = sender
             .send_payload(b"bonded-duplicate", ntp, Instant::now())
@@ -3918,8 +4107,8 @@ mod tests {
         let rx_b = StdUdpSocket::bind(loopback_any()).unwrap();
 
         let mut sender = MainMioMultiSender::bind(loopback_any(), flow_id, 64).unwrap();
-        sender.add_peer(rx_a.local_addr().unwrap(), 2);
-        sender.add_peer(rx_b.local_addr().unwrap(), 1);
+        sender.add_peer(rx_a.local_addr().unwrap(), 2).unwrap();
+        sender.add_peer(rx_b.local_addr().unwrap(), 1).unwrap();
 
         let mut counts = [0usize; 2];
         for payload in [b"one".as_slice(), b"two".as_slice(), b"three".as_slice()] {
@@ -3944,8 +4133,8 @@ mod tests {
             .unwrap();
 
         let mut sender = MainMioMultiSender::bind(loopback_any(), flow_id, 64).unwrap();
-        let peer_a = sender.add_peer(rx_a.local_addr().unwrap(), 0);
-        let peer_b = sender.add_peer(rx_b.local_addr().unwrap(), 0);
+        let peer_a = sender.add_peer(rx_a.local_addr().unwrap(), 0).unwrap();
+        let peer_b = sender.add_peer(rx_b.local_addr().unwrap(), 0).unwrap();
         sender.set_recovery_config(
             RecoveryConfig {
                 length_min: Duration::from_secs(1),
@@ -4025,8 +4214,12 @@ mod tests {
         }
 
         let mut sender = MainMioMultiSender::bind(loopback_any(), flow_id, 64).unwrap();
-        let peer_a = sender.add_peer(receiver_a.local_addr().unwrap(), 0);
-        let peer_b = sender.add_peer(receiver_b.local_addr().unwrap(), 0);
+        let peer_a = sender
+            .add_peer(receiver_a.local_addr().unwrap(), 0)
+            .unwrap();
+        let peer_b = sender
+            .add_peer(receiver_b.local_addr().unwrap(), 0)
+            .unwrap();
         sender.enable_srp_client("rist", b"multipath");
         let sender_addr = sender.local_addr().unwrap();
         let starts = sender.start_srp_authentication_all().unwrap();

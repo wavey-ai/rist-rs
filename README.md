@@ -38,7 +38,11 @@ A red cross means that required work or verification remains.
 - ✅ All caller and listener combinations supported by current librist
   - Main plaintext and SRP roles pass C-to-Rust and Rust-to-C tests.
   - Simple reverse roles pass Rust-to-Rust tests as a Rust extension.
-- ❌ Complete IPv4 and IPv6 behavior
+- ✅ IPv4 and IPv6 unicast behavior
+  - Simple and Main pass native tests in both caller and listener roles.
+  - Main passes current-C interoperability tests in both directions.
+  - Simple passes current-C sender to Rust receiver tests.
+  - Current librist 0.2.20 crashes in its Simple IPv6 receiver, including a C-to-C baseline.
 - ❌ ASM and SSM multicast behavior
 - ❌ Socket buffers and truncated-datagram detection
 - ❌ Allocation-free weighted multipath transmission

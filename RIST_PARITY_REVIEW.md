@@ -448,6 +448,7 @@ review; the findings above remain the audit of the originally reviewed commit.
   authentication, liveness, recovery, and feedback state by peer and flow.
   The multipath sender isolates GRE, encryption, liveness, RTT, feedback, and
   retry state by peer. Each multipath peer has an independent SRP session.
+  IPv4 and IPv6 unicast work for Simple and Main caller and listener roles.
   Only valid traffic accepted in the current authentication state refreshes
   peer activity. Fresh SRP authentication gates address reassociation to one
   silent matching identity. Same-tuple and listener restarts force
@@ -579,7 +580,12 @@ Tasks:
    Main plaintext and SRP roles pass C-to-Rust and Rust-to-C tests.
    Simple reverse roles pass Rust-to-Rust tests as a Rust extension.
    Current librist does not support those Simple reverse roles.
-8. [ ] Add complete IPv4/IPv6 behavior.
+8. [x] Add complete IPv4/IPv6 unicast behavior.
+   Native tests cover Simple and Main in caller and listener roles.
+   Main passes current-C tests in both directions.
+   Simple passes from a current-C sender to a Rust receiver.
+   Current librist v0.2.20 crashes in its Simple IPv6 receiver, including a
+   C-to-C baseline.
 9. [ ] Add ASM/SSM multicast, TTL/hop limit, interface names, and local-port
    binding.
 10. [ ] Configure socket buffers and detect truncated datagrams.

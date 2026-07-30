@@ -8,7 +8,7 @@ use rist_core::packet::rtcp::{
 use rist_core::time::ntp_now;
 use rist_core::{PskKey, SrpCredentialStore};
 use rist_mio::{MainMioReceiver, MainMioSender, SimpleMioReceiver, SimpleMioSender};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -25,9 +25,21 @@ fn loopback_any() -> SocketAddr {
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
 }
 
+fn ipv6_loopback_any() -> SocketAddr {
+    SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0))
+}
+
 fn next_even_test_port_pair() -> u16 {
+    next_even_test_port_pair_for(loopback_any())
+}
+
+fn next_even_ipv6_test_port_pair() -> u16 {
+    next_even_test_port_pair_for(ipv6_loopback_any())
+}
+
+fn next_even_test_port_pair_for(local: SocketAddr) -> u16 {
     for _ in 0..128 {
-        let socket = UdpSocket::bind(loopback_any()).expect("failed to allocate UDP port");
+        let socket = UdpSocket::bind(local).expect("failed to allocate UDP port");
         let port = socket.local_addr().unwrap().port();
         drop(socket);
 
@@ -40,8 +52,10 @@ fn next_even_test_port_pair() -> u16 {
             continue;
         }
 
-        let rtp_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, base));
-        let rtcp_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, base + 1));
+        let mut rtp_addr = local;
+        rtp_addr.set_port(base);
+        let mut rtcp_addr = local;
+        rtcp_addr.set_port(base + 1);
         if let (Ok(_rtp), Ok(_rtcp)) = (UdpSocket::bind(rtp_addr), UdpSocket::bind(rtcp_addr)) {
             return base;
         }
@@ -152,6 +166,48 @@ fn librist_simple_sender_to_pure_rust_receiver() {
         assert!(
             Instant::now() < deadline,
             "timed out waiting for pure Rust receiver"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn librist_simple_sender_to_pure_rust_ipv6_receiver() {
+    if !interop_enabled() {
+        return;
+    }
+    let _guard = lock_interop();
+
+    let flow_id = 0x1122_3344;
+    let port = next_even_ipv6_test_port_pair();
+    let receiver_addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, port, 0, 0));
+    let mut receiver =
+        SimpleMioReceiver::bind(receiver_addr, flow_id, "rust", NackMode::Range).unwrap();
+    let sender_url = format!("rist://[::1]:{port}");
+    let mut sender = rist::Sender::new(rist::Profile::Simple).unwrap();
+    sender.add_peer(&sender_url).unwrap();
+    sender.start().unwrap();
+
+    let payload = mpegts_payload("LIBRIST SIMPLE IPV6 TO PURE RUST");
+    for _ in 0..5 {
+        sender.send(&payload).unwrap();
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let mut buf = [0u8; 1500];
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some((from, received)) = receiver.try_recv_payload(&mut buf).unwrap() {
+            assert!(from.is_ipv6());
+            assert!(received
+                .payload
+                .windows(b"LIBRIST SIMPLE IPV6 TO PURE RUST".len())
+                .any(|window| window == b"LIBRIST SIMPLE IPV6 TO PURE RUST"));
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the pure Rust Simple IPv6 receiver"
         );
         thread::sleep(Duration::from_millis(1));
     }
@@ -341,6 +397,90 @@ fn librist_main_sender_to_pure_rust_receiver() {
         assert!(
             Instant::now() < deadline,
             "timed out waiting for pure Rust Main receiver"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn pure_rust_main_sender_to_librist_ipv6_receiver() {
+    if !interop_enabled() {
+        return;
+    }
+    let _guard = lock_interop();
+
+    let flow_id = 0x1122_3344;
+    let port = next_even_ipv6_test_port_pair();
+    let receiver_url = format!("rist://@[::1]:{port}");
+    let receiver_addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, port, 0, 0));
+    let mut receiver = rist::Receiver::new(rist::Profile::Main).unwrap();
+    receiver.add_peer(&receiver_url).unwrap();
+    receiver.start().unwrap();
+
+    let mut sender =
+        MainMioSender::connect(ipv6_loopback_any(), receiver_addr, flow_id, 64).unwrap();
+    send_main_session_probe(&mut sender);
+    let payload = mpegts_payload_7("PURE RUST MAIN IPV6 TO LIBRIST");
+    for _ in 0..20 {
+        sender
+            .send_payload(&payload, ntp_now(), Instant::now())
+            .unwrap();
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(block) = receiver.read(Duration::from_millis(50)).unwrap() {
+            assert!(block
+                .payload()
+                .windows(b"PURE RUST MAIN IPV6 TO LIBRIST".len())
+                .any(|window| window == b"PURE RUST MAIN IPV6 TO LIBRIST"));
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the librist Main IPv6 receiver"
+        );
+    }
+}
+
+#[test]
+fn librist_main_sender_to_pure_rust_ipv6_receiver() {
+    if !interop_enabled() {
+        return;
+    }
+    let _guard = lock_interop();
+
+    let flow_id = 0x1122_3344;
+    let port = next_even_ipv6_test_port_pair();
+    let receiver_addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, port, 0, 0));
+    let mut receiver =
+        MainMioReceiver::bind(receiver_addr, flow_id, "rust", NackMode::Range).unwrap();
+    let sender_url = format!("rist://[::1]:{port}");
+    let mut sender = rist::Sender::new(rist::Profile::Main).unwrap();
+    sender.add_peer(&sender_url).unwrap();
+    sender.start().unwrap();
+
+    let payload = mpegts_payload_7("LIBRIST MAIN IPV6 TO PURE RUST");
+    for _ in 0..20 {
+        sender.send(&payload).unwrap();
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let mut buf = [0u8; 1500];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some((from, received)) = receiver.try_recv_payload(&mut buf).unwrap() {
+            assert!(from.is_ipv6());
+            assert!(received
+                .payload
+                .windows(b"LIBRIST MAIN IPV6 TO PURE RUST".len())
+                .any(|window| window == b"LIBRIST MAIN IPV6 TO PURE RUST"));
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the pure Rust Main IPv6 receiver"
         );
         thread::sleep(Duration::from_millis(1));
     }

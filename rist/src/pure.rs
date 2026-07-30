@@ -6,7 +6,7 @@
 
 use std::collections::VecDeque;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -102,6 +102,7 @@ impl PskOptions {
 pub struct SenderBuilder {
     profile: Profile,
     local: SocketAddr,
+    local_explicit: bool,
     peer: Option<SocketAddr>,
     listening: bool,
     flow_id: u32,
@@ -124,6 +125,7 @@ impl SenderBuilder {
         Self {
             profile,
             local: loopback_any(),
+            local_explicit: false,
             peer: None,
             listening: false,
             flow_id: 0x1122_3344,
@@ -144,10 +146,14 @@ impl SenderBuilder {
 
     pub fn local_addr(mut self, local: SocketAddr) -> Self {
         self.local = local;
+        self.local_explicit = true;
         self
     }
 
     pub fn peer_addr(mut self, peer: SocketAddr) -> Self {
+        if !self.local_explicit {
+            self.local = default_local_for_peer(peer);
+        }
         self.peer = Some(peer);
         self.listening = false;
         self
@@ -155,6 +161,7 @@ impl SenderBuilder {
 
     pub fn listen_addr(mut self, local: SocketAddr) -> Self {
         self.local = local;
+        self.local_explicit = true;
         self.peer = None;
         self.listening = true;
         self
@@ -210,7 +217,11 @@ impl SenderBuilder {
         self.session_config = config.connection.into();
         self.recovery = config.recovery;
         self.congestion_control = config.congestion_control;
-        self.peer = Some(resolve_endpoint(&config.endpoint)?);
+        let peer = resolve_endpoint(&config.endpoint, self.local_explicit.then_some(self.local))?;
+        if !self.local_explicit {
+            self.local = default_local_for_peer(peer);
+        }
+        self.peer = Some(peer);
         self.listening = false;
         Ok(self)
     }
@@ -267,7 +278,8 @@ impl SenderBuilder {
         self.session_config = config.connection.into();
         self.recovery = config.recovery;
         self.congestion_control = config.congestion_control;
-        self.local = resolve_endpoint(&config.endpoint)?;
+        self.local = resolve_endpoint(&config.endpoint, None)?;
+        self.local_explicit = true;
         self.peer = None;
         self.listening = true;
         Ok(self)
@@ -568,6 +580,7 @@ struct MultiSenderPeer {
 pub struct MultiSenderBuilder {
     profile: Profile,
     local: SocketAddr,
+    local_explicit: bool,
     peers: Vec<MultiSenderPeer>,
     flow_id: u32,
     history_packets: usize,
@@ -588,6 +601,7 @@ impl MultiSenderBuilder {
         Self {
             profile,
             local: loopback_any(),
+            local_explicit: false,
             peers: Vec::new(),
             flow_id: 0x1122_3344,
             history_packets: 1024,
@@ -606,10 +620,14 @@ impl MultiSenderBuilder {
 
     pub fn local_addr(mut self, local: SocketAddr) -> Self {
         self.local = local;
+        self.local_explicit = true;
         self
     }
 
     pub fn peer_addr(mut self, peer: SocketAddr, weight: u32) -> Self {
+        if !self.local_explicit && self.peers.is_empty() {
+            self.local = default_local_for_peer(peer);
+        }
         self.peers.push(MultiSenderPeer { addr: peer, weight });
         self
     }
@@ -664,8 +682,17 @@ impl MultiSenderBuilder {
         self.session_config = config.connection.into();
         self.recovery = config.recovery;
         self.congestion_control = config.congestion_control;
+        let preferred = if self.local_explicit {
+            Some(self.local)
+        } else {
+            self.peers.first().map(|peer| peer.addr)
+        };
+        let peer = resolve_endpoint(&config.endpoint, preferred)?;
+        if !self.local_explicit && self.peers.is_empty() {
+            self.local = default_local_for_peer(peer);
+        }
         self.peers.push(MultiSenderPeer {
-            addr: resolve_endpoint(&config.endpoint)?,
+            addr: peer,
             weight: config.advanced.weight,
         });
         Ok(self)
@@ -755,7 +782,7 @@ impl MultiSenderBuilder {
                     );
                 }
                 for peer in self.peers {
-                    sender.add_peer(peer.addr, peer.weight);
+                    sender.add_peer(peer.addr, peer.weight)?;
                 }
                 Ok(MultiSender::Main(sender))
             }
@@ -860,6 +887,7 @@ impl MultiSender {
 pub struct ReceiverBuilder {
     profile: Profile,
     local: SocketAddr,
+    local_explicit: bool,
     peer: Option<SocketAddr>,
     listening: bool,
     flow_id: u32,
@@ -879,6 +907,7 @@ impl ReceiverBuilder {
         Self {
             profile,
             local: loopback_any(),
+            local_explicit: false,
             peer: None,
             listening: true,
             flow_id: 0x1122_3344,
@@ -896,10 +925,14 @@ impl ReceiverBuilder {
 
     pub fn local_addr(mut self, local: SocketAddr) -> Self {
         self.local = local;
+        self.local_explicit = true;
         self
     }
 
     pub fn peer_addr(mut self, peer: SocketAddr) -> Self {
+        if !self.local_explicit {
+            self.local = default_local_for_peer(peer);
+        }
         self.peer = Some(peer);
         self.listening = false;
         self
@@ -954,7 +987,8 @@ impl ReceiverBuilder {
         self.session_config = config.connection.into();
         self.recovery = config.recovery;
         self.congestion_control = config.congestion_control;
-        self.local = resolve_endpoint(&config.endpoint)?;
+        self.local = resolve_endpoint(&config.endpoint, None)?;
+        self.local_explicit = true;
         self.peer = None;
         self.listening = true;
         Ok(self)
@@ -1007,7 +1041,11 @@ impl ReceiverBuilder {
         self.session_config = config.connection.into();
         self.recovery = config.recovery;
         self.congestion_control = config.congestion_control;
-        self.peer = Some(resolve_endpoint(&config.endpoint)?);
+        let peer = resolve_endpoint(&config.endpoint, self.local_explicit.then_some(self.local))?;
+        if !self.local_explicit {
+            self.local = default_local_for_peer(peer);
+        }
+        self.peer = Some(peer);
         self.listening = false;
         Ok(self)
     }
@@ -1360,12 +1398,39 @@ fn loopback_any() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 0))
 }
 
-fn resolve_endpoint(endpoint: &Endpoint) -> Result<SocketAddr> {
-    let address = format!("{}:{}", endpoint.host, endpoint.port);
-    address
+fn default_local_for_peer(peer: SocketAddr) -> SocketAddr {
+    let ip = match peer.ip() {
+        IpAddr::V4(ip) if ip.is_loopback() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        IpAddr::V6(ip) if ip.is_loopback() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+    };
+    SocketAddr::new(ip, 0)
+}
+
+fn resolve_endpoint(endpoint: &Endpoint, preferred: Option<SocketAddr>) -> Result<SocketAddr> {
+    let address = format_endpoint(endpoint);
+    let addresses = (endpoint.host.as_str(), endpoint.port)
         .to_socket_addrs()?
+        .collect::<Vec<_>>();
+    if let Some(preferred) = preferred {
+        return addresses
+            .into_iter()
+            .find(|address| address.is_ipv4() == preferred.is_ipv4())
+            .ok_or(Error::AddressResolution(address));
+    }
+    addresses
+        .into_iter()
         .next()
         .ok_or(Error::AddressResolution(address))
+}
+
+fn format_endpoint(endpoint: &Endpoint) -> String {
+    if endpoint.host.contains(':') {
+        format!("[{}]:{}", endpoint.host, endpoint.port)
+    } else {
+        format!("{}:{}", endpoint.host, endpoint.port)
+    }
 }
 
 fn parse_miface_v4(miface: Option<&str>) -> Result<Option<Ipv4Addr>> {
@@ -1504,6 +1569,79 @@ mod tests {
         let mut buf = [0; 1500];
         let payload = recv_eventually(&mut receiver, &mut buf);
         assert_eq!(payload.payload, b"reverse-payload");
+    }
+
+    #[test]
+    fn ipv6_urls_select_ipv6_local_sockets_for_both_profiles() {
+        for profile in [Profile::Simple, Profile::Main] {
+            let mut receiver = Receiver::builder(profile)
+                .listen_url("rist://@[::1]:0")
+                .unwrap()
+                .bind()
+                .unwrap();
+            let receiver_addr = receiver.local_addr().unwrap();
+            assert!(receiver_addr.is_ipv6());
+
+            let url = format!("rist://[::1]:{}", receiver_addr.port());
+            let mut sender = Sender::builder(profile)
+                .peer_url(&url)
+                .unwrap()
+                .connect()
+                .unwrap();
+            assert!(sender.local_addr().unwrap().is_ipv6());
+
+            sender.send(b"ipv6-builder").unwrap();
+            let mut buf = [0u8; 1500];
+            let payload = recv_eventually(&mut receiver, &mut buf);
+            assert_eq!(payload.payload, b"ipv6-builder");
+        }
+    }
+
+    #[test]
+    fn builders_reject_mixed_ip_address_families() {
+        let ipv4 = SocketAddr::from(([127, 0, 0, 1], 0));
+        let ipv6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 9000);
+
+        for profile in [Profile::Simple, Profile::Main] {
+            let error = match Sender::builder(profile)
+                .local_addr(ipv4)
+                .peer_addr(ipv6)
+                .connect()
+            {
+                Ok(_) => panic!("mixed-family sender unexpectedly connected"),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                error,
+                Error::Io(ref error) if error.kind() == io::ErrorKind::InvalidInput
+            ));
+
+            let error = match Receiver::builder(profile)
+                .local_addr(ipv4)
+                .peer_addr(ipv6)
+                .bind()
+            {
+                Ok(_) => panic!("mixed-family receiver unexpectedly connected"),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                error,
+                Error::Io(ref error) if error.kind() == io::ErrorKind::InvalidInput
+            ));
+        }
+
+        let error = match MultiSender::builder(Profile::Main)
+            .peer_addr(SocketAddr::from(([127, 0, 0, 1], 9000)), 1)
+            .peer_addr(ipv6, 1)
+            .connect()
+        {
+            Ok(_) => panic!("mixed-family multipath sender unexpectedly connected"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            Error::Io(ref error) if error.kind() == io::ErrorKind::InvalidInput
+        ));
     }
 
     #[test]
