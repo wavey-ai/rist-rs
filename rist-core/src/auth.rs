@@ -1,16 +1,23 @@
 use crate::{Error, Result};
 use aes::{Aes128, Aes256};
+use aes_gcm::aead::{AeadInPlace, KeyInit};
+use aes_gcm::{Aes256Gcm, Nonce, Tag};
 use ctr::cipher::{KeyIvInit, StreamCipher};
+use hkdf::Hkdf;
 use num_bigint::BigUint;
 use num_traits::Zero;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::fmt;
+use subtle::ConstantTimeEq;
+use zeroize::Zeroize;
 
 type Aes128Ctr = ctr::Ctr128BE<Aes128>;
 type Aes256Ctr = ctr::Ctr128BE<Aes256>;
 
 pub const EAPOL_VERSION_2: u8 = 2;
 pub const EAPOL_VERSION_3: u8 = 3;
+pub const EAPOL_VERSION_4: u8 = 4;
 pub const EAPOL_TYPE_EAP_PACKET: u8 = 0;
 pub const EAPOL_TYPE_START: u8 = 1;
 pub const EAPOL_TYPE_LOGOFF: u8 = 2;
@@ -23,6 +30,13 @@ pub const EAP_TYPE_SRP_SHA1: u8 = 19;
 
 pub const SRP_SHA256_DIGEST_LENGTH: usize = 32;
 pub const SRP_DEFAULT_SALT_LEN: usize = 32;
+const MAX_SRP_OPERATIONS_PER_SESSION: u8 = 8;
+const MIN_SRP_MODULUS_BYTES: usize = 128;
+const MAX_SRP_MODULUS_BYTES: usize = 1024;
+const MAX_SRP_SALT_BYTES: usize = 64;
+const EAP_V4_NONCE_LEN: usize = 12;
+const EAP_V4_TAG_LEN: usize = 16;
+const EAP_V4_MAX_PLAINTEXT: usize = 1400;
 
 const SRP_2048_N_HEX: &str = concat!(
     "AC6BDB41324A9A9BF166DE5E1389582FAF72B6651987EE07FC3192943DB56050A37329CBB4",
@@ -368,10 +382,19 @@ impl EapSrpChallenge {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum SrpPassphrase {
     UseSessionKey,
     Passphrase(Vec<u8>),
+}
+
+impl fmt::Debug for SrpPassphrase {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UseSessionKey => formatter.write_str("UseSessionKey"),
+            Self::Passphrase(_) => formatter.write_str("Passphrase(<redacted>)"),
+        }
+    }
 }
 
 impl SrpPassphrase {
@@ -410,6 +433,117 @@ impl SrpPassphrase {
             encrypted,
         )?))
     }
+
+    pub fn encode_response_v4(
+        &self,
+        identifier: u8,
+        session_key: &[u8],
+        client_to_server: bool,
+        counter: u64,
+    ) -> Result<EapSrpMessage> {
+        let Self::Passphrase(passphrase) = self else {
+            return Err(Error::InvalidEapPacket);
+        };
+        if passphrase.is_empty() || passphrase.len() > EAP_V4_MAX_PLAINTEXT {
+            return Err(Error::InvalidEapPacket);
+        }
+
+        let flags = 0x40;
+        let nonce = eap_v4_nonce(counter);
+        let aad = eap_v4_aad(identifier, flags, &nonce);
+        let key = eap_v4_direction_key(session_key, client_to_server)?;
+        let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| Error::EapAuthenticationFailed)?;
+        let mut ciphertext = passphrase.clone();
+        let tag = cipher
+            .encrypt_in_place_detached(Nonce::from_slice(&nonce), &aad, &mut ciphertext)
+            .map_err(|_| Error::EapAuthenticationFailed)?;
+
+        let mut data = Vec::with_capacity(1 + EAP_V4_NONCE_LEN + ciphertext.len() + EAP_V4_TAG_LEN);
+        data.push(flags);
+        data.extend_from_slice(&nonce);
+        data.extend_from_slice(&ciphertext);
+        data.extend_from_slice(&tag);
+        Ok(EapSrpMessage::new(
+            EapSrpSubtype::PassphraseRequestResponse,
+            data,
+        ))
+    }
+
+    pub fn decode_response_v4(
+        identifier: u8,
+        session_key: &[u8],
+        client_to_server: bool,
+        input: &[u8],
+        last_nonce: &mut Option<u64>,
+    ) -> Result<Self> {
+        if input.len() < 1 + EAP_V4_NONCE_LEN + EAP_V4_TAG_LEN || input[0] & 0x80 != 0 {
+            return Err(Error::InvalidEapPacket);
+        }
+        let flags = input[0];
+        let nonce: [u8; EAP_V4_NONCE_LEN] = input[1..1 + EAP_V4_NONCE_LEN]
+            .try_into()
+            .map_err(|_| Error::InvalidEapPacket)?;
+        let ciphertext_end = input.len() - EAP_V4_TAG_LEN;
+        let mut plaintext = input[1 + EAP_V4_NONCE_LEN..ciphertext_end].to_vec();
+        if plaintext.is_empty() || plaintext.len() > EAP_V4_MAX_PLAINTEXT {
+            return Err(Error::InvalidEapPacket);
+        }
+        let tag = Tag::from_slice(&input[ciphertext_end..]);
+        let aad = eap_v4_aad(identifier, flags, &nonce);
+        let key = eap_v4_direction_key(session_key, client_to_server)?;
+        let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| Error::EapAuthenticationFailed)?;
+        cipher
+            .decrypt_in_place_detached(Nonce::from_slice(&nonce), &aad, &mut plaintext, tag)
+            .map_err(|_| Error::EapAuthenticationFailed)?;
+
+        let counter =
+            u64::from_be_bytes(nonce[4..].try_into().map_err(|_| Error::InvalidEapPacket)?);
+        if last_nonce.is_some_and(|last| counter <= last) {
+            plaintext.zeroize();
+            return Err(Error::EapReplay);
+        }
+        *last_nonce = Some(counter);
+        Ok(Self::Passphrase(plaintext))
+    }
+}
+
+fn eap_v4_direction_key(
+    session_key: &[u8],
+    client_to_server: bool,
+) -> Result<[u8; SRP_SHA256_DIGEST_LENGTH]> {
+    let hkdf = Hkdf::<Sha256>::from_prk(session_key).map_err(|_| Error::InvalidEapPacket)?;
+    let label = if client_to_server {
+        b"RIST-EAP-v4 pass c2s".as_slice()
+    } else {
+        b"RIST-EAP-v4 pass s2c".as_slice()
+    };
+    let mut output = [0; SRP_SHA256_DIGEST_LENGTH];
+    hkdf.expand(label, &mut output)
+        .map_err(|_| Error::InvalidEapPacket)?;
+    Ok(output)
+}
+
+fn eap_v4_nonce(counter: u64) -> [u8; EAP_V4_NONCE_LEN] {
+    let mut nonce = [0; EAP_V4_NONCE_LEN];
+    nonce[4..].copy_from_slice(&counter.to_be_bytes());
+    nonce
+}
+
+fn eap_v4_aad(
+    identifier: u8,
+    flags: u8,
+    nonce: &[u8; EAP_V4_NONCE_LEN],
+) -> [u8; 5 + EAP_V4_NONCE_LEN] {
+    let mut aad = [0; 5 + EAP_V4_NONCE_LEN];
+    aad[..5].copy_from_slice(&[
+        EapCode::Response.as_u8(),
+        identifier,
+        EAP_TYPE_SRP_SHA1,
+        EapSrpSubtype::PassphraseRequestResponse.as_u8(),
+        flags,
+    ]);
+    aad[5..].copy_from_slice(nonce);
+    aad
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -463,7 +597,14 @@ impl SrpGroup {
     }
 
     fn new(n: BigUint, g: BigUint) -> Result<Self> {
-        if n.is_zero() || g.is_zero() || g >= n {
+        let modulus_len = minimal_bytes(&n).len();
+        if !(MIN_SRP_MODULUS_BYTES..=MAX_SRP_MODULUS_BYTES).contains(&modulus_len)
+            || n.is_zero()
+            || (&n & BigUint::from(1u8)).is_zero()
+            || g <= BigUint::from(1u8)
+            || g >= n
+            || minimal_bytes(&g).len() > modulus_len
+        {
             return Err(Error::InvalidSrpGroup);
         }
         Ok(Self {
@@ -491,7 +632,7 @@ impl SrpGroup {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SrpUserRecord {
     pub username: String,
     pub salt: Vec<u8>,
@@ -500,6 +641,24 @@ pub struct SrpUserRecord {
     pub hash_version: SrpHashVersion,
     pub group: SrpGroup,
     pub use_default_2048_bit_group: bool,
+}
+
+impl fmt::Debug for SrpUserRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SrpUserRecord")
+            .field("username", &self.username)
+            .field("salt", &"<redacted>")
+            .field("verifier", &"<redacted>")
+            .field("generation", &self.generation)
+            .field("hash_version", &self.hash_version)
+            .field("group", &self.group)
+            .field(
+                "use_default_2048_bit_group",
+                &self.use_default_2048_bit_group,
+            )
+            .finish()
+    }
 }
 
 impl SrpUserRecord {
@@ -531,6 +690,9 @@ impl SrpUserRecord {
     ) -> Result<Self> {
         let username = username.into();
         let salt = canonical_srp_bytes(salt.as_ref());
+        if salt.is_empty() || salt.len() > MAX_SRP_SALT_BYTES {
+            return Err(Error::InvalidSrpGroup);
+        }
         let verifier = srp_verifier(&group, &username, password.as_ref(), &salt, hash_version)?;
         Ok(Self {
             username,
@@ -552,6 +714,13 @@ impl SrpUserRecord {
             self.hash_version,
         )?;
         Ok(verifier == self.verifier)
+    }
+}
+
+impl Drop for SrpUserRecord {
+    fn drop(&mut self) {
+        self.salt.zeroize();
+        self.verifier.zeroize();
     }
 }
 
@@ -662,11 +831,22 @@ impl SrpCredentialStore {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PassphraseRollover {
     current: Vec<u8>,
     pending: Option<Vec<u8>>,
     generation: u64,
+}
+
+impl fmt::Debug for PassphraseRollover {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PassphraseRollover")
+            .field("current", &"<redacted>")
+            .field("pending", &self.pending.as_ref().map(|_| "<redacted>"))
+            .field("generation", &self.generation)
+            .finish()
+    }
 }
 
 impl PassphraseRollover {
@@ -709,16 +889,40 @@ impl PassphraseRollover {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl Drop for PassphraseRollover {
+    fn drop(&mut self) {
+        self.current.zeroize();
+        if let Some(pending) = &mut self.pending {
+            pending.zeroize();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientAuthState {
+    Idle,
+    AwaitingIdentity,
+    AwaitingChallenge,
+    AwaitingServerKey,
+    AwaitingServerValidator,
+    Authenticated,
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct EapSrpClientSession {
     username: String,
     password: Vec<u8>,
     eap_version: u8,
     srp: Option<SrpClient>,
-    authenticated: bool,
+    state: ClientAuthState,
     use_session_key_as_passphrase: bool,
     tx_passphrase: Option<Vec<u8>>,
     rx_passphrase: Option<Vec<u8>>,
+    srp_compat_legacy: bool,
+    expensive_operations: u8,
+    last_request: Option<(EapPacket, EapolFrame)>,
+    peer_eap_version: u8,
+    tx_nonce_counter: u64,
 }
 
 impl EapSrpClientSession {
@@ -726,12 +930,17 @@ impl EapSrpClientSession {
         Self {
             username: username.into(),
             password: password.as_ref().to_vec(),
-            eap_version: EAPOL_VERSION_3,
+            eap_version: EAPOL_VERSION_4,
             srp: None,
-            authenticated: false,
+            state: ClientAuthState::Idle,
             use_session_key_as_passphrase: true,
             tx_passphrase: None,
             rx_passphrase: None,
+            srp_compat_legacy: false,
+            expensive_operations: 0,
+            last_request: None,
+            peer_eap_version: 0,
+            tx_nonce_counter: 0,
         }
     }
 
@@ -751,19 +960,25 @@ impl EapSrpClientSession {
         self
     }
 
-    pub fn start(&self) -> EapolFrame {
+    /// Use the pre-v0.2.16 unpadded SRP transcript.
+    pub fn with_srp_compat_legacy(mut self, enabled: bool) -> Self {
+        self.srp_compat_legacy = enabled;
+        self
+    }
+
+    pub fn start(&mut self) -> EapolFrame {
+        self.clear_exchange();
+        self.state = ClientAuthState::AwaitingIdentity;
         EapolFrame::start(self.eap_version)
     }
 
     pub fn authenticated(&self) -> bool {
-        self.authenticated
+        self.state == ClientAuthState::Authenticated
     }
 
     pub fn set_password(&mut self, password: impl AsRef<[u8]>) {
         self.password = password.as_ref().to_vec();
-        self.srp = None;
-        self.authenticated = false;
-        self.rx_passphrase = None;
+        self.clear_exchange();
     }
 
     pub fn session_key(&self) -> Option<&[u8; SRP_SHA256_DIGEST_LENGTH]> {
@@ -775,18 +990,32 @@ impl EapSrpClientSession {
     }
 
     pub fn handle_frame(&mut self, frame: &EapolFrame) -> Result<Option<EapolFrame>> {
-        if frame.packet_type != EAPOL_TYPE_EAP_PACKET {
-            return Ok(None);
+        self.peer_eap_version = self.peer_eap_version.max(frame.version);
+        match frame.packet_type {
+            EAPOL_TYPE_LOGOFF | EAPOL_TYPE_START => {
+                self.clear_exchange();
+                return Ok(None);
+            }
+            EAPOL_TYPE_EAP_PACKET => {}
+            _ => return Ok(None),
         }
         let packet = frame.eap_packet()?;
         match packet.code {
-            EapCode::Request => self.handle_request(frame.version, &packet),
-            EapCode::Success => {
-                self.authenticated = true;
-                Ok(None)
+            EapCode::Request => {
+                if let Some((cached_request, cached_response)) = &self.last_request {
+                    if cached_request == &packet {
+                        return Ok(Some(cached_response.clone()));
+                    }
+                }
+                let response = self.handle_request(frame.version, &packet)?;
+                if let Some(response) = &response {
+                    self.last_request = Some((packet, response.clone()));
+                }
+                Ok(response)
             }
+            EapCode::Success => Err(Error::InvalidEapPacket),
             EapCode::Failure => {
-                self.authenticated = false;
+                self.clear_exchange();
                 Err(Error::InvalidEapPacket)
             }
             EapCode::Response => Err(Error::InvalidEapPacket),
@@ -796,15 +1025,22 @@ impl EapSrpClientSession {
     fn handle_request(&mut self, version: u8, packet: &EapPacket) -> Result<Option<EapolFrame>> {
         match packet.eap_type {
             Some(EAP_TYPE_IDENTITY) => {
+                self.clear_exchange();
                 let response =
                     EapPacket::identity_response(packet.identifier, self.username.as_bytes());
+                self.state = ClientAuthState::AwaitingChallenge;
                 Ok(Some(EapolFrame::eap(self.eap_version, &response)?))
             }
             Some(EAP_TYPE_SRP_SHA1) => {
                 let message = EapSrpMessage::from_eap_packet(packet)?;
                 self.handle_srp_request(version, packet.identifier, message)
             }
-            _ => Err(Error::InvalidEapPacket),
+            _ => Err(Error::UnexpectedEapMessage {
+                state: "client request state",
+                code: packet.code.as_u8(),
+                identifier: packet.identifier,
+                subtype: packet.data.first().copied(),
+            }),
         }
     }
 
@@ -815,7 +1051,8 @@ impl EapSrpClientSession {
         message: EapSrpMessage,
     ) -> Result<Option<EapolFrame>> {
         match message.subtype {
-            EapSrpSubtype::Challenge => {
+            EapSrpSubtype::Challenge if self.state == ClientAuthState::AwaitingChallenge => {
+                self.consume_expensive_operation()?;
                 let challenge = EapSrpChallenge::decode(&message.data)?;
                 let group = challenge.group.unwrap_or_else(SrpGroup::default_2048);
                 let hash_version = if version >= EAPOL_VERSION_3 {
@@ -823,13 +1060,22 @@ impl EapSrpClientSession {
                 } else {
                     SrpHashVersion::LegacyMbedTlsSha256
                 };
-                let srp = SrpClient::new(group, challenge.salt, hash_version)?;
+                let srp = SrpClient::new_with_compat(
+                    group,
+                    challenge.salt,
+                    hash_version,
+                    self.srp_compat_legacy,
+                )?;
                 let response = EapSrpMessage::new(EapSrpSubtype::Challenge, srp.public_key())
                     .into_eap_response(identifier);
                 self.srp = Some(srp);
+                self.state = ClientAuthState::AwaitingServerKey;
                 Ok(Some(EapolFrame::eap(self.eap_version, &response)?))
             }
-            EapSrpSubtype::ServerKeyOrClientValidator => {
+            EapSrpSubtype::ServerKeyOrClientValidator
+                if self.state == ClientAuthState::AwaitingServerKey =>
+            {
+                self.consume_expensive_operation()?;
                 let Some(srp) = &mut self.srp else {
                     return Err(Error::InvalidEapPacket);
                 };
@@ -841,9 +1087,12 @@ impl EapSrpClientSession {
                 data.extend_from_slice(&m1);
                 let response = EapSrpMessage::new(EapSrpSubtype::ServerKeyOrClientValidator, data)
                     .into_eap_response(identifier);
+                self.state = ClientAuthState::AwaitingServerValidator;
                 Ok(Some(EapolFrame::eap(self.eap_version, &response)?))
             }
-            EapSrpSubtype::ServerValidator => {
+            EapSrpSubtype::ServerValidator
+                if self.state == ClientAuthState::AwaitingServerValidator =>
+            {
                 if message.data.len() < 4 + SRP_SHA256_DIGEST_LENGTH {
                     return Err(Error::InvalidEapPacket);
                 }
@@ -851,21 +1100,22 @@ impl EapSrpClientSession {
                     return Err(Error::InvalidEapPacket);
                 };
                 if !srp.verify_server(&message.data[4..4 + SRP_SHA256_DIGEST_LENGTH])? {
-                    self.authenticated = false;
+                    self.clear_exchange();
                     return Err(Error::InvalidEapPacket);
                 }
                 if message.data[3] & 1 != 0 {
                     self.rx_passphrase = srp.session_key().map(|key| key.to_vec());
                 }
-                self.authenticated = true;
+                self.state = ClientAuthState::Authenticated;
+                self.expensive_operations = 0;
                 let response = EapPacket::success(identifier);
                 Ok(Some(EapolFrame::eap(self.eap_version, &response)?))
             }
             EapSrpSubtype::PassphraseRequestResponse => {
-                if !self.authenticated {
+                if self.state != ClientAuthState::Authenticated {
                     return Err(Error::InvalidEapPacket);
                 }
-                let Some(key) = self.session_key() else {
+                let Some(key) = self.session_key().copied() else {
                     return Err(Error::InvalidEapPacket);
                 };
                 let passphrase = if self.use_session_key_as_passphrase {
@@ -873,39 +1123,112 @@ impl EapSrpClientSession {
                 } else {
                     SrpPassphrase::Passphrase(self.tx_passphrase.clone().unwrap_or_default())
                 };
-                let response = passphrase
-                    .encode_response(identifier, key)?
-                    .into_eap_response(identifier);
+                let response = if self.eap_version >= EAPOL_VERSION_4
+                    && self.peer_eap_version >= EAPOL_VERSION_4
+                {
+                    let response = passphrase.encode_response_v4(
+                        identifier,
+                        &key,
+                        true,
+                        self.tx_nonce_counter,
+                    )?;
+                    self.tx_nonce_counter = self.tx_nonce_counter.wrapping_add(1);
+                    response
+                } else {
+                    passphrase.encode_response(identifier, &key)?
+                }
+                .into_eap_response(identifier);
                 Ok(Some(EapolFrame::eap(self.eap_version, &response)?))
             }
-            EapSrpSubtype::LightweightRechallenge => Err(Error::InvalidEapPacket),
+            subtype => Err(Error::UnexpectedEapMessage {
+                state: "client SRP state",
+                code: EapCode::Request.as_u8(),
+                identifier,
+                subtype: Some(subtype.as_u8()),
+            }),
+        }
+    }
+
+    fn consume_expensive_operation(&mut self) -> Result<()> {
+        if self.expensive_operations >= MAX_SRP_OPERATIONS_PER_SESSION {
+            self.clear_exchange();
+            return Err(Error::InvalidEapPacket);
+        }
+        self.expensive_operations += 1;
+        Ok(())
+    }
+
+    fn clear_exchange(&mut self) {
+        self.srp = None;
+        self.state = ClientAuthState::Idle;
+        if let Some(passphrase) = &mut self.rx_passphrase {
+            passphrase.zeroize();
+        }
+        self.rx_passphrase = None;
+        self.last_request = None;
+        self.tx_nonce_counter = 0;
+    }
+}
+
+impl Drop for EapSrpClientSession {
+    fn drop(&mut self) {
+        self.password.zeroize();
+        if let Some(passphrase) = &mut self.tx_passphrase {
+            passphrase.zeroize();
+        }
+        if let Some(passphrase) = &mut self.rx_passphrase {
+            passphrase.zeroize();
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthenticatorAuthState {
+    Idle,
+    AwaitingIdentity(u8),
+    AwaitingClientKey(u8),
+    AwaitingClientProof(u8),
+    AwaitingClientAck(u8),
+    Authenticated,
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct EapSrpAuthenticatorSession {
     store: SrpCredentialStore,
     eap_version: u8,
     next_identifier: u8,
     username: Option<String>,
     srp: Option<SrpAuthenticator>,
-    authenticated: bool,
+    state: AuthenticatorAuthState,
     use_session_key_as_passphrase: bool,
     rx_passphrase: Option<Vec<u8>>,
+    srp_compat_legacy: bool,
+    identifier_ready: bool,
+    expensive_operations: u8,
+    last_response: Option<(EapPacket, EapolFrame)>,
+    peer_eap_version: u8,
+    rx_last_nonce: Option<u64>,
 }
 
 impl EapSrpAuthenticatorSession {
     pub fn new(store: SrpCredentialStore) -> Self {
+        let mut identifier = [0u8; 1];
+        let identifier_ready = getrandom::getrandom(&mut identifier).is_ok();
         Self {
             store,
-            eap_version: EAPOL_VERSION_3,
-            next_identifier: 0,
+            eap_version: EAPOL_VERSION_4,
+            next_identifier: identifier[0],
             username: None,
             srp: None,
-            authenticated: false,
+            state: AuthenticatorAuthState::Idle,
             use_session_key_as_passphrase: true,
             rx_passphrase: None,
+            srp_compat_legacy: false,
+            identifier_ready,
+            expensive_operations: 0,
+            last_response: None,
+            peer_eap_version: 0,
+            rx_last_nonce: None,
         }
     }
 
@@ -916,6 +1239,7 @@ impl EapSrpAuthenticatorSession {
 
     pub fn with_initial_identifier(mut self, identifier: u8) -> Self {
         self.next_identifier = identifier;
+        self.identifier_ready = true;
         self
     }
 
@@ -929,8 +1253,22 @@ impl EapSrpAuthenticatorSession {
         self
     }
 
+    /// Use the pre-v0.2.16 unpadded SRP transcript.
+    pub fn with_srp_compat_legacy(mut self, enabled: bool) -> Self {
+        self.srp_compat_legacy = enabled;
+        self
+    }
+
     pub fn authenticated(&self) -> bool {
-        self.authenticated
+        self.state == AuthenticatorAuthState::Authenticated
+    }
+
+    pub fn authenticated_username(&self) -> Option<&str> {
+        if self.authenticated() {
+            self.username.as_deref()
+        } else {
+            None
+        }
     }
 
     pub fn stage_password(
@@ -958,31 +1296,52 @@ impl EapSrpAuthenticatorSession {
     }
 
     pub fn request_identity(&mut self) -> Result<EapolFrame> {
-        let identifier = self.next_identifier();
+        self.clear_exchange();
+        let identifier = self.next_identifier()?;
+        self.state = AuthenticatorAuthState::AwaitingIdentity(identifier);
         EapolFrame::eap(self.eap_version, &EapPacket::identity_request(identifier))
     }
 
     pub fn handle_frame(&mut self, frame: &EapolFrame) -> Result<Option<EapolFrame>> {
+        self.peer_eap_version = self.peer_eap_version.max(frame.version);
         match frame.packet_type {
             EAPOL_TYPE_START => Ok(Some(self.request_identity()?)),
             EAPOL_TYPE_LOGOFF => {
-                self.authenticated = false;
+                self.clear_exchange();
                 Ok(None)
             }
             EAPOL_TYPE_EAP_PACKET => {
                 let packet = frame.eap_packet()?;
                 match packet.code {
-                    EapCode::Response => self.handle_response(frame.version, &packet),
-                    EapCode::Success => {
-                        self.authenticated = self
-                            .srp
-                            .as_ref()
-                            .and_then(SrpAuthenticator::session_key)
-                            .is_some();
-                        Ok(None)
+                    EapCode::Response => {
+                        if let Some((cached_response, cached_request)) = &self.last_response {
+                            if cached_response == &packet {
+                                return Ok(Some(cached_request.clone()));
+                            }
+                        }
+                        let request = self.handle_response(frame.version, &packet)?;
+                        if let Some(request) = &request {
+                            self.last_response = Some((packet, request.clone()));
+                        }
+                        Ok(request)
                     }
+                    EapCode::Success => match self.state {
+                        AuthenticatorAuthState::AwaitingClientAck(identifier)
+                            if identifier == packet.identifier
+                                && self
+                                    .srp
+                                    .as_ref()
+                                    .and_then(SrpAuthenticator::session_key)
+                                    .is_some() =>
+                        {
+                            self.state = AuthenticatorAuthState::Authenticated;
+                            self.expensive_operations = 0;
+                            Ok(None)
+                        }
+                        _ => Err(Error::InvalidEapPacket),
+                    },
                     EapCode::Failure => {
-                        self.authenticated = false;
+                        self.clear_exchange();
                         Err(Error::InvalidEapPacket)
                     }
                     EapCode::Request => Err(Error::InvalidEapPacket),
@@ -994,10 +1353,14 @@ impl EapSrpAuthenticatorSession {
 
     fn handle_response(&mut self, version: u8, packet: &EapPacket) -> Result<Option<EapolFrame>> {
         match packet.eap_type {
-            Some(EAP_TYPE_IDENTITY) => self.handle_identity_response(version, packet),
+            Some(EAP_TYPE_IDENTITY)
+                if self.state == AuthenticatorAuthState::AwaitingIdentity(packet.identifier) =>
+            {
+                self.handle_identity_response(version, packet)
+            }
             Some(EAP_TYPE_SRP_SHA1) => {
                 let message = EapSrpMessage::from_eap_packet(packet)?;
-                self.handle_srp_response(packet.identifier, message)
+                self.handle_srp_response(version, packet.identifier, message)
             }
             _ => Err(Error::InvalidEapPacket),
         }
@@ -1008,6 +1371,7 @@ impl EapSrpAuthenticatorSession {
         version: u8,
         packet: &EapPacket,
     ) -> Result<Option<EapolFrame>> {
+        self.consume_expensive_operation()?;
         let username =
             String::from_utf8(packet.data.clone()).map_err(|_| Error::InvalidEapPacket)?;
         let max_hash_version = if version >= EAPOL_VERSION_3 {
@@ -1027,28 +1391,42 @@ impl EapSrpAuthenticatorSession {
         }
         .encode_message()?;
         self.username = Some(username);
-        self.srp = Some(SrpAuthenticator::new(record)?);
-        let request = challenge.into_eap_request(self.next_identifier());
+        self.srp = Some(SrpAuthenticator::new_with_compat(
+            record,
+            self.srp_compat_legacy,
+        )?);
+        let identifier = self.next_identifier()?;
+        let request = challenge.into_eap_request(identifier);
+        self.state = AuthenticatorAuthState::AwaitingClientKey(identifier);
         Ok(Some(EapolFrame::eap(self.eap_version, &request)?))
     }
 
     fn handle_srp_response(
         &mut self,
+        version: u8,
         identifier: u8,
         message: EapSrpMessage,
     ) -> Result<Option<EapolFrame>> {
         match message.subtype {
-            EapSrpSubtype::Challenge => {
+            EapSrpSubtype::Challenge
+                if self.state == AuthenticatorAuthState::AwaitingClientKey(identifier) =>
+            {
+                self.consume_expensive_operation()?;
                 let Some(srp) = &mut self.srp else {
                     return Err(Error::InvalidEapPacket);
                 };
                 let server_key = srp.handle_client_key(&message.data)?;
+                let request_identifier = self.next_identifier()?;
                 let request =
                     EapSrpMessage::new(EapSrpSubtype::ServerKeyOrClientValidator, server_key)
-                        .into_eap_request(self.next_identifier());
+                        .into_eap_request(request_identifier);
+                self.state = AuthenticatorAuthState::AwaitingClientProof(request_identifier);
                 Ok(Some(EapolFrame::eap(self.eap_version, &request)?))
             }
-            EapSrpSubtype::ServerKeyOrClientValidator => {
+            EapSrpSubtype::ServerKeyOrClientValidator
+                if self.state == AuthenticatorAuthState::AwaitingClientProof(identifier) =>
+            {
+                self.consume_expensive_operation()?;
                 if message.data.len() < 4 + SRP_SHA256_DIGEST_LENGTH {
                     return Err(Error::InvalidEapPacket);
                 }
@@ -1059,22 +1437,40 @@ impl EapSrpAuthenticatorSession {
                 if message.data[3] & 1 != 0 {
                     self.rx_passphrase = srp.session_key().map(|key| key.to_vec());
                 }
-                self.authenticated = true;
                 let mut data = vec![0; 4];
                 if self.use_session_key_as_passphrase {
                     data[3] |= 1;
                 }
                 data.extend_from_slice(&m2);
+                let request_identifier = self.next_identifier()?;
                 let request = EapSrpMessage::new(EapSrpSubtype::ServerValidator, data)
-                    .into_eap_request(self.next_identifier());
+                    .into_eap_request(request_identifier);
+                self.state = AuthenticatorAuthState::AwaitingClientAck(request_identifier);
                 Ok(Some(EapolFrame::eap(self.eap_version, &request)?))
             }
-            EapSrpSubtype::PassphraseRequestResponse => {
-                let Some(key) = self.session_key() else {
+            EapSrpSubtype::PassphraseRequestResponse
+                if self.state == AuthenticatorAuthState::Authenticated =>
+            {
+                let Some(key) = self.session_key().copied() else {
                     return Err(Error::InvalidEapPacket);
                 };
                 self.rx_passphrase = Some(
-                    match SrpPassphrase::decode_response(identifier, key, &message.data)? {
+                    match if self.eap_version >= EAPOL_VERSION_4
+                        && self.peer_eap_version >= EAPOL_VERSION_4
+                    {
+                        if version < EAPOL_VERSION_4 {
+                            return Err(Error::InvalidEapPacket);
+                        }
+                        SrpPassphrase::decode_response_v4(
+                            identifier,
+                            &key,
+                            true,
+                            &message.data,
+                            &mut self.rx_last_nonce,
+                        )?
+                    } else {
+                        SrpPassphrase::decode_response(identifier, &key, &message.data)?
+                    } {
                         SrpPassphrase::UseSessionKey => key.to_vec(),
                         SrpPassphrase::Passphrase(passphrase) => passphrase,
                     },
@@ -1082,20 +1478,50 @@ impl EapSrpAuthenticatorSession {
                 let response = EapPacket::success(identifier);
                 Ok(Some(EapolFrame::eap(self.eap_version, &response)?))
             }
-            EapSrpSubtype::ServerValidator | EapSrpSubtype::LightweightRechallenge => {
-                Err(Error::InvalidEapPacket)
-            }
+            _ => Err(Error::InvalidEapPacket),
         }
     }
 
-    fn next_identifier(&mut self) -> u8 {
+    fn next_identifier(&mut self) -> Result<u8> {
+        if !self.identifier_ready {
+            return Err(Error::RandomNonce);
+        }
         let identifier = self.next_identifier;
         self.next_identifier = self.next_identifier.wrapping_add(1);
-        identifier
+        Ok(identifier)
+    }
+
+    fn consume_expensive_operation(&mut self) -> Result<()> {
+        if self.expensive_operations >= MAX_SRP_OPERATIONS_PER_SESSION {
+            self.clear_exchange();
+            return Err(Error::InvalidEapPacket);
+        }
+        self.expensive_operations += 1;
+        Ok(())
+    }
+
+    fn clear_exchange(&mut self) {
+        self.username = None;
+        self.srp = None;
+        self.state = AuthenticatorAuthState::Idle;
+        if let Some(passphrase) = &mut self.rx_passphrase {
+            passphrase.zeroize();
+        }
+        self.rx_passphrase = None;
+        self.last_response = None;
+        self.rx_last_nonce = None;
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl Drop for EapSrpAuthenticatorSession {
+    fn drop(&mut self) {
+        if let Some(passphrase) = &mut self.rx_passphrase {
+            passphrase.zeroize();
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct SrpClient {
     group: SrpGroup,
     salt: Vec<u8>,
@@ -1105,6 +1531,7 @@ pub struct SrpClient {
     b_pub: Option<BigUint>,
     key: Option<[u8; SRP_SHA256_DIGEST_LENGTH]>,
     m1: Option<[u8; SRP_SHA256_DIGEST_LENGTH]>,
+    legacy_pad: bool,
 }
 
 impl SrpClient {
@@ -1113,8 +1540,17 @@ impl SrpClient {
         salt: impl AsRef<[u8]>,
         hash_version: SrpHashVersion,
     ) -> Result<Self> {
+        Self::new_with_compat(group, salt, hash_version, false)
+    }
+
+    pub fn new_with_compat(
+        group: SrpGroup,
+        salt: impl AsRef<[u8]>,
+        hash_version: SrpHashVersion,
+        legacy_pad: bool,
+    ) -> Result<Self> {
         let a = random_nonzero_below(&group.n)?;
-        Self::with_private_ephemeral(group, salt, hash_version, a)
+        Self::with_private_ephemeral_and_compat(group, salt, hash_version, a, legacy_pad)
     }
 
     pub fn with_private_ephemeral(
@@ -1123,20 +1559,32 @@ impl SrpClient {
         hash_version: SrpHashVersion,
         a: BigUint,
     ) -> Result<Self> {
+        Self::with_private_ephemeral_and_compat(group, salt, hash_version, a, false)
+    }
+
+    pub fn with_private_ephemeral_and_compat(
+        group: SrpGroup,
+        salt: impl AsRef<[u8]>,
+        hash_version: SrpHashVersion,
+        a: BigUint,
+        legacy_pad: bool,
+    ) -> Result<Self> {
         hash_version.require_supported()?;
-        if a.is_zero() {
+        let salt = canonical_srp_bytes(salt.as_ref());
+        if a.is_zero() || salt.is_empty() || salt.len() > MAX_SRP_SALT_BYTES {
             return Err(Error::InvalidSrpGroup);
         }
         let a_pub = group.g.modpow(&a, &group.n);
         Ok(Self {
             group,
-            salt: canonical_srp_bytes(salt.as_ref()),
+            salt,
             hash_version,
             a,
             a_pub,
             b_pub: None,
             key: None,
             m1: None,
+            legacy_pad,
         })
     }
 
@@ -1154,11 +1602,11 @@ impl SrpClient {
         if b_pub.is_zero() || &b_pub % &self.group.n == BigUint::zero() {
             return Err(Error::InvalidSrpGroup);
         }
-        let u = srp_scrambler(&self.a_pub, &b_pub)?;
+        let u = srp_scrambler(&self.group, &self.a_pub, &b_pub, self.legacy_pad)?;
         if &u % &self.group.n == BigUint::zero() {
             return Err(Error::InvalidSrpGroup);
         }
-        let k = srp_multiplier(&self.group)?;
+        let k = srp_multiplier(&self.group, self.legacy_pad)?;
         let x = srp_private_key(username, password.as_ref(), &self.salt, self.hash_version)?;
         let gx = self.group.g.modpow(&x, &self.group.n);
         let kgx = (k * gx) % &self.group.n;
@@ -1193,7 +1641,7 @@ impl SrpClient {
             return Err(Error::InvalidEapPacket);
         };
         let expected = srp_server_proof(&self.a_pub, &m1, &key, self.hash_version)?;
-        Ok(expected.as_slice() == server_proof)
+        Ok(bool::from(expected.as_slice().ct_eq(server_proof)))
     }
 
     pub fn session_key(&self) -> Option<&[u8; SRP_SHA256_DIGEST_LENGTH]> {
@@ -1201,7 +1649,22 @@ impl SrpClient {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl Drop for SrpClient {
+    fn drop(&mut self) {
+        self.salt.zeroize();
+        self.a = BigUint::zero();
+        self.a_pub = BigUint::zero();
+        self.b_pub = None;
+        if let Some(key) = &mut self.key {
+            key.zeroize();
+        }
+        if let Some(proof) = &mut self.m1 {
+            proof.zeroize();
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct SrpAuthenticator {
     record: SrpUserRecord,
     a_pub: Option<BigUint>,
@@ -1209,15 +1672,28 @@ pub struct SrpAuthenticator {
     b_pub: Option<BigUint>,
     key: Option<[u8; SRP_SHA256_DIGEST_LENGTH]>,
     m2: Option<[u8; SRP_SHA256_DIGEST_LENGTH]>,
+    legacy_pad: bool,
 }
 
 impl SrpAuthenticator {
     pub fn new(record: SrpUserRecord) -> Result<Self> {
+        Self::new_with_compat(record, false)
+    }
+
+    pub fn new_with_compat(record: SrpUserRecord, legacy_pad: bool) -> Result<Self> {
         let b = random_nonzero_below(&record.group.n)?;
-        Self::with_private_ephemeral(record, b)
+        Self::with_private_ephemeral_and_compat(record, b, legacy_pad)
     }
 
     pub fn with_private_ephemeral(record: SrpUserRecord, b: BigUint) -> Result<Self> {
+        Self::with_private_ephemeral_and_compat(record, b, false)
+    }
+
+    pub fn with_private_ephemeral_and_compat(
+        record: SrpUserRecord,
+        b: BigUint,
+        legacy_pad: bool,
+    ) -> Result<Self> {
         record.hash_version.require_supported()?;
         if b.is_zero() {
             return Err(Error::InvalidSrpGroup);
@@ -1229,6 +1705,7 @@ impl SrpAuthenticator {
             b_pub: None,
             key: None,
             m2: None,
+            legacy_pad,
         })
     }
 
@@ -1237,7 +1714,7 @@ impl SrpAuthenticator {
         if a_pub.is_zero() || &a_pub % &self.record.group.n == BigUint::zero() {
             return Err(Error::InvalidSrpGroup);
         }
-        let k = srp_multiplier(&self.record.group)?;
+        let k = srp_multiplier(&self.record.group, self.legacy_pad)?;
         let verifier = BigUint::from_bytes_be(&self.record.verifier);
         let gb = self.record.group.g.modpow(&self.b, &self.record.group.n);
         let b_pub = ((k * verifier) + gb) % &self.record.group.n;
@@ -1255,7 +1732,7 @@ impl SrpAuthenticator {
             return Err(Error::InvalidEapPacket);
         };
         let verifier = BigUint::from_bytes_be(&self.record.verifier);
-        let u = srp_scrambler(a_pub, b_pub)?;
+        let u = srp_scrambler(&self.record.group, a_pub, b_pub, self.legacy_pad)?;
         let vu = verifier.modpow(&u, &self.record.group.n);
         let avu = (a_pub * vu) % &self.record.group.n;
         let shared = avu.modpow(&self.b, &self.record.group.n);
@@ -1269,7 +1746,7 @@ impl SrpAuthenticator {
             &key,
             self.record.hash_version,
         )?;
-        if expected_m1.as_slice() != client_proof {
+        if !bool::from(expected_m1.as_slice().ct_eq(client_proof)) {
             return Err(Error::InvalidEapPacket);
         }
         let m2 = srp_server_proof(a_pub, &expected_m1, &key, self.record.hash_version)?;
@@ -1280,6 +1757,20 @@ impl SrpAuthenticator {
 
     pub fn session_key(&self) -> Option<&[u8; SRP_SHA256_DIGEST_LENGTH]> {
         self.key.as_ref()
+    }
+}
+
+impl Drop for SrpAuthenticator {
+    fn drop(&mut self) {
+        self.a_pub = None;
+        self.b = BigUint::zero();
+        self.b_pub = None;
+        if let Some(key) = &mut self.key {
+            key.zeroize();
+        }
+        if let Some(proof) = &mut self.m2 {
+            proof.zeroize();
+        }
     }
 }
 
@@ -1313,18 +1804,47 @@ pub fn srp_verifier(
     Ok(minimal_bytes(&group.g.modpow(&x, &group.n)))
 }
 
-fn srp_multiplier(group: &SrpGroup) -> Result<BigUint> {
-    Ok(BigUint::from_bytes_be(&sha256_join(&[
-        group.modulus_bytes(),
-        group.generator_bytes(),
-    ])))
+fn srp_multiplier(group: &SrpGroup, legacy_pad: bool) -> Result<BigUint> {
+    Ok(BigUint::from_bytes_be(&srp_hash_pair(
+        group, &group.n, &group.g, legacy_pad,
+    )?))
 }
 
-fn srp_scrambler(a_pub: &BigUint, b_pub: &BigUint) -> Result<BigUint> {
-    Ok(BigUint::from_bytes_be(&sha256_join(&[
-        minimal_bytes(a_pub),
-        minimal_bytes(b_pub),
-    ])))
+fn srp_scrambler(
+    group: &SrpGroup,
+    a_pub: &BigUint,
+    b_pub: &BigUint,
+    legacy_pad: bool,
+) -> Result<BigUint> {
+    Ok(BigUint::from_bytes_be(&srp_hash_pair(
+        group, a_pub, b_pub, legacy_pad,
+    )?))
+}
+
+fn srp_hash_pair(
+    group: &SrpGroup,
+    left: &BigUint,
+    right: &BigUint,
+    legacy_pad: bool,
+) -> Result<[u8; SRP_SHA256_DIGEST_LENGTH]> {
+    if legacy_pad {
+        return Ok(sha256_join(&[minimal_bytes(left), minimal_bytes(right)]));
+    }
+    let width = group.modulus_bytes().len();
+    Ok(sha256_join(&[
+        padded_srp_bytes(left, width)?,
+        padded_srp_bytes(right, width)?,
+    ]))
+}
+
+fn padded_srp_bytes(value: &BigUint, width: usize) -> Result<Vec<u8>> {
+    let bytes = minimal_bytes(value);
+    if bytes.len() > width {
+        return Err(Error::InvalidSrpGroup);
+    }
+    let mut padded = vec![0; width];
+    padded[width - bytes.len()..].copy_from_slice(&bytes);
+    Ok(padded)
 }
 
 fn srp_session_key(shared: &BigUint) -> [u8; SRP_SHA256_DIGEST_LENGTH] {
@@ -1547,7 +2067,7 @@ mod tests {
 
     #[test]
     fn srp_verifier_matches_librist_correct_hashing_vector() {
-        let group = SrpGroup::from_hex(SRP_TEST_N_512, "2").unwrap();
+        let group = legacy_test_group();
         let verifier = srp_verifier(
             &group,
             "rist",
@@ -1560,8 +2080,8 @@ mod tests {
     }
 
     #[test]
-    fn srp_exchange_matches_librist_correct_hashing_vector() {
-        let group = SrpGroup::from_hex(SRP_TEST_N_512, "2").unwrap();
+    fn legacy_srp_exchange_matches_pre_v0216_librist_vector() {
+        let group = legacy_test_group();
         let record = SrpUserRecord::from_password_with_salt(
             "rist",
             b"mainprofile",
@@ -1578,16 +2098,18 @@ mod tests {
         let b =
             parse_hex_biguint("ED0D58FF861A1FC75A0829BEA5F1392D2B13AB2B05CBCD6ED1E71AAAD761E856")
                 .unwrap();
-        let mut client = SrpClient::with_private_ephemeral(
+        let mut client = SrpClient::with_private_ephemeral_and_compat(
             group,
             hex(SAMPLE_SALT),
             SrpHashVersion::CorrectSha256,
             a,
+            true,
         )
         .unwrap();
         assert_eq!(upper_hex(&client.public_key()), CLIENT_A);
 
-        let mut auth = SrpAuthenticator::with_private_ephemeral(record, b).unwrap();
+        let mut auth =
+            SrpAuthenticator::with_private_ephemeral_and_compat(record, b, true).unwrap();
         let server_key = auth.handle_client_key(client.public_key()).unwrap();
         assert_eq!(upper_hex(&server_key), SERVER_B);
 
@@ -1604,15 +2126,14 @@ mod tests {
 
     #[test]
     fn eap_srp_sessions_authenticate_over_frames() {
-        let group = SrpGroup::from_hex(SRP_TEST_N_512, "2").unwrap();
         let record = SrpUserRecord::from_password_with_salt(
             "rist",
             b"mainprofile",
             hex(SAMPLE_SALT),
             1,
             SrpHashVersion::CorrectSha256,
-            group,
-            false,
+            SrpGroup::default_2048(),
+            true,
         )
         .unwrap();
         let mut store = SrpCredentialStore::new();
@@ -1690,6 +2211,81 @@ mod tests {
         assert_ne!(&message.data[1..], b"next-secret");
         let decoded = SrpPassphrase::decode_response(44, &key, &message.data).unwrap();
         assert_eq!(decoded, SrpPassphrase::Passphrase(b"next-secret".to_vec()));
+    }
+
+    #[test]
+    fn eap_v4_passphrases_are_directional_authenticated_and_replay_safe() {
+        let key = [0x42; SRP_SHA256_DIGEST_LENGTH];
+        let passphrase = SrpPassphrase::Passphrase(b"next-secret".to_vec());
+        let message = passphrase.encode_response_v4(44, &key, true, 7).unwrap();
+        assert_eq!(message.data[0], 0x40);
+        assert!(!message.data.windows(11).any(|part| part == b"next-secret"));
+
+        let mut last_nonce = None;
+        let decoded =
+            SrpPassphrase::decode_response_v4(44, &key, true, &message.data, &mut last_nonce)
+                .unwrap();
+        assert_eq!(decoded, passphrase);
+        assert_eq!(last_nonce, Some(7));
+        assert_eq!(
+            SrpPassphrase::decode_response_v4(44, &key, true, &message.data, &mut last_nonce)
+                .unwrap_err(),
+            Error::EapReplay
+        );
+
+        let mut tampered = message.data.clone();
+        tampered[1 + EAP_V4_NONCE_LEN] ^= 1;
+        assert_eq!(
+            SrpPassphrase::decode_response_v4(44, &key, true, &tampered, &mut None).unwrap_err(),
+            Error::EapAuthenticationFailed
+        );
+        assert_eq!(
+            SrpPassphrase::decode_response_v4(44, &key, false, &message.data, &mut None)
+                .unwrap_err(),
+            Error::EapAuthenticationFailed
+        );
+    }
+
+    #[test]
+    fn authentication_requires_the_proof_state_and_matching_identifier() {
+        let mut client = EapSrpClientSession::new("rist", b"secret");
+        client.start();
+        let unsolicited_success = EapolFrame::eap(EAPOL_VERSION_4, &EapPacket::success(9)).unwrap();
+        assert_eq!(
+            client.handle_frame(&unsolicited_success).unwrap_err(),
+            Error::InvalidEapPacket
+        );
+        assert!(!client.authenticated());
+
+        let mut store = SrpCredentialStore::new();
+        store.stage_password("rist", b"secret").unwrap();
+        let mut authenticator = EapSrpAuthenticatorSession::new(store).with_initial_identifier(20);
+        let identity = authenticator.request_identity().unwrap();
+        let request = identity.eap_packet().unwrap();
+        let wrong_identifier =
+            EapPacket::identity_response(request.identifier.wrapping_add(1), b"rist");
+        let frame = EapolFrame::eap(EAPOL_VERSION_4, &wrong_identifier).unwrap();
+        assert!(authenticator.handle_frame(&frame).is_err());
+        assert!(!authenticator.authenticated());
+    }
+
+    #[test]
+    fn rejects_network_srp_groups_below_the_supported_strength() {
+        assert_eq!(
+            SrpGroup::from_hex(SRP_TEST_N_512, "2").unwrap_err(),
+            Error::InvalidSrpGroup
+        );
+    }
+
+    fn legacy_test_group() -> SrpGroup {
+        let n = parse_hex_biguint(SRP_TEST_N_512).unwrap();
+        let g = BigUint::from(2u8);
+        SrpGroup {
+            n_hex: biguint_hex(&n),
+            g_hex: biguint_hex(&g),
+            n,
+            g,
+        }
     }
 
     fn hex(input: &str) -> Vec<u8> {

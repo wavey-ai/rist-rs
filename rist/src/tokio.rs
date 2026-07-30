@@ -25,8 +25,8 @@
 mod receiver;
 mod sender;
 
-pub use receiver::AsyncReceiver;
-pub use sender::AsyncSender;
+pub use receiver::{AsyncReceiver, AsyncReceiverStream};
+pub use sender::{AsyncSender, AsyncSenderStream};
 
 #[cfg(test)]
 mod tests {
@@ -36,9 +36,11 @@ mod tests {
     use ::tokio::time::timeout;
     use std::time::Duration;
 
+    static TOKIO_TEST_MUTEX: ::tokio::sync::Mutex<()> = ::tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn test_receiver_bind() {
-        let _guard = crate::TEST_MUTEX.lock().unwrap();
+        let _guard = TOKIO_TEST_MUTEX.lock().await;
         let url = format!("rist://@:{}", crate::next_test_port());
         // Just test that we can create a receiver without panicking
         let result = AsyncReceiver::bind(Profile::Main, &url);
@@ -47,7 +49,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_receiver_bind_with_options() {
-        let _guard = crate::TEST_MUTEX.lock().unwrap();
+        let _guard = TOKIO_TEST_MUTEX.lock().await;
         let url = format!("rist://@:{}", crate::next_test_port());
         let options = ReceiverOptions::new().fifo_size(2048);
         let result = AsyncReceiver::bind_with_options(Profile::Main, &url, options);
@@ -56,7 +58,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_receiver_bind_rejects_invalid_fifo_size() {
-        let _guard = crate::TEST_MUTEX.lock().unwrap();
+        let _guard = TOKIO_TEST_MUTEX.lock().await;
         let url = format!("rist://@:{}", crate::next_test_port());
         let options = ReceiverOptions::new().fifo_size(3);
         let result = AsyncReceiver::bind_with_options(Profile::Main, &url, options);
@@ -65,7 +67,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_receiver_recv_timeout() {
-        let _guard = crate::TEST_MUTEX.lock().unwrap();
+        let _guard = TOKIO_TEST_MUTEX.lock().await;
         let url = format!("rist://@:{}", crate::next_test_port());
         let receiver = AsyncReceiver::bind(Profile::Main, &url).unwrap();
 
@@ -84,7 +86,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sender_connect_empty_url() {
-        let _guard = crate::TEST_MUTEX.lock().unwrap();
+        let _guard = TOKIO_TEST_MUTEX.lock().await;
         // Empty URL should fail
         let result = AsyncSender::connect(Profile::Main, "").await;
         assert!(result.is_err());
@@ -92,13 +94,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_async_client_server() {
-        let _guard = crate::TEST_MUTEX.lock().unwrap();
+        let _guard = TOKIO_TEST_MUTEX.lock().await;
         // Similar to sportsball's test_async_client_server but for unidirectional RIST
         let port = crate::next_test_port();
         let receiver_url = format!("rist://@:{port}");
         let sender_url = format!("rist://127.0.0.1:{port}");
         let receiver = AsyncReceiver::bind(Profile::Main, &receiver_url).unwrap();
-        let sender = AsyncSender::connect(Profile::Main, &sender_url)
+        let mut sender = AsyncSender::connect(Profile::Main, &sender_url)
             .await
             .unwrap();
 
@@ -134,25 +136,25 @@ mod tests {
 
     #[tokio::test]
     async fn test_stats_available() {
-        let _guard = crate::TEST_MUTEX.lock().unwrap();
+        let _guard = TOKIO_TEST_MUTEX.lock().await;
         let url = format!("rist://@:{}", crate::next_test_port());
         let receiver = AsyncReceiver::bind(Profile::Main, &url).unwrap();
 
         // Stats might be None initially
-        let stats = receiver.raw_stats();
-        // Just check it doesn't panic
-        drop(stats);
+        let _stats = receiver.raw_stats();
     }
 
     #[tokio::test]
     async fn test_stream_api() {
-        let _guard = crate::TEST_MUTEX.lock().unwrap();
+        let _guard = TOKIO_TEST_MUTEX.lock().await;
         // Test that AsyncRead works on receiver (stream-like API)
         let port = crate::next_test_port();
         let receiver_url = format!("rist://@:{port}");
         let sender_url = format!("rist://127.0.0.1:{port}");
-        let mut receiver = AsyncReceiver::bind(Profile::Main, &receiver_url).unwrap();
-        let sender = AsyncSender::connect(Profile::Main, &sender_url)
+        let mut receiver = AsyncReceiver::bind(Profile::Main, &receiver_url)
+            .unwrap()
+            .into_byte_stream();
+        let mut sender = AsyncSender::connect(Profile::Main, &sender_url)
             .await
             .unwrap();
 
@@ -170,5 +172,25 @@ mod tests {
         // Just verify the stream API is accessible - may or may not have data
         // depending on timing
         assert!(read_result.is_ok() || read_result.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sender_shutdown_joins_cancelled_and_queued_work() {
+        let _guard = TOKIO_TEST_MUTEX.lock().await;
+        let port = crate::next_test_port();
+        let receiver_url = format!("rist://@:{port}");
+        let sender_url = format!("rist://127.0.0.1:{port}");
+        let receiver = AsyncReceiver::bind(Profile::Main, &receiver_url).unwrap();
+
+        for _ in 0..16 {
+            let mut sender = AsyncSender::connect(Profile::Main, &sender_url)
+                .await
+                .unwrap();
+            let payload = [0x47u8; 1316];
+            let _ = timeout(Duration::from_nanos(1), sender.send(&payload)).await;
+            drop(sender);
+        }
+
+        drop(receiver);
     }
 }

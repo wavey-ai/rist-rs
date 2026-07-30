@@ -1,49 +1,79 @@
 use crate::{Error, Profile, ReceiverOptions, Result};
-use std::ffi::CString;
 use std::ptr;
 use std::time::Duration;
 
 /// A received data block from a RIST stream.
 pub struct DataBlock {
-    inner: *mut rist_sys::rist_data_block,
+    payload: Vec<u8>,
+    timestamp: u64,
+    virtual_source_port: u16,
+    virtual_destination_port: u16,
+    flow_id: u32,
+    sequence: u64,
+    flags: u32,
 }
 
 impl DataBlock {
-    /// Create a DataBlock from a raw pointer.
-    pub(crate) fn from_raw(inner: *mut rist_sys::rist_data_block) -> Self {
-        Self { inner }
+    /// Copy a librist-owned block into safe Rust storage and release it.
+    pub(crate) unsafe fn copy_from_raw(mut inner: *mut rist_sys::rist_data_block) -> Self {
+        debug_assert!(!inner.is_null());
+        let block = unsafe { &*inner };
+        let payload = if block.payload.is_null() || block.payload_len == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(block.payload.cast::<u8>(), block.payload_len) }
+                .to_vec()
+        };
+        let owned = Self {
+            payload,
+            timestamp: block.ts_ntp,
+            virtual_source_port: block.virt_src_port,
+            virtual_destination_port: block.virt_dst_port,
+            flow_id: block.flow_id,
+            sequence: block.seq,
+            flags: block.flags,
+        };
+        unsafe {
+            rist_sys::rist_receiver_data_block_free2(&mut inner);
+        }
+        owned
     }
 
     /// Get the payload data.
     pub fn payload(&self) -> &[u8] {
-        unsafe {
-            let ptr = (*self.inner).payload as *const u8;
-            let len = (*self.inner).payload_len;
-            std::slice::from_raw_parts(ptr, len)
-        }
+        &self.payload
     }
 
     /// Get the timestamp (in 90kHz clock units).
     pub fn timestamp(&self) -> u64 {
-        unsafe { (*self.inner).ts_ntp }
+        self.timestamp
     }
 
     /// Get the flow ID.
     pub fn flow_id(&self) -> u32 {
-        unsafe { (*self.inner).flow_id }
+        self.flow_id
+    }
+
+    /// Get the virtual source port.
+    pub fn virtual_source_port(&self) -> u16 {
+        self.virtual_source_port
+    }
+
+    /// Get the virtual destination port.
+    pub fn virtual_destination_port(&self) -> u16 {
+        self.virtual_destination_port
+    }
+
+    /// Get the packet sequence reported by librist.
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    /// Get the packet flags reported by librist.
+    pub fn flags(&self) -> u32 {
+        self.flags
     }
 }
-
-impl Drop for DataBlock {
-    fn drop(&mut self) {
-        unsafe {
-            rist_sys::rist_receiver_data_block_free2(&mut self.inner);
-        }
-    }
-}
-
-// SAFETY: DataBlock owns its data and can be sent between threads
-unsafe impl Send for DataBlock {}
 
 /// RIST receiver for receiving data streams.
 pub struct Receiver {
@@ -78,36 +108,13 @@ impl Receiver {
     pub fn add_peer_with_options(&mut self, url: &str, options: &ReceiverOptions) -> Result<()> {
         options.apply_to_receiver_ctx(self.ctx)?;
 
-        let url_c = CString::new(url)?;
-        let mut peer_config: *mut rist_sys::rist_peer_config = ptr::null_mut();
-
-        let ret = unsafe { rist_sys::rist_parse_address2(url_c.as_ptr(), &mut peer_config) };
-
-        if ret != 0 || peer_config.is_null() {
-            return Err(Error::UrlParse(url.to_string()));
-        }
-
+        let mut config = crate::ffi::ParsedPeerConfig::parse(url)?;
+        config.configure(|config| {
+            options.apply_to_peer_config(config);
+        });
         unsafe {
-            options.apply_to_peer_config(&mut *peer_config);
+            config.create_peer(self.ctx)?;
         }
-
-        let mut peer: *mut rist_sys::rist_peer = ptr::null_mut();
-        let ret = unsafe { rist_sys::rist_peer_create(self.ctx, &mut peer, peer_config) };
-        let srp_result = if ret == 0 {
-            unsafe { crate::srp::enable_from_peer_config(peer, &*peer_config) }
-        } else {
-            Ok(())
-        };
-
-        unsafe {
-            rist_sys::rist_peer_config_free2(&mut peer_config);
-        }
-
-        if ret != 0 {
-            return Err(Error::PeerCreation(url.to_string()));
-        }
-
-        srp_result?;
         Ok(())
     }
 
@@ -152,7 +159,7 @@ impl Receiver {
             return Ok(None);
         }
 
-        Ok(Some(DataBlock::from_raw(block)))
+        Ok(Some(unsafe { DataBlock::copy_from_raw(block) }))
     }
 }
 

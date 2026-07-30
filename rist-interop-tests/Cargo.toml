@@ -1,0 +1,15 @@
+[package]
+name = "rist-interop-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Black-box interoperability tests between rist-rs and librist"
+
+[dependencies]
+rist = { package = "wavey-rist", version = "0.1.0", path = "../rist", features = ["tokio"] }
+rist-core = { version = "0.1.0", path = "../rist-core" }
+rist-mio = { version = "0.1.0", path = "../rist-mio" }
+tokio = { version = "1", features = ["macros", "rt", "time"] }

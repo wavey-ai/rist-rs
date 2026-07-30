@@ -2,16 +2,21 @@
 name = "rist-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Pure Rust protocol primitives for RIST"
 
 [dependencies]
 aes = "0.8"
+aes-gcm = "0.10"
 ctr = "0.9"
 getrandom = "0.2"
+hkdf = "0.12"
 num-bigint = "0.4"
 num-traits = "0.2"
 pbkdf2 = "0.12"
 sha2 = "0.10"
+subtle = "2"
 thiserror = "2"
+zeroize = "1"

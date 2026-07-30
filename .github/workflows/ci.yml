@@ -3,6 +3,12 @@ name: CI
 on:
   pull_request:
   push:
+  schedule:
+    - cron: "17 4 * * 1"
+
+env:
+  LIBRIST_PIN: 4f45ef8f78983892d52ccd52d9f675435b23738f
+  LIBRIST_VERSION: 0.2.20
 
 jobs:
   test:
@@ -10,13 +16,85 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install librist
+        with:
+          components: clippy, rustfmt
+      - name: Install build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang librist-dev pkg-config
+          sudo apt-get install -y clang meson ninja-build pkg-config
+      - name: Install pinned librist
+        run: bash .github/scripts/install-librist.sh "$LIBRIST_PIN" "$LIBRIST_VERSION"
       - name: Check formatting
         run: cargo fmt --all --check
+      - name: Check workspace
+        run: cargo check --workspace --all-features --all-targets
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-features --all-targets -- -D warnings
       - name: Test workspace
-        run: cargo test --workspace
-      - name: Test librist interop
-        run: RIST_INTEROP=1 cargo test -p rist-mio --test librist_interop -- --test-threads=1
+        run: cargo test --workspace --all-features
+      - name: Test librist interoperability
+        run: RIST_INTEROP=1 cargo test -p rist-interop-tests --test librist_interop -- --test-threads=1
+      - name: Check documentation
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.74
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang meson ninja-build pkg-config
+      - name: Install pinned librist
+        run: bash .github/scripts/install-librist.sh "$LIBRIST_PIN" "$LIBRIST_VERSION"
+      - name: Check minimum supported Rust
+        run: cargo check --workspace --all-features --all-targets
+
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - name: Test pure protocol core with Miri
+        run: cargo miri test -p rist-core
+
+  address-sanitizer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang meson ninja-build pkg-config
+      - name: Install pinned librist
+        run: bash .github/scripts/install-librist.sh "$LIBRIST_PIN" "$LIBRIST_VERSION"
+      - name: Test FFI wrapper with AddressSanitizer
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+          RUSTDOCFLAGS: -Zsanitizer=address
+        run: >-
+          cargo test -Zbuild-std
+          --target x86_64-unknown-linux-gnu
+          -p wavey-rist
+          --features tokio
+
+  upstream-master:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang meson ninja-build pkg-config
+      - name: Install current librist master
+        run: bash .github/scripts/install-librist.sh master
+      - name: Check current upstream compatibility
+        run: cargo test --workspace --all-features

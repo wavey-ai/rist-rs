@@ -2,17 +2,15 @@
 name = "rist-mio"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Mio transport experiments for the pure Rust RIST implementation"
 
 [dependencies]
 mio = { version = "1", features = ["net", "os-poll"] }
-rist-core = "0.1.0"
+rist-core = { version = "0.1.0", path = "../rist-core" }
 socket2 = { version = "0.6", features = ["all"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-
-[dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt", "time"] }

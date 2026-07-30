@@ -22,6 +22,7 @@
 //! ```
 
 mod error;
+mod ffi;
 mod logging;
 mod options;
 mod profile;

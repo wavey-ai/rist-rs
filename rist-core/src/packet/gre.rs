@@ -422,6 +422,107 @@ pub struct EapolGrePacket {
     pub frame: EapolFrame,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedOobPacket {
+    pub gre: GreHeader,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MainPacket {
+    Reduced(OwnedReducedPacket),
+    Keepalive(OwnedKeepalivePacket),
+    BufferNegotiation(OwnedBufferNegotiationPacket),
+    Eapol(EapolGrePacket),
+    Oob(OwnedOobPacket),
+    FutureNonce {
+        gre: GreHeader,
+        payload: Vec<u8>,
+    },
+    Unknown {
+        gre: GreHeader,
+        vsf: Option<VsfHeader>,
+        payload: Vec<u8>,
+    },
+}
+
+/// Parses one Main-profile datagram exactly once at the GRE boundary and
+/// decrypts its payload at most once before typed dispatch.
+pub fn decode_main_packet(input: &[u8], key: Option<&mut PskKey>) -> Result<MainPacket> {
+    let (gre, offset) = GreHeader::decode(input)?;
+    let payload = if let Some(nonce) = gre.key {
+        let key = key.ok_or(Error::UnsupportedGreProtocol(gre.protocol_type))?;
+        let sequence = gre
+            .sequence
+            .ok_or(Error::UnsupportedGreProtocol(gre.protocol_type))?;
+        key.decrypt(nonce.to_be_bytes(), gre.version, sequence, &input[offset..])?
+    } else {
+        input[offset..].to_vec()
+    };
+
+    decode_main_payload(gre, payload)
+}
+
+fn decode_main_payload(gre: GreHeader, payload: Vec<u8>) -> Result<MainPacket> {
+    match gre.protocol_type {
+        GRE_PROTOCOL_TYPE_REDUCED => {
+            let packet = ReducedPacket::decode_after_gre(gre, &payload)?;
+            Ok(MainPacket::Reduced(OwnedReducedPacket {
+                gre,
+                vsf: packet.vsf,
+                reduced: packet.reduced,
+                payload: packet.payload.to_vec(),
+            }))
+        }
+        GRE_PROTOCOL_TYPE_KEEPALIVE => Ok(MainPacket::Keepalive(
+            KeepalivePacket::decode_after_gre(gre, &payload)?.into_owned(),
+        )),
+        GRE_PROTOCOL_TYPE_EAPOL if gre.key.is_none() => Ok(MainPacket::Eapol(EapolGrePacket {
+            gre,
+            frame: EapolFrame::decode(&payload)?,
+        })),
+        GRE_PROTOCOL_TYPE_FULL => Ok(MainPacket::Oob(OwnedOobPacket { gre, payload })),
+        GRE_PROTOCOL_TYPE_VSF => {
+            let vsf = VsfHeader::decode(&payload)?;
+            if vsf.protocol_type != VSF_PROTOCOL_TYPE_RIST {
+                return Ok(MainPacket::Unknown {
+                    gre,
+                    vsf: Some(vsf),
+                    payload,
+                });
+            }
+            match vsf.subtype {
+                VSF_SUBTYPE_REDUCED => {
+                    let packet = ReducedPacket::decode_after_gre(gre, &payload)?;
+                    Ok(MainPacket::Reduced(OwnedReducedPacket {
+                        gre,
+                        vsf: packet.vsf,
+                        reduced: packet.reduced,
+                        payload: packet.payload.to_vec(),
+                    }))
+                }
+                VSF_SUBTYPE_KEEPALIVE => Ok(MainPacket::Keepalive(
+                    KeepalivePacket::decode_after_gre(gre, &payload)?.into_owned(),
+                )),
+                VSF_SUBTYPE_BUFFER_NEGOTIATION => Ok(MainPacket::BufferNegotiation(
+                    BufferNegotiationPacket::decode_after_gre(gre, &payload)?.into_owned(),
+                )),
+                VSF_SUBTYPE_FUTURE_NONCE => Ok(MainPacket::FutureNonce { gre, payload }),
+                _ => Ok(MainPacket::Unknown {
+                    gre,
+                    vsf: Some(vsf),
+                    payload,
+                }),
+            }
+        }
+        _ => Ok(MainPacket::Unknown {
+            gre,
+            vsf: None,
+            payload,
+        }),
+    }
+}
+
 impl EapolGrePacket {
     pub fn decode(input: &[u8]) -> Result<Self> {
         decode_eapol_payload(input)
@@ -575,6 +676,28 @@ pub fn encode_encrypted_reduced_payload(
     out
 }
 
+pub fn encode_oob_payload(gre_version: u8, sequence: u32, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(GreHeader::MIN_LEN + 4 + payload.len());
+    GreHeader {
+        protocol_type: GRE_PROTOCOL_TYPE_FULL,
+        version: gre_version,
+        key: None,
+        sequence: Some(sequence),
+    }
+    .encode(&mut out);
+    out.extend_from_slice(payload);
+    out
+}
+
+pub fn encode_encrypted_oob_payload(
+    gre_version: u8,
+    sequence: u32,
+    payload: &[u8],
+    key: &mut PskKey,
+) -> Vec<u8> {
+    encode_encrypted_gre_payload(gre_version, GRE_PROTOCOL_TYPE_FULL, sequence, payload, key)
+}
+
 pub fn decode_encrypted_reduced_packet(
     input: &[u8],
     key: &mut PskKey,
@@ -586,7 +709,7 @@ pub fn decode_encrypted_reduced_packet(
     let Some(sequence) = gre.sequence else {
         return Err(Error::UnsupportedGreProtocol(gre.protocol_type));
     };
-    let decrypted = key.decrypt(nonce.to_be_bytes(), gre.version, sequence, &input[offset..]);
+    let decrypted = key.decrypt(nonce.to_be_bytes(), gre.version, sequence, &input[offset..])?;
     let packet = ReducedPacket::decode_after_gre(gre, &decrypted)?;
     Ok(OwnedReducedPacket {
         gre: packet.gre,
@@ -631,7 +754,7 @@ fn decrypt_gre_payload(input: &[u8], key: &mut PskKey) -> Result<(GreHeader, Vec
     let Some(sequence) = gre.sequence else {
         return Err(Error::UnsupportedGreProtocol(gre.protocol_type));
     };
-    let decrypted = key.decrypt(nonce.to_be_bytes(), gre.version, sequence, &input[offset..]);
+    let decrypted = key.decrypt(nonce.to_be_bytes(), gre.version, sequence, &input[offset..])?;
     Ok((gre, decrypted))
 }
 
@@ -992,5 +1115,54 @@ mod tests {
         let eap = decoded.frame.eap_packet().unwrap();
         assert_eq!(eap.eap_type, Some(EAP_TYPE_IDENTITY));
         assert_eq!(eap.data, b"rist");
+    }
+
+    #[test]
+    fn main_datagram_decoder_returns_typed_clear_and_encrypted_events() {
+        let reduced = ReducedHeader {
+            src_port: 1000,
+            dst_port: 2000,
+        };
+        let clear = encode_reduced_payload(2, 7, reduced, b"media");
+        assert!(matches!(
+            decode_main_packet(&clear, None).unwrap(),
+            MainPacket::Reduced(OwnedReducedPacket { payload, .. }) if payload == b"media"
+        ));
+
+        let mut tx = PskKey::from_nonce(256, 0, b"secret", [1, 2, 3, 4]).unwrap();
+        let mut rx = PskKey::receiver(256, b"secret").unwrap();
+        let encrypted = encode_encrypted_reduced_payload(2, 8, reduced, b"secure", &mut tx);
+        assert!(matches!(
+            decode_main_packet(&encrypted, Some(&mut rx)).unwrap(),
+            MainPacket::Reduced(OwnedReducedPacket { payload, .. }) if payload == b"secure"
+        ));
+
+        let clear_oob = encode_oob_payload(2, 9, b"tunnel");
+        assert!(matches!(
+            decode_main_packet(&clear_oob, None).unwrap(),
+            MainPacket::Oob(OwnedOobPacket { payload, .. }) if payload == b"tunnel"
+        ));
+
+        let mut oob_tx = PskKey::from_nonce(256, 0, b"secret", [5, 6, 7, 8]).unwrap();
+        let mut oob_rx = PskKey::receiver(256, b"secret").unwrap();
+        let encrypted_oob = encode_encrypted_oob_payload(2, 10, b"secure tunnel", &mut oob_tx);
+        assert!(matches!(
+            decode_main_packet(&encrypted_oob, Some(&mut oob_rx)).unwrap(),
+            MainPacket::Oob(OwnedOobPacket { payload, .. }) if payload == b"secure tunnel"
+        ));
+
+        let unknown = GreHeader {
+            protocol_type: 0x1234,
+            version: 1,
+            key: None,
+            sequence: Some(9),
+        };
+        let mut bytes = Vec::new();
+        unknown.encode(&mut bytes);
+        bytes.extend_from_slice(b"opaque");
+        assert!(matches!(
+            decode_main_packet(&bytes, None).unwrap(),
+            MainPacket::Unknown { payload, .. } if payload == b"opaque"
+        ));
     }
 }

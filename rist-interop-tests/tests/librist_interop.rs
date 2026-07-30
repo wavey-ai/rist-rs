@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+//! End-to-end packet and authentication interoperability with librist.
 
 use rist_core::packet::gre::{BufferNegotiation, GreKeepalive};
 use rist_core::packet::rtcp::{
@@ -13,6 +14,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 static INTEROP_MUTEX: Mutex<()> = Mutex::new(());
+
+fn lock_interop() -> std::sync::MutexGuard<'static, ()> {
+    INTEROP_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 fn loopback_any() -> SocketAddr {
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
@@ -52,12 +59,11 @@ fn pure_rust_simple_sender_to_librist_receiver() {
     if !interop_enabled() {
         return;
     }
-    let _guard = INTEROP_MUTEX.lock().unwrap();
+    let _guard = lock_interop();
 
     let port = next_even_test_port_pair();
     let receiver_url = format!("rist://@127.0.0.1:{port}");
     let receiver_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
-    let receiver_rtcp_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port + 1));
 
     let mut receiver = rist::Receiver::new(rist::Profile::Simple).unwrap();
     receiver.add_peer(&receiver_url).unwrap();
@@ -65,11 +71,9 @@ fn pure_rust_simple_sender_to_librist_receiver() {
 
     let sender_port = next_even_test_port_pair();
     let sender_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, sender_port));
-    let sender_rtcp_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, sender_port + 1));
-    let rtcp_socket = UdpSocket::bind(sender_rtcp_addr).unwrap();
     let mut sender = SimpleMioSender::connect(sender_addr, receiver_addr, 0x1122_3344, 64).unwrap();
     let payload = mpegts_payload_7("PURE RUST TO LIBRIST");
-    send_simple_rtcp_probe(&rtcp_socket, receiver_rtcp_addr, 0x1122_3344);
+    sender.send_rtcp(&simple_rtcp_probe(0x1122_3344)).unwrap();
     thread::sleep(Duration::from_millis(20));
     for sequence in 1..=20 {
         let packet =
@@ -95,7 +99,7 @@ fn pure_rust_simple_sender_to_librist_receiver() {
     }
 }
 
-fn send_simple_rtcp_probe(socket: &UdpSocket, peer: SocketAddr, ssrc: u32) {
+fn simple_rtcp_probe(ssrc: u32) -> Vec<u8> {
     let mut packet = Vec::new();
     encode_empty_receiver_report(ssrc, &mut packet);
     encode_sdes_cname(ssrc, "rust", &mut packet);
@@ -107,7 +111,7 @@ fn send_simple_rtcp_probe(socket: &UdpSocket, peer: SocketAddr, ssrc: u32) {
         },
         &mut packet,
     );
-    socket.send_to(&packet, peer).unwrap();
+    packet
 }
 
 #[test]
@@ -115,14 +119,11 @@ fn librist_simple_sender_to_pure_rust_receiver() {
     if !interop_enabled() {
         return;
     }
-    let _guard = INTEROP_MUTEX.lock().unwrap();
+    let _guard = lock_interop();
 
     let flow_id = 0x1122_3344;
     let receiver_port = next_even_test_port_pair();
     let receiver_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, receiver_port));
-    let receiver_rtcp_addr =
-        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, receiver_port + 1));
-    let _rtcp_sink = UdpSocket::bind(receiver_rtcp_addr).unwrap();
     let mut receiver =
         SimpleMioReceiver::bind(receiver_addr, flow_id, "rust", NackMode::Range).unwrap();
     let receiver_addr = receiver.local_addr().unwrap();
@@ -158,11 +159,116 @@ fn librist_simple_sender_to_pure_rust_receiver() {
 }
 
 #[test]
+#[ignore = "pending caller/listener parity with current librist"]
+fn librist_simple_receiver_caller_from_pure_rust_sender_listener() {
+    if !interop_enabled() {
+        return;
+    }
+    let _guard = lock_interop();
+
+    let flow_id = 0x1122_3344;
+    let sender_port = next_even_test_port_pair();
+    let sender_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, sender_port));
+    let mut sender = SimpleMioSender::listen(sender_addr, flow_id, 64).unwrap();
+    let receiver_url = format!("rist://127.0.0.1:{sender_port}");
+    let mut receiver = rist::Receiver::new(rist::Profile::Simple).unwrap();
+    receiver.add_peer(&receiver_url).unwrap();
+    receiver.start().unwrap();
+
+    let mut feedback_buf = [0u8; 1500];
+    let discovery_deadline = Instant::now() + Duration::from_secs(5);
+    while sender.peer_addr().is_none() {
+        sender
+            .try_recv_feedback_and_retransmit(&mut feedback_buf)
+            .unwrap();
+        assert!(
+            Instant::now() < discovery_deadline,
+            "timed out waiting for the librist Simple receiver caller"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    let payload = mpegts_payload_7("LIBRIST SIMPLE CALLER FROM RUST LISTENER");
+    for _ in 0..20 {
+        sender
+            .send_payload(&payload, ntp_now(), Instant::now())
+            .unwrap();
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(block) = receiver.read(Duration::from_millis(50)).unwrap() {
+            assert!(block
+                .payload()
+                .windows(b"LIBRIST SIMPLE CALLER FROM RUST LISTENER".len())
+                .any(|window| window == b"LIBRIST SIMPLE CALLER FROM RUST LISTENER"));
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the librist Simple receiver caller"
+        );
+    }
+}
+
+#[test]
+#[ignore = "pending caller/listener parity with current librist"]
+fn pure_rust_simple_receiver_caller_from_librist_sender_listener() {
+    if !interop_enabled() {
+        return;
+    }
+    let _guard = lock_interop();
+
+    let flow_id = 0x1122_3344;
+    let sender_port = next_even_test_port_pair();
+    let sender_url = format!("rist://@127.0.0.1:{sender_port}");
+    let sender_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, sender_port));
+    let mut sender = rist::Sender::new(rist::Profile::Simple).unwrap();
+    sender.add_peer(&sender_url).unwrap();
+    sender.start().unwrap();
+
+    let mut receiver = SimpleMioReceiver::connect(
+        loopback_any(),
+        sender_addr,
+        flow_id,
+        "rust",
+        NackMode::Range,
+    )
+    .unwrap();
+    receiver.send_feedback().unwrap().unwrap();
+    thread::sleep(Duration::from_millis(50));
+
+    let payload = mpegts_payload("RUST SIMPLE CALLER FROM LIBRIST LISTENER");
+    for _ in 0..20 {
+        sender.send(&payload).unwrap();
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let mut buf = [0u8; 1500];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some((_from, received)) = receiver.try_recv_payload(&mut buf).unwrap() {
+            assert!(received
+                .payload
+                .windows(b"RUST SIMPLE CALLER FROM LIBRIST LISTENER".len())
+                .any(|window| window == b"RUST SIMPLE CALLER FROM LIBRIST LISTENER"));
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the pure Rust Simple receiver caller"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
 fn pure_rust_main_sender_to_librist_receiver() {
     if !interop_enabled() {
         return;
     }
-    let _guard = INTEROP_MUTEX.lock().unwrap();
+    let _guard = lock_interop();
 
     let port = next_even_test_port_pair();
     let receiver_url = format!("rist://@127.0.0.1:{port}");
@@ -202,11 +308,12 @@ fn pure_rust_main_sender_to_librist_receiver() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)] // The whole interop suite is intentionally serialized.
 async fn pure_rust_main_sender_to_async_librist_receiver() {
     if !interop_enabled() {
         return;
     }
-    let _guard = INTEROP_MUTEX.lock().unwrap();
+    let _guard = lock_interop();
 
     let port = next_even_test_port_pair();
     let receiver_url = format!("rist://@127.0.0.1:{port}");
@@ -249,11 +356,12 @@ async fn pure_rust_main_sender_to_async_librist_receiver() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)] // The whole interop suite is intentionally serialized.
 async fn av_contrib_style_main_sender_to_async_librist_receiver() {
     if !interop_enabled() {
         return;
     }
-    let _guard = INTEROP_MUTEX.lock().unwrap();
+    let _guard = lock_interop();
 
     let flow_id = 0x1122_3344;
     let port = next_even_test_port_pair();
@@ -305,7 +413,7 @@ fn librist_main_sender_to_pure_rust_receiver() {
     if !interop_enabled() {
         return;
     }
-    let _guard = INTEROP_MUTEX.lock().unwrap();
+    let _guard = lock_interop();
 
     let flow_id = 0x1122_3344;
     let receiver_port = next_even_test_port_pair();
@@ -345,11 +453,119 @@ fn librist_main_sender_to_pure_rust_receiver() {
 }
 
 #[test]
+#[ignore = "pending caller/listener parity with current librist"]
+fn librist_main_receiver_caller_from_pure_rust_sender_listener() {
+    if !interop_enabled() {
+        return;
+    }
+    let _guard = lock_interop();
+
+    let flow_id = 0x1122_3344;
+    let sender_port = next_even_test_port_pair();
+    let sender_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, sender_port));
+    let mut sender = MainMioSender::listen(sender_addr, flow_id, 64).unwrap();
+    let receiver_url = format!("rist://127.0.0.1:{sender_port}");
+    let mut receiver = rist::Receiver::new(rist::Profile::Main).unwrap();
+    receiver.add_peer(&receiver_url).unwrap();
+    receiver.start().unwrap();
+
+    let mut control_buf = [0u8; 1500];
+    let discovery_deadline = Instant::now() + Duration::from_secs(5);
+    while sender.peer_addr().is_none() {
+        sender.try_recv_event(&mut control_buf).unwrap();
+        assert!(
+            Instant::now() < discovery_deadline,
+            "timed out waiting for the librist Main receiver caller"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    let payload = mpegts_payload_7("LIBRIST MAIN CALLER FROM RUST LISTENER");
+    for _ in 0..20 {
+        sender
+            .send_payload(&payload, ntp_now(), Instant::now())
+            .unwrap();
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(block) = receiver.read(Duration::from_millis(50)).unwrap() {
+            assert!(block
+                .payload()
+                .windows(b"LIBRIST MAIN CALLER FROM RUST LISTENER".len())
+                .any(|window| window == b"LIBRIST MAIN CALLER FROM RUST LISTENER"));
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the librist Main receiver caller"
+        );
+    }
+}
+
+#[test]
+#[ignore = "pending caller/listener parity with current librist"]
+fn pure_rust_main_receiver_caller_from_librist_sender_listener() {
+    if !interop_enabled() {
+        return;
+    }
+    let _guard = lock_interop();
+
+    let flow_id = 0x1122_3344;
+    let sender_port = next_even_test_port_pair();
+    let sender_url = format!("rist://@127.0.0.1:{sender_port}");
+    let sender_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, sender_port));
+    let mut sender = rist::Sender::new(rist::Profile::Main).unwrap();
+    sender.add_peer(&sender_url).unwrap();
+    sender.start().unwrap();
+
+    let mut receiver = MainMioReceiver::connect(
+        loopback_any(),
+        sender_addr,
+        flow_id,
+        "rust",
+        NackMode::Range,
+    )
+    .unwrap();
+    receiver
+        .send_keepalive_to(
+            sender_addr,
+            GreKeepalive::librist_default([1, 2, 3, 4, 5, 6]),
+        )
+        .unwrap();
+    thread::sleep(Duration::from_millis(50));
+
+    let payload = mpegts_payload_7("RUST MAIN CALLER FROM LIBRIST LISTENER");
+    for _ in 0..20 {
+        sender.send(&payload).unwrap();
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let mut buf = [0u8; 1500];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some((_from, received)) = receiver.try_recv_payload(&mut buf).unwrap() {
+            assert!(received
+                .payload
+                .windows(b"RUST MAIN CALLER FROM LIBRIST LISTENER".len())
+                .any(|window| window == b"RUST MAIN CALLER FROM LIBRIST LISTENER"));
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the pure Rust Main receiver caller"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
 fn pure_rust_main_aes_sender_to_librist_receiver() {
     if !interop_enabled() {
         return;
     }
-    let _guard = INTEROP_MUTEX.lock().unwrap();
+    let _guard = lock_interop();
 
     let port = next_even_test_port_pair();
     let receiver_url = format!("rist://@127.0.0.1:{port}?secret=12345678&aes-type=128");
@@ -395,7 +611,7 @@ fn librist_main_aes_sender_to_pure_rust_receiver() {
     if !interop_enabled() {
         return;
     }
-    let _guard = INTEROP_MUTEX.lock().unwrap();
+    let _guard = lock_interop();
 
     let flow_id = 0x1122_3344;
     let receiver_port = next_even_test_port_pair();
@@ -444,7 +660,7 @@ fn pure_rust_main_aes_sender_wrong_secret_does_not_reach_librist_receiver() {
     if !interop_enabled() {
         return;
     }
-    let _guard = INTEROP_MUTEX.lock().unwrap();
+    let _guard = lock_interop();
 
     let port = next_even_test_port_pair();
     let receiver_url = format!("rist://@127.0.0.1:{port}?secret=12345678&aes-type=128");
@@ -484,7 +700,7 @@ fn librist_main_aes_sender_wrong_secret_does_not_reach_pure_rust_receiver() {
     if !interop_enabled() {
         return;
     }
-    let _guard = INTEROP_MUTEX.lock().unwrap();
+    let _guard = lock_interop();
 
     let flow_id = 0x1122_3344;
     let receiver_port = next_even_test_port_pair();
@@ -534,7 +750,7 @@ fn pure_rust_main_srp_client_sends_payload_to_librist_receiver() {
     if !interop_enabled() {
         return;
     }
-    let _guard = INTEROP_MUTEX.lock().unwrap();
+    let _guard = lock_interop();
 
     let port = next_even_test_port_pair();
     let receiver_url = format!(
@@ -549,6 +765,7 @@ fn pure_rust_main_srp_client_sends_payload_to_librist_receiver() {
     let mut sender =
         MainMioSender::connect(loopback_any(), receiver_addr, 0x1122_3344, 64).unwrap();
     sender.set_tx_key(PskKey::new(128, b"12345678").unwrap());
+    sender.set_rx_key(PskKey::receiver(128, b"12345678").unwrap());
     sender.enable_srp_client("testuser", b"testpassword");
     sender
         .send_keepalive(GreKeepalive::librist_default([1, 2, 3, 4, 5, 6]))
@@ -589,7 +806,7 @@ fn librist_main_srp_client_sends_payload_to_pure_rust_receiver() {
     if !interop_enabled() {
         return;
     }
-    let _guard = INTEROP_MUTEX.lock().unwrap();
+    let _guard = lock_interop();
 
     let flow_id = 0x1122_3344;
     let receiver_port = next_even_test_port_pair();

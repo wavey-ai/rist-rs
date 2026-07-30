@@ -2,6 +2,7 @@
 name = "rist-sys"
 version = "0.1.1"
 edition = "2021"
+rust-version.workspace = true
 license = "MIT"
 repository = "https://github.com/wavey-ai/rist-rs"
 description = "Raw FFI bindings to librist"

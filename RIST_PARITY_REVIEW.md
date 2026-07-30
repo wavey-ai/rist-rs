@@ -421,6 +421,44 @@ the Wine-based Windows runtime job was marked `allow_failure`.
 
 ## Dependency-ordered implementation plan
 
+### Implementation progress
+
+Updated 30 July 2026. These statuses describe the working tree after the
+review; the findings above remain the audit of the originally reviewed commit.
+
+- [x] **M0 complete.** The workspace uses one local source graph, pins CI and
+  interop to librist v0.2.20, separates the interop package, rejects
+  unsupported behavior, and has format/check/test/Clippy/docs/MSRV/Miri/
+  sanitizer coverage configured.
+- [x] **M1 complete.** C contexts have exclusive workers and cancellation-safe
+  teardown; packet ownership is safe; SRP uses explicit state, RFC 5054 PAD,
+  legacy compatibility, bounded work, constant-time proofs, zeroization, and
+  EAP v4 AEAD; PSK and NACK work are bounded. Current-C SRP passes in both
+  directions.
+- [x] **M2 complete.** Recovery history and receiver tracking use bounded
+  power-of-two windows; missing state expires; Simple/Main NACKs use librist's
+  standard low-16-bit records and full local sequence context; rollover,
+  restart, deadline, retry, age, bitrate, congestion, and loss/reorder behavior
+  have direct tests. Recovery URL controls are applied, pending UDP sends are
+  bounded and retain identical bytes on `WouldBlock`, and NPD failure preserves
+  the original payload. Bounded per-peer retry rings share one packet history.
+- [ ] **M3 in progress.** The runtime uses one-pass typed datagram dispatch.
+  Separate bounded queues isolate data, RTCP, EAPOL, keepalive, buffer
+  negotiation, OOB, and unknown traffic. The receiver bounds and isolates
+  authentication, liveness, recovery, and feedback state by peer and flow.
+  The multipath sender isolates GRE, encryption, liveness, RTT, feedback, and
+  retry state by peer. Each multipath peer has an independent SRP session.
+  Only valid traffic accepted in the current authentication state refreshes
+  peer activity. Fresh SRP authentication gates address reassociation to one
+  silent matching identity. Same-tuple and listener restarts force
+  reauthentication. Simple-profile endpoints bind even RTP and adjacent odd
+  RTCP sockets. Media and control traffic use their assigned sockets. Rust
+  endpoints support all caller and listener directions. Current-C black-box
+  role tests do not yet pass.
+- [ ] **M4 pending.**
+- [ ] **M5 pending.**
+- [ ] **M6 pending.**
+
 ### M0: Establish a truthful baseline
 
 Tasks:
@@ -498,8 +536,8 @@ Exit gate:
 Tasks:
 
 1. Replace `BTreeMap` history with a power-of-two ring.
-2. Store a full-sequence tag, timestamp, retry count, payload length, and
-   transmitted buffer in each slot.
+2. Store a full-sequence tag, timestamp, payload length, and transmitted buffer
+   in each history slot. Store retry data in bounded per-peer slots.
 3. Replace delivered/missing sets with a bounded sequence window and bitmap.
 4. Expire missing state by recovery age/window.
 5. Emit and consume sequence-extension records correctly across 16-bit wrap.
@@ -528,26 +566,27 @@ Exit gate:
 
 Tasks:
 
-1. Parse each datagram once into a typed event.
-2. Dispatch data, RTCP, EAPOL, keepalive, buffer negotiation, OOB, and unknown
+1. [x] Parse each datagram once into a typed event.
+2. [x] Dispatch data, RTCP, EAPOL, keepalive, buffer negotiation, OOB, and unknown
    controls into appropriate bounded queues.
-3. Maintain authentication, liveness, RTT, recovery, and feedback state per
+3. [x] Maintain authentication, liveness, RTT, recovery, and feedback state per
    peer/flow.
-4. Refresh activity only for valid traffic acceptable in the current state.
-5. Implement safe NAT rebinding and restart reauthentication.
-6. Add Simple RTP/RTCP even/odd port management.
-7. Support caller/listener roles in both sender and receiver directions.
-8. Add complete IPv4/IPv6 behavior.
-9. Add ASM/SSM multicast, TTL/hop limit, interface names, and local-port
+4. [x] Refresh activity only for valid traffic acceptable in the current state.
+5. [x] Implement safe NAT rebinding and restart reauthentication.
+6. [x] Add Simple RTP/RTCP even/odd port management.
+7. [ ] Support caller/listener roles in both sender and receiver directions.
+   Rust-to-Rust role and SRP tests pass. Current-C black-box tests remain open.
+8. [ ] Add complete IPv4/IPv6 behavior.
+9. [ ] Add ASM/SSM multicast, TTL/hop limit, interface names, and local-port
    binding.
-10. Configure socket buffers and detect truncated datagrams.
-11. Implement weight-zero duplication and weighted balancing without
+10. [ ] Configure socket buffers and detect truncated datagrams.
+11. [ ] Implement weight-zero duplication and weighted balancing without
     per-packet allocation.
-12. Add recovery priority and RTT tie-breaking.
-13. Implement RTT auto-muting, settle/restore thresholds, sole-carrier
+12. [ ] Add recovery priority and RTT tie-breaking.
+13. [ ] Implement RTT auto-muting, settle/restore thresholds, sole-carrier
     protection, trickle traffic, and rejoin ramp.
-14. Add split/merge, reflector, compression, and CBR output behavior.
-15. Maintain per-peer stats and configuration rather than allowing the most
+14. [ ] Add split/merge, reflector, compression, and CBR output behavior.
+15. [ ] Maintain per-peer stats and configuration rather than allowing the most
     recent URL to overwrite global settings.
 
 Exit gate:
@@ -666,6 +705,13 @@ Exit gate:
 - One million async cancellation/drop iterations pass sanitizer checks without
   UAF, race, leak, or deadlock.
 - One datagram produces one outer GRE parse and at most one decrypt.
+
+### Official C test reuse
+
+- Run official black-box tests with Rust and C endpoints in both directions.
+- Parameterize network scripts so they can start Rust or C commands.
+- Import stable C packet vectors into Rust differential tests.
+- Add a C-ABI adapter only when a private-function test has no network form.
 
 ### Performance
 

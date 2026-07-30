@@ -1,5 +1,6 @@
 use crate::main_profile::{DEFAULT_VIRT_DST_PORT, DEFAULT_VIRT_SRC_PORT};
 use crate::{Error, Profile, Result};
+use std::fmt;
 use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,11 +48,22 @@ pub enum RecoveryMode {
     Time,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct EncryptionConfig {
     pub secret: String,
     pub key_size_bits: u16,
     pub key_rotation: Option<u32>,
+}
+
+impl fmt::Debug for EncryptionConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EncryptionConfig")
+            .field("secret", &"<redacted>")
+            .field("key_size_bits", &self.key_size_bits)
+            .field("key_rotation", &self.key_rotation)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,30 +81,20 @@ impl Default for VirtualPorts {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CongestionControlMode {
     Off,
+    #[default]
     Normal,
     Aggressive,
 }
 
-impl Default for CongestionControlMode {
-    fn default() -> Self {
-        Self::Normal
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TimingMode {
+    #[default]
     Source,
     Arrival,
     Rtc,
-}
-
-impl Default for TimingMode {
-    fn default() -> Self {
-        Self::Source
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,7 +114,7 @@ impl Default for ConnectionConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AdvancedUrlConfig {
     pub profile: Option<Profile>,
     pub weight: u32,
@@ -126,23 +128,6 @@ pub struct AdvancedUrlConfig {
     pub verbose_level: Option<i32>,
 }
 
-impl Default for AdvancedUrlConfig {
-    fn default() -> Self {
-        Self {
-            profile: None,
-            weight: 0,
-            compression: None,
-            stream_id: None,
-            rtp_timestamp: None,
-            rtp_sequence: None,
-            rtp_output_payload_type: None,
-            multiplex_mode: None,
-            multiplex_filter: None,
-            verbose_level: None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MultiplexMode {
     Auto,
@@ -151,7 +136,7 @@ pub enum MultiplexMode {
     Ipv4,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PeerConfig {
     pub endpoint: Endpoint,
     pub virtual_ports: VirtualPorts,
@@ -163,6 +148,35 @@ pub struct PeerConfig {
     pub cname: Option<String>,
     pub srp_username: Option<String>,
     pub srp_password: Option<String>,
+    pub srp_compat_legacy: bool,
+    /// Query option names explicitly supplied by the URL.
+    ///
+    /// Consumers use this to reject parsed options that their runtime does not
+    /// implement instead of silently accepting them as no-ops.
+    pub specified_options: Vec<String>,
+}
+
+impl fmt::Debug for PeerConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PeerConfig")
+            .field("endpoint", &self.endpoint)
+            .field("virtual_ports", &self.virtual_ports)
+            .field("recovery", &self.recovery)
+            .field("congestion_control", &self.congestion_control)
+            .field("connection", &self.connection)
+            .field("advanced", &self.advanced)
+            .field("encryption", &self.encryption)
+            .field("cname", &self.cname)
+            .field("srp_username", &self.srp_username)
+            .field(
+                "srp_password",
+                &self.srp_password.as_ref().map(|_| "<redacted>"),
+            )
+            .field("srp_compat_legacy", &self.srp_compat_legacy)
+            .field("specified_options", &self.specified_options)
+            .finish()
+    }
 }
 
 impl PeerConfig {
@@ -180,6 +194,8 @@ impl PeerConfig {
         let mut cname = None;
         let mut srp_username = None;
         let mut srp_password = None;
+        let mut srp_compat_legacy = false;
+        let mut specified_options = Vec::new();
 
         for (key, value) in parse_query(parsed.query) {
             match key {
@@ -188,7 +204,12 @@ impl PeerConfig {
                     recovery.length_min = duration;
                     recovery.length_max = duration;
                 }
-                "bandwidth" => recovery.max_bitrate = parse_u32(key, value)?,
+                "bandwidth" => {
+                    let bitrate = parse_u32(key, value)?;
+                    if bitrate > 0 {
+                        recovery.max_bitrate = bitrate;
+                    }
+                }
                 "return-bandwidth" => recovery.return_max_bitrate = parse_u32(key, value)?,
                 "buffer-min" => recovery.length_min = parse_millis(key, value)?,
                 "buffer-max" => recovery.length_max = parse_millis(key, value)?,
@@ -217,6 +238,7 @@ impl PeerConfig {
                 "timing-mode" => connection.timing_mode = parse_timing_mode(value)?,
                 "username" => srp_username = Some(value.to_string()),
                 "password" => srp_password = Some(value.to_string()),
+                "srp-compat" => srp_compat_legacy = parse_zero_or_one(key, value)?,
                 "stream-id" => advanced.stream_id = Some(parse_u16(key, value)?),
                 "rtp-timestamp" => advanced.rtp_timestamp = Some(parse_i32(key, value)?),
                 "rtp-sequence" => advanced.rtp_sequence = Some(parse_i32(key, value)?),
@@ -225,8 +247,54 @@ impl PeerConfig {
                 "multiplex-filter" => advanced.multiplex_filter = non_empty_string(value),
                 "profile" => advanced.profile = Some(parse_profile(value)?),
                 "verbose-level" => advanced.verbose_level = Some(parse_i32(key, value)?),
-                _ => {}
+                _ => return Err(Error::UnsupportedQueryOption(key.to_string())),
             }
+            specified_options.push(key.to_string());
+        }
+
+        if secret.is_none() {
+            if key_size_bits.is_some() {
+                return Err(Error::MissingQueryOption {
+                    option: "aes-type".to_string(),
+                    required: "secret".to_string(),
+                });
+            }
+            if key_rotation.is_some() {
+                return Err(Error::MissingQueryOption {
+                    option: "key-rotation".to_string(),
+                    required: "secret".to_string(),
+                });
+            }
+        }
+        match (srp_username.is_some(), srp_password.is_some()) {
+            (true, false) => {
+                return Err(Error::MissingQueryOption {
+                    option: "username".to_string(),
+                    required: "password".to_string(),
+                })
+            }
+            (false, true) => {
+                return Err(Error::MissingQueryOption {
+                    option: "password".to_string(),
+                    required: "username".to_string(),
+                })
+            }
+            _ => {}
+        }
+        if recovery.length_min.is_zero() || recovery.length_min > recovery.length_max {
+            return Err(Error::InvalidRecoveryConfig(
+                "buffer-min must be nonzero and no greater than buffer-max",
+            ));
+        }
+        if recovery.rtt_min > recovery.rtt_max {
+            return Err(Error::InvalidRecoveryConfig(
+                "rtt-min must be no greater than rtt-max",
+            ));
+        }
+        if recovery.min_retries > recovery.max_retries {
+            return Err(Error::InvalidRecoveryConfig(
+                "min-retries must be no greater than max-retries",
+            ));
         }
 
         let encryption = match (secret, key_size_bits) {
@@ -240,11 +308,7 @@ impl PeerConfig {
                 key_size_bits: 128,
                 key_rotation,
             }),
-            (None, Some(key_size_bits)) => Some(EncryptionConfig {
-                secret: String::new(),
-                key_size_bits,
-                key_rotation,
-            }),
+            (None, Some(_)) => unreachable!("aes-type without secret was rejected"),
             (None, None) => None,
         };
 
@@ -264,6 +328,8 @@ impl PeerConfig {
             cname,
             srp_username,
             srp_password,
+            srp_compat_legacy,
+            specified_options,
         })
     }
 }
@@ -375,13 +441,24 @@ fn parse_u64(key: &str, value: &str) -> Result<u64> {
     })
 }
 
+fn parse_zero_or_one(key: &str, value: &str) -> Result<bool> {
+    match value {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        _ => Err(Error::InvalidQueryValue {
+            key: key.to_string(),
+            value: value.to_string(),
+        }),
+    }
+}
+
 fn parse_aes_key_size(value: &str) -> Result<u16> {
     let value = value.parse().map_err(|_| Error::InvalidQueryValue {
         key: "aes-type".to_string(),
         value: value.to_string(),
     })?;
     match value {
-        0 | 128 | 256 => Ok(value),
+        0 | 128 | 192 | 256 => Ok(value),
         other => Err(Error::UnsupportedAesKeySize(other)),
     }
 }
@@ -515,5 +592,39 @@ mod tests {
         assert_eq!(config.advanced.verbose_level, Some(7));
         assert_eq!(config.srp_username.as_deref(), Some("user"));
         assert_eq!(config.srp_password.as_deref(), Some("pass"));
+    }
+
+    #[test]
+    fn rejects_unknown_query_options() {
+        let error = PeerConfig::parse("rist://127.0.0.1:8000?made-up=1").unwrap_err();
+        assert_eq!(error, Error::UnsupportedQueryOption("made-up".to_string()));
+    }
+
+    #[test]
+    fn requires_complete_crypto_and_srp_credentials() {
+        assert_eq!(
+            PeerConfig::parse("rist://127.0.0.1:8000?aes-type=256").unwrap_err(),
+            Error::MissingQueryOption {
+                option: "aes-type".to_string(),
+                required: "secret".to_string(),
+            }
+        );
+        assert_eq!(
+            PeerConfig::parse("rist://127.0.0.1:8000?username=rist").unwrap_err(),
+            Error::MissingQueryOption {
+                option: "username".to_string(),
+                required: "password".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_current_librist_crypto_options() {
+        let config = PeerConfig::parse(
+            "rist://127.0.0.1:8000?secret=secret&aes-type=192&username=rist&password=pass&srp-compat=1",
+        )
+        .unwrap();
+        assert_eq!(config.encryption.unwrap().key_size_bits, 192);
+        assert!(config.srp_compat_legacy);
     }
 }

@@ -5,9 +5,9 @@ fn main() {
     println!("cargo:rerun-if-changed=wrapper.h");
 
     let library = pkg_config::Config::new()
-        .atleast_version("0.2.8")
+        .atleast_version("0.2.20")
         .probe("librist")
-        .expect("librist 0.2.8 or later is required and must be available through pkg-config.");
+        .expect("librist 0.2.20 or later is required and must be available through pkg-config.");
 
     let mut builder = bindgen::Builder::default()
         .header("wrapper.h")
@@ -15,7 +15,12 @@ fn main() {
         .allowlist_function("rist_.*")
         .allowlist_type("rist_.*")
         .allowlist_var("RIST_.*")
-        .generate_comments(true)
+        // Doxygen's `@param[out]` syntax is emitted as a broken intra-doc
+        // link, so keep the raw bindings free of upstream C comments.
+        .generate_comments(false)
+        // bindgen's generated offset assertions use `offset_of!`, which was
+        // stabilized after this workspace's MSRV.
+        .layout_tests(false)
         .derive_debug(true)
         .derive_default(true);
 

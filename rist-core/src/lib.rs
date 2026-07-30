@@ -34,9 +34,10 @@ pub use endpoint::{
 pub use error::Error;
 pub use main_profile::{
     MainControlPacket, MainOutboundPacket, MainReceiverCore, MainReceiverFeedback, MainSenderCore,
-    MainSessionConfig, MainSessionPoll, MainSessionTimers,
+    MainSenderPeerState, MainSessionConfig, MainSessionPoll, MainSessionTimers,
 };
 pub use mpegts::{expand_null_packets, suppress_null_packets, NullPacketSuppression};
+pub use packet::gre::MainPacket;
 pub use profile::Profile;
 pub use recovery::{
     MissingTracker, OrderedPayloadBuffer, OrderedPayloadBufferError, ReceiverObservation,
@@ -45,6 +46,7 @@ pub use recovery::{
 pub use sequence::SequenceExtender;
 pub use simple::{
     OutboundPacket, ReceivedPayload, RtcpIntervals, SimpleReceiverCore, SimpleSenderCore,
+    SimpleSenderPeerState,
 };
 pub use stats::{ReceiverStats, SenderStats};
 

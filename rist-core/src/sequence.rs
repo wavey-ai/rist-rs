@@ -20,6 +20,10 @@ impl SequenceExtender {
     pub fn last(&self) -> Option<u32> {
         self.last
     }
+
+    pub fn reset(&mut self) {
+        self.last = None;
+    }
 }
 
 pub fn extend_near(reference: u32, seq: u16) -> u32 {
@@ -49,5 +53,15 @@ mod tests {
     #[test]
     fn keeps_late_packet_in_previous_cycle() {
         assert_eq!(extend_near(0x1_0002, 0xffff), 0xffff);
+    }
+
+    #[test]
+    fn extends_across_the_full_u32_rollover() {
+        let mut extender = SequenceExtender {
+            last: Some(u32::MAX),
+        };
+        assert_eq!(extender.extend(0), 0);
+        assert_eq!(extender.extend(1), 1);
+        assert_eq!(extend_near(1, 0xffff), u32::MAX);
     }
 }

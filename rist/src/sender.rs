@@ -1,5 +1,4 @@
 use crate::{Error, Profile, Result, SenderOptions};
-use std::ffi::CString;
 use std::ptr;
 
 /// RIST sender for sending data streams.
@@ -33,36 +32,13 @@ impl Sender {
 
     /// Add a peer by URL with custom sender options.
     pub fn add_peer_with_options(&mut self, url: &str, options: &SenderOptions) -> Result<()> {
-        let url_c = CString::new(url)?;
-        let mut peer_config: *mut rist_sys::rist_peer_config = ptr::null_mut();
-
-        let ret = unsafe { rist_sys::rist_parse_address2(url_c.as_ptr(), &mut peer_config) };
-
-        if ret != 0 || peer_config.is_null() {
-            return Err(Error::UrlParse(url.to_string()));
-        }
-
+        let mut config = crate::ffi::ParsedPeerConfig::parse(url)?;
+        config.configure(|config| {
+            options.apply_to_peer_config(config);
+        });
         unsafe {
-            options.apply_to_peer_config(&mut *peer_config);
+            config.create_peer(self.ctx)?;
         }
-
-        let mut peer: *mut rist_sys::rist_peer = ptr::null_mut();
-        let ret = unsafe { rist_sys::rist_peer_create(self.ctx, &mut peer, peer_config) };
-        let srp_result = if ret == 0 {
-            unsafe { crate::srp::enable_from_peer_config(peer, &*peer_config) }
-        } else {
-            Ok(())
-        };
-
-        unsafe {
-            rist_sys::rist_peer_config_free2(&mut peer_config);
-        }
-
-        if ret != 0 {
-            return Err(Error::PeerCreation(url.to_string()));
-        }
-
-        srp_result?;
         Ok(())
     }
 

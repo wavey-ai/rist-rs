@@ -12,14 +12,14 @@ pub const RTCP_RR_FULL_FLAGS: u8 = 0x81;
 pub const RTCP_SDES_FLAGS: u8 = 0x81;
 pub const RTCP_NACK_RANGE_FLAGS: u8 = 0x80;
 pub const RTCP_NACK_BITMASK_FLAGS: u8 = 0x81;
-pub const RTCP_NACK_SEQEXT_FLAGS: u8 = 0x81;
 pub const RTCP_ECHOEXT_REQ_FLAGS: u8 = 0x82;
 pub const RTCP_ECHOEXT_RESP_FLAGS: u8 = 0x83;
 pub const NACK_FMT_RANGE: u8 = 0;
 pub const NACK_FMT_BITMASK: u8 = 1;
-pub const NACK_FMT_SEQEXT: u8 = 1;
 pub const ECHO_REQUEST: u8 = 2;
 pub const ECHO_RESPONSE: u8 = 3;
+pub const MAX_NACK_RANGE_PACKETS: usize = 256;
+pub const MAX_NACK_PACKET_REQUESTS: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RtcpHeader {
@@ -210,6 +210,15 @@ pub fn encode_nack(mode: NackMode, flow_id: u32, missing: &[u32], out: &mut Vec<
     if missing.is_empty() {
         return;
     }
+
+    // Simple/Main NACK records carry the RTP low 16 bits. The sender maps
+    // them back into its current full-sequence history window. PTYPE 204
+    // subtype 1 is not a sequence-extension record in librist v0.2.20.
+    encode_nack_records(mode, flow_id, missing, out);
+}
+
+fn encode_nack_records(mode: NackMode, flow_id: u32, missing: &[u32], out: &mut Vec<u8>) {
+    let missing = &missing[..missing.len().min(MAX_NACK_PACKET_REQUESTS)];
     let records = match mode {
         NackMode::Range => range_records(missing),
         NackMode::Bitmask => bitmask_records(missing),
@@ -257,7 +266,6 @@ pub fn decode_nack(input: &[u8], seq_msb: u32) -> Result<Vec<u32>> {
 
 pub fn decode_nacks_from_compound(input: &[u8]) -> Result<Vec<u32>> {
     let mut offset = 0;
-    let mut seq_msb = 0;
     let mut out = Vec::new();
 
     while offset < input.len() {
@@ -278,16 +286,18 @@ pub fn decode_nacks_from_compound(input: &[u8]) -> Result<Vec<u32>> {
         }
         let packet = &input[offset..packet_end];
         let subtype = header.flags & 0x1f;
-        if header.packet_type == PTYPE_NACK_CUSTOM && subtype == NACK_FMT_SEQEXT {
-            if packet.len() >= 14 {
-                seq_msb = u32::from(u16::from_be_bytes([packet[12], packet[13]])) << 16;
-            }
-        } else if header.packet_type == PTYPE_NACK_CUSTOM
+        if header.packet_type == PTYPE_NACK_CUSTOM
             && (subtype == ECHO_REQUEST || subtype == ECHO_RESPONSE)
         {
             // Echo packets share the custom RTCP packet type but are not NACKs.
         } else {
-            out.extend(decode_nack(packet, seq_msb)?);
+            let decoded = decode_nack(packet, 0)?;
+            if out.len().saturating_add(decoded.len()) > MAX_NACK_PACKET_REQUESTS {
+                return Err(Error::NackPacketTooLarge {
+                    maximum: MAX_NACK_PACKET_REQUESTS,
+                });
+            }
+            out.extend(decoded);
         }
         offset = packet_end;
     }
@@ -297,7 +307,6 @@ pub fn decode_nacks_from_compound(input: &[u8]) -> Result<Vec<u32>> {
 
 pub fn decode_compound(input: &[u8]) -> Result<Vec<RtcpPacket>> {
     let mut offset = 0;
-    let mut seq_msb = 0;
     let mut out = Vec::new();
 
     while offset < input.len() {
@@ -328,17 +337,11 @@ pub fn decode_compound(input: &[u8]) -> Result<Vec<RtcpPacket>> {
                 ssrc: header.ssrc,
                 cname,
             }),
-            PTYPE_NACK_CUSTOM if subtype == NACK_FMT_SEQEXT => {
-                if packet.len() >= 14 {
-                    seq_msb = u32::from(u16::from_be_bytes([packet[12], packet[13]])) << 16;
-                }
-                None
-            }
             PTYPE_NACK_CUSTOM if subtype == ECHO_REQUEST || subtype == ECHO_RESPONSE => {
                 decode_echo(packet)?.map(RtcpPacket::Echo)
             }
             PTYPE_NACK_CUSTOM | PTYPE_NACK_BITMASK => {
-                Some(RtcpPacket::Nack(decode_nack(packet, seq_msb)?))
+                Some(RtcpPacket::Nack(decode_nack(packet, 0)?))
             }
             _ => Some(RtcpPacket::Unknown {
                 packet_type: header.packet_type,
@@ -448,7 +451,7 @@ fn range_records(missing: &[u32]) -> Vec<NackRecord> {
 
     for sequence in iter {
         let seq = sequence as u16;
-        if extra != u16::MAX && seq == last.wrapping_add(1) {
+        if usize::from(extra) + 1 < MAX_NACK_RANGE_PACKETS && seq == last.wrapping_add(1) {
             extra = extra.wrapping_add(1);
         } else {
             records.push(NackRecord { start, extra });
@@ -530,18 +533,32 @@ fn decode_records(
     for record in input[..needed].chunks_exact(4) {
         let start = u16::from_be_bytes([record[0], record[1]]);
         let extra = u16::from_be_bytes([record[2], record[3]]);
-        let base = seq_msb + u32::from(start);
+        let base = seq_msb | u32::from(start);
+        let represented = match mode {
+            NackMode::Range => usize::from(extra) + 1,
+            NackMode::Bitmask => extra.count_ones() as usize + 1,
+        };
+        if mode == NackMode::Range && represented > MAX_NACK_RANGE_PACKETS {
+            return Err(Error::NackRangeTooLarge {
+                maximum: MAX_NACK_RANGE_PACKETS,
+            });
+        }
+        if out.len().saturating_add(represented) > MAX_NACK_PACKET_REQUESTS {
+            return Err(Error::NackPacketTooLarge {
+                maximum: MAX_NACK_PACKET_REQUESTS,
+            });
+        }
         out.push(base);
         match mode {
             NackMode::Range => {
                 for offset in 1..=u32::from(extra) {
-                    out.push(base + offset);
+                    out.push(seq_msb | u32::from(start.wrapping_add(offset as u16)));
                 }
             }
             NackMode::Bitmask => {
                 for bit in 0..16 {
                     if extra & (1 << bit) != 0 {
-                        out.push(base + bit + 1);
+                        out.push(seq_msb | u32::from(start.wrapping_add(bit + 1)));
                     }
                 }
             }
@@ -591,6 +608,30 @@ mod tests {
                 RtcpPacket::Nack(vec![4])
             ]
         );
+    }
+
+    #[test]
+    fn extended_sequences_use_standard_low_16_bit_nacks() {
+        let mut out = Vec::new();
+        encode_nack(NackMode::Range, 0x1122_3344, &[0x1_0000], &mut out);
+        assert_eq!(
+            &out,
+            &[0x80, 204, 0, 3, 0x11, 0x22, 0x33, 0x44, b'R', b'I', b'S', b'T', 0, 0, 0, 0]
+        );
+        assert_eq!(decode_nacks_from_compound(&out).unwrap(), vec![0]);
+    }
+
+    #[test]
+    fn compound_nacks_encode_each_extended_sequence_as_low_16_bits() {
+        let missing = [0xffff, 0x1_0000, 0x1_0001, 0x3_c06c];
+
+        for mode in [NackMode::Range, NackMode::Bitmask] {
+            let out = encode_nack_compound(mode, 1, "rust", &missing);
+            assert_eq!(
+                decode_nacks_from_compound(&out).unwrap(),
+                vec![0xffff, 0, 1, 0xc06c]
+            );
+        }
     }
 
     #[test]
@@ -651,6 +692,48 @@ mod tests {
         assert_eq!(
             decode_compound(&out).unwrap(),
             vec![RtcpPacket::Echo(request), RtcpPacket::Echo(response)]
+        );
+    }
+
+    #[test]
+    fn nack_decoding_has_fixed_range_and_packet_bounds() {
+        let mut oversized_range = Vec::new();
+        RtcpHeader {
+            flags: RTCP_NACK_RANGE_FLAGS,
+            packet_type: PTYPE_NACK_CUSTOM,
+            length_words_minus_one: 3,
+            ssrc: 1,
+        }
+        .encode(&mut oversized_range);
+        oversized_range.extend_from_slice(b"RIST");
+        oversized_range.extend_from_slice(&1u16.to_be_bytes());
+        oversized_range.extend_from_slice(&256u16.to_be_bytes());
+        assert_eq!(
+            decode_nack(&oversized_range, 0).unwrap_err(),
+            Error::NackRangeTooLarge {
+                maximum: MAX_NACK_RANGE_PACKETS
+            }
+        );
+
+        let records = MAX_NACK_PACKET_REQUESTS / 16 + 1;
+        let mut oversized_packet = Vec::new();
+        RtcpHeader {
+            flags: RTCP_NACK_BITMASK_FLAGS,
+            packet_type: PTYPE_NACK_BITMASK,
+            length_words_minus_one: (records + 2) as u16,
+            ssrc: 0,
+        }
+        .encode(&mut oversized_packet);
+        oversized_packet.extend_from_slice(&[0; 8]);
+        for start in 0..records {
+            oversized_packet.extend_from_slice(&(start as u16 * 17).to_be_bytes());
+            oversized_packet.extend_from_slice(&u16::MAX.to_be_bytes());
+        }
+        assert_eq!(
+            decode_nack(&oversized_packet, 0).unwrap_err(),
+            Error::NackPacketTooLarge {
+                maximum: MAX_NACK_PACKET_REQUESTS
+            }
         );
     }
 }

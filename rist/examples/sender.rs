@@ -16,7 +16,7 @@ async fn main() -> rist::Result<()> {
 
     let options = SenderOptions::new().recovery_length_max(Duration::from_millis(1000));
 
-    let sender = AsyncSender::connect_with_options(Profile::Main, &url, options).await?;
+    let mut sender = AsyncSender::connect_with_options(Profile::Main, &url, options).await?;
 
     println!("Connected!");
 
