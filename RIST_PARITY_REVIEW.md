@@ -470,9 +470,13 @@ It sends 1,316-byte MPEG-TS payloads with flow ID `0x11223344`.
 
 The pure protocol path now has the required roles, recovery, URL controls,
 backpressure, socket sizing, truncation handling, and current-C interoperability.
+Dynamic librist media flows receive scheduled feedback.
+The receiver normalizes librist retry SSRC markers before recovery tracking.
 
 `av-contrib` production ingest now selects `rist-pure`.
 Its dependencies pin the hardened RIST transport revision.
+`rist-loss-proxy` can inject deterministic first-send media loss.
+It measures NACK requests and observed retransmissions without dropping control traffic.
 
 One product-level work item remains:
 

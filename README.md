@@ -10,6 +10,7 @@ RIST (Reliable Internet Stream Transport) is a protocol for reliable video strea
 - `rist-sys` - Raw FFI bindings generated via bindgen
 - `rist-core` - Sans-I/O pure Rust protocol engine
 - `rist-mio` - Nonblocking UDP transport for the pure Rust engine
+- `rist-tools` - Operational loss and recovery qualification tools
 - `wavey-rist` (`rist` library name) - Safe wrapper and public API
 - `rist-interop-tests` - Black-box Rust/librist interoperability suite
 
@@ -63,12 +64,36 @@ Needletail uses Main-profile IPv4 unicast from a caller to a local listener.
 Media uses 1,316-byte MPEG-TS payloads and flow ID `0x11223344`.
 
 - ✅ Main caller-to-listener data and control interoperate with current librist.
+- ✅ Dynamic librist media flows receive scheduled NACKs, and retry SSRC markers preserve recovery state.
 - ✅ Bounded recovery supports Needletail's buffer, bandwidth, RTT, reorder, retry, and congestion controls.
 - ✅ Socket buffers, backpressure, exact recovery bytes, and truncated-datagram handling are ready.
 - ✅ `av-contrib` production ingest selects the pure Rust receiver.
+- ✅ `rist-loss-proxy` injects deterministic first-send loss and measures successful recovery.
 - ❌ Live 4K, sustained-loss, recovery, CPU, memory, and continuity qualification remains.
 
 One product-level qualification gate remains before Needletail can use pure RIST in production.
+
+### Loss Qualification
+
+Build the release proxy:
+
+```sh
+cargo build --release -p rist-tools --bin rist-loss-proxy
+```
+
+Put the proxy between the RIST sender and receiver:
+
+```sh
+target/release/rist-loss-proxy \
+  --listen 127.0.0.1:27010 \
+  --target 127.0.0.1:27000 \
+  --drop-every 100 \
+  --duration-seconds 600
+```
+
+Send the source to port `27010`.
+The proxy emits NDJSON statistics once per second.
+It exits with status 1 when an injected loss has no observed retransmission.
 
 ## Usage
 

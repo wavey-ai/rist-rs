@@ -751,8 +751,9 @@ impl MainReceiverCore {
         payload: &[u8],
     ) -> Result<ReceivedPayload> {
         self.last_reduced = Some(reduced);
-        let packet = RtpPacket::decode(payload)?;
+        let mut packet = RtpPacket::decode(payload)?;
         let flow_id = packet.header.ssrc & !1;
+        packet.header.ssrc = flow_id;
         self.flow_reduced.insert(flow_id, reduced);
         self.flow_mut(flow_id)?.accept_rtp_packet(packet)
     }
@@ -1209,6 +1210,35 @@ mod tests {
             receiver.stats().recovered_packets,
             lost_sequences.len() as u64
         );
+    }
+
+    #[test]
+    fn main_profile_normalizes_librist_retry_ssrc_bit() {
+        let now = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut sender = MainSenderCore::new(0x1122_3344, 64);
+        let mut receiver = MainReceiverCore::new(0x1122_3344, "rust", NackMode::Range);
+        let reduced = ReducedHeader {
+            src_port: DEFAULT_VIRT_SRC_PORT,
+            dst_port: DEFAULT_VIRT_DST_PORT,
+        };
+
+        let first = sender.prepare_payload(b"first", ntp, now);
+        let lost = sender.prepare_payload(b"lost", ntp, now);
+        let third = sender.prepare_payload(b"third", ntp, now);
+
+        receiver.accept_reduced(reduced, &first.bytes).unwrap();
+        let observed = receiver.accept_reduced(reduced, &third.bytes).unwrap();
+        assert_eq!(observed.newly_missing, vec![1]);
+
+        let mut retry = lost.bytes.clone();
+        retry[11] |= 1;
+        let recovered = receiver.accept_reduced(reduced, &retry).unwrap();
+
+        assert!(recovered.recovered);
+        assert_eq!(recovered.payload, b"lost");
+        assert!(receiver.missing_sequences().is_empty());
+        assert_eq!(receiver.stats().recovered_packets, 1);
     }
 
     #[test]

@@ -3466,15 +3466,16 @@ impl MainMioReceiver {
             return Ok(None);
         };
         self.ensure_peer_authenticated(peer)?;
-        let packet = match self.peer_runtime.get_mut(&peer) {
-            Some(runtime) => runtime.core.poll_rtcp(now, now_ntp),
-            None => self.core.poll_rtcp(now, now_ntp),
+        let packets = match self.peer_runtime.get_mut(&peer) {
+            Some(runtime) => runtime.core.poll_rtcp_all(now, now_ntp),
+            None => self.core.poll_rtcp_all(now, now_ntp),
         };
-        let Some(packet) = packet else {
-            return Ok(None);
-        };
-        self.socket.send_packet_to(peer, &packet.bytes)?;
-        Ok(Some(packet))
+        let mut first = None;
+        for (_flow_id, packet) in packets {
+            self.socket.send_packet_to(peer, &packet.bytes)?;
+            first.get_or_insert(packet);
+        }
+        Ok(first)
     }
 
     pub fn try_recv_rtcp_and_respond(

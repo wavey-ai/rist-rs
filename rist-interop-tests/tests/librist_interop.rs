@@ -8,6 +8,8 @@ use rist_core::packet::rtcp::{
 use rist_core::time::ntp_now;
 use rist_core::{PskKey, SrpCredentialStore};
 use rist_mio::{MainMioReceiver, MainMioSender, SimpleMioReceiver, SimpleMioSender};
+use rist_tools::{LossProxy, LossProxyConfig};
+use std::collections::HashSet;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket};
 use std::sync::Mutex;
 use std::thread;
@@ -400,6 +402,105 @@ fn librist_main_sender_to_pure_rust_receiver() {
         );
         thread::sleep(Duration::from_millis(1));
     }
+}
+
+#[test]
+fn librist_main_sender_recovers_every_injected_loss_for_pure_rust_receiver() {
+    if !interop_enabled() {
+        return;
+    }
+    let _guard = lock_interop();
+
+    const PACKETS: u8 = 21;
+    const DROP_EVERY: u64 = 5;
+
+    let flow_id = 0x1122_3344;
+    let receiver_port = next_even_test_port_pair();
+    let receiver_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, receiver_port));
+    let mut receiver =
+        MainMioReceiver::bind(receiver_addr, flow_id, "rust-loss", NackMode::Range).unwrap();
+    let mut proxy = LossProxy::bind(LossProxyConfig {
+        listen: loopback_any(),
+        upstream_bind: loopback_any(),
+        target: receiver.local_addr().unwrap(),
+        drop_every: DROP_EVERY,
+    })
+    .unwrap();
+    let sender_url = format!("rist://{}", proxy.listen_addr().unwrap());
+    let mut sender = rist::Sender::new(rist::Profile::Main).unwrap();
+    sender.add_peer(&sender_url).unwrap();
+    sender.start().unwrap();
+
+    for sequence in 0..PACKETS {
+        sender.send(&[sequence; 1_316]).unwrap();
+        proxy.poll().unwrap();
+        thread::sleep(Duration::from_millis(2));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut received = HashSet::new();
+    let mut receiver_buf = vec![0; 65_536];
+    while received.len() < usize::from(PACKETS) {
+        proxy.poll().unwrap();
+        while let Some((_from, payload)) = receiver.try_recv_payload(&mut receiver_buf).unwrap() {
+            assert_eq!(payload.payload.len(), 1_316);
+            received.insert(payload.payload[0]);
+        }
+        receiver
+            .poll_rtcp_and_send(Instant::now(), ntp_now())
+            .unwrap();
+        proxy.poll().unwrap();
+
+        assert!(
+            Instant::now() < deadline,
+            "timed out after receiving {} of {PACKETS} payloads; proxy={:?}, receiver={:?}",
+            received.len(),
+            proxy.stats(),
+            receiver.stats()
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    assert_eq!(proxy.stats().injected_drops, 4);
+    assert_eq!(proxy.stats().recovered_forwards, 4);
+    assert!(proxy.stats().all_injected_drops_recovered());
+    let peer = receiver
+        .peer_addr()
+        .expect("pure receiver lost the proxy peer");
+    let flow_stats = receiver
+        .peer_flow_ids(peer)
+        .unwrap()
+        .into_iter()
+        .filter_map(|flow_id| {
+            receiver
+                .peer_flow_stats(peer, flow_id)
+                .map(|stats| (flow_id, stats))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        flow_stats
+            .iter()
+            .map(|(_, stats)| stats.received_packets)
+            .sum::<u64>(),
+        u64::from(PACKETS),
+        "unexpected C media flow statistics: {flow_stats:?}"
+    );
+    assert_eq!(
+        flow_stats
+            .iter()
+            .map(|(_, stats)| stats.recovered_packets)
+            .sum::<u64>(),
+        4,
+        "unexpected C media recovery statistics: {flow_stats:?}"
+    );
+    assert_eq!(
+        flow_stats
+            .iter()
+            .map(|(_, stats)| stats.currently_missing_packets)
+            .sum::<u64>(),
+        0,
+        "C media flows retained missing packets: {flow_stats:?}"
+    );
 }
 
 #[test]
