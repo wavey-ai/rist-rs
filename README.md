@@ -35,9 +35,9 @@ A red cross means that required work or verification remains.
 - ✅ Valid-traffic activity rules
 - ✅ Authenticated NAT rebinding and restart reauthentication
 - ✅ Simple RTP and RTCP even-odd port pairs
-- ❌ All caller and listener combinations
-  - Rust-to-Rust tests pass.
-  - Current-C black-box tests still require correction.
+- ✅ All caller and listener combinations supported by current librist
+  - Main plaintext and SRP roles pass C-to-Rust and Rust-to-C tests.
+  - Simple reverse roles pass Rust-to-Rust tests as a Rust extension.
 - ❌ Complete IPv4 and IPv6 behavior
 - ❌ ASM and SSM multicast behavior
 - ❌ Socket buffers and truncated-datagram detection

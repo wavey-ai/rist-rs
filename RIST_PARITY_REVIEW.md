@@ -453,8 +453,9 @@ review; the findings above remain the audit of the originally reviewed commit.
   silent matching identity. Same-tuple and listener restarts force
   reauthentication. Simple-profile endpoints bind even RTP and adjacent odd
   RTCP sockets. Media and control traffic use their assigned sockets. Rust
-  endpoints support all caller and listener directions. Current-C black-box
-  role tests do not yet pass.
+  endpoints support all caller and listener directions. C-supported Main roles
+  pass plaintext and SRP black-box tests in both directions. Simple reverse
+  roles pass Rust-to-Rust tests as a Rust extension.
 - [ ] **M4 pending.**
 - [ ] **M5 pending.**
 - [ ] **M6 pending.**
@@ -574,8 +575,10 @@ Tasks:
 4. [x] Refresh activity only for valid traffic acceptable in the current state.
 5. [x] Implement safe NAT rebinding and restart reauthentication.
 6. [x] Add Simple RTP/RTCP even/odd port management.
-7. [ ] Support caller/listener roles in both sender and receiver directions.
-   Rust-to-Rust role and SRP tests pass. Current-C black-box tests remain open.
+7. [x] Support caller/listener roles in both sender and receiver directions.
+   Main plaintext and SRP roles pass C-to-Rust and Rust-to-C tests.
+   Simple reverse roles pass Rust-to-Rust tests as a Rust extension.
+   Current librist does not support those Simple reverse roles.
 8. [ ] Add complete IPv4/IPv6 behavior.
 9. [ ] Add ASM/SSM multicast, TTL/hop limit, interface names, and local-port
    binding.
@@ -593,7 +596,8 @@ Exit gate:
 
 - Multipath failure/recovery works under asymmetric loss and RTT.
 - NAT rebind and process restart do not weaken authentication.
-- Multicast and all caller/listener role combinations interoperate with C.
+- Multicast and all C-supported caller/listener role combinations interoperate
+  with C.
 
 ### M4: Implement Advanced `Baseline.Direct`
 

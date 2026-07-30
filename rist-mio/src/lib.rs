@@ -1393,7 +1393,14 @@ impl MainMioSender {
                 MainSenderEvent::Feedback { from, retries }
             }
             MainPacket::Keepalive(packet) => {
+                let discovered = self.listening && self.peer.is_none();
                 self.select_unsecured_listener_peer(from);
+                if self.listening && self.peer == Some(from) {
+                    self.core.upgrade_gre_version(packet.gre.version);
+                }
+                if discovered && self.peer == Some(from) {
+                    self.send_keepalive(GreKeepalive::librist_default([0; 6]))?;
+                }
                 self.timers.observe_peer_activity(Instant::now());
                 MainSenderEvent::Keepalive { from, packet }
             }
@@ -2816,7 +2823,6 @@ impl MainMioReceiver {
         peer: SocketAddr,
         keepalive: GreKeepalive<'_>,
     ) -> io::Result<MainControlPacket> {
-        self.ensure_peer_authenticated(peer)?;
         let packet = match self.peer_runtime.get_mut(&peer) {
             Some(runtime) => runtime.core.build_keepalive(keepalive),
             None => self.core.build_keepalive(keepalive),
@@ -3203,6 +3209,12 @@ mod tests {
         )
         .unwrap();
         receiver.enable_srp_client("rist", b"reverse-roles");
+        receiver
+            .send_keepalive_to(
+                sender_addr,
+                GreKeepalive::librist_default([1, 2, 3, 4, 5, 6]),
+            )
+            .unwrap();
         receiver.start_srp_authentication().unwrap();
 
         let mut sender_buf = [0u8; 2048];

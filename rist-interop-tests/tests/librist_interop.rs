@@ -120,7 +120,6 @@ fn librist_simple_sender_to_pure_rust_receiver() {
         return;
     }
     let _guard = lock_interop();
-
     let flow_id = 0x1122_3344;
     let receiver_port = next_even_test_port_pair();
     let receiver_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, receiver_port));
@@ -153,111 +152,6 @@ fn librist_simple_sender_to_pure_rust_receiver() {
         assert!(
             Instant::now() < deadline,
             "timed out waiting for pure Rust receiver"
-        );
-        thread::sleep(Duration::from_millis(1));
-    }
-}
-
-#[test]
-#[ignore = "pending caller/listener parity with current librist"]
-fn librist_simple_receiver_caller_from_pure_rust_sender_listener() {
-    if !interop_enabled() {
-        return;
-    }
-    let _guard = lock_interop();
-
-    let flow_id = 0x1122_3344;
-    let sender_port = next_even_test_port_pair();
-    let sender_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, sender_port));
-    let mut sender = SimpleMioSender::listen(sender_addr, flow_id, 64).unwrap();
-    let receiver_url = format!("rist://127.0.0.1:{sender_port}");
-    let mut receiver = rist::Receiver::new(rist::Profile::Simple).unwrap();
-    receiver.add_peer(&receiver_url).unwrap();
-    receiver.start().unwrap();
-
-    let mut feedback_buf = [0u8; 1500];
-    let discovery_deadline = Instant::now() + Duration::from_secs(5);
-    while sender.peer_addr().is_none() {
-        sender
-            .try_recv_feedback_and_retransmit(&mut feedback_buf)
-            .unwrap();
-        assert!(
-            Instant::now() < discovery_deadline,
-            "timed out waiting for the librist Simple receiver caller"
-        );
-        thread::sleep(Duration::from_millis(1));
-    }
-
-    let payload = mpegts_payload_7("LIBRIST SIMPLE CALLER FROM RUST LISTENER");
-    for _ in 0..20 {
-        sender
-            .send_payload(&payload, ntp_now(), Instant::now())
-            .unwrap();
-        thread::sleep(Duration::from_millis(10));
-    }
-
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Some(block) = receiver.read(Duration::from_millis(50)).unwrap() {
-            assert!(block
-                .payload()
-                .windows(b"LIBRIST SIMPLE CALLER FROM RUST LISTENER".len())
-                .any(|window| window == b"LIBRIST SIMPLE CALLER FROM RUST LISTENER"));
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for the librist Simple receiver caller"
-        );
-    }
-}
-
-#[test]
-#[ignore = "pending caller/listener parity with current librist"]
-fn pure_rust_simple_receiver_caller_from_librist_sender_listener() {
-    if !interop_enabled() {
-        return;
-    }
-    let _guard = lock_interop();
-
-    let flow_id = 0x1122_3344;
-    let sender_port = next_even_test_port_pair();
-    let sender_url = format!("rist://@127.0.0.1:{sender_port}");
-    let sender_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, sender_port));
-    let mut sender = rist::Sender::new(rist::Profile::Simple).unwrap();
-    sender.add_peer(&sender_url).unwrap();
-    sender.start().unwrap();
-
-    let mut receiver = SimpleMioReceiver::connect(
-        loopback_any(),
-        sender_addr,
-        flow_id,
-        "rust",
-        NackMode::Range,
-    )
-    .unwrap();
-    receiver.send_feedback().unwrap().unwrap();
-    thread::sleep(Duration::from_millis(50));
-
-    let payload = mpegts_payload("RUST SIMPLE CALLER FROM LIBRIST LISTENER");
-    for _ in 0..20 {
-        sender.send(&payload).unwrap();
-        thread::sleep(Duration::from_millis(10));
-    }
-
-    let mut buf = [0u8; 1500];
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Some((_from, received)) = receiver.try_recv_payload(&mut buf).unwrap() {
-            assert!(received
-                .payload
-                .windows(b"RUST SIMPLE CALLER FROM LIBRIST LISTENER".len())
-                .any(|window| window == b"RUST SIMPLE CALLER FROM LIBRIST LISTENER"));
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for the pure Rust Simple receiver caller"
         );
         thread::sleep(Duration::from_millis(1));
     }
@@ -453,7 +347,6 @@ fn librist_main_sender_to_pure_rust_receiver() {
 }
 
 #[test]
-#[ignore = "pending caller/listener parity with current librist"]
 fn librist_main_receiver_caller_from_pure_rust_sender_listener() {
     if !interop_enabled() {
         return;
@@ -479,6 +372,7 @@ fn librist_main_receiver_caller_from_pure_rust_sender_listener() {
         );
         thread::sleep(Duration::from_millis(1));
     }
+    send_main_session_probe(&mut sender);
 
     let payload = mpegts_payload_7("LIBRIST MAIN CALLER FROM RUST LISTENER");
     for _ in 0..20 {
@@ -505,7 +399,6 @@ fn librist_main_receiver_caller_from_pure_rust_sender_listener() {
 }
 
 #[test]
-#[ignore = "pending caller/listener parity with current librist"]
 fn pure_rust_main_receiver_caller_from_librist_sender_listener() {
     if !interop_enabled() {
         return;
@@ -534,7 +427,12 @@ fn pure_rust_main_receiver_caller_from_librist_sender_listener() {
             GreKeepalive::librist_default([1, 2, 3, 4, 5, 6]),
         )
         .unwrap();
-    thread::sleep(Duration::from_millis(50));
+    let now = Instant::now();
+    receiver.poll_rtcp_and_send(now, ntp_now()).unwrap();
+    receiver
+        .poll_rtcp_and_send(now + Duration::from_secs(1), ntp_now())
+        .unwrap();
+    thread::sleep(Duration::from_millis(20));
 
     let payload = mpegts_payload_7("RUST MAIN CALLER FROM LIBRIST LISTENER");
     for _ in 0..20 {
@@ -555,6 +453,121 @@ fn pure_rust_main_receiver_caller_from_librist_sender_listener() {
         assert!(
             Instant::now() < deadline,
             "timed out waiting for the pure Rust Main receiver caller"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn librist_main_receiver_caller_srp_to_pure_rust_sender_listener() {
+    if !interop_enabled() {
+        return;
+    }
+    let _guard = lock_interop();
+
+    let flow_id = 0x1122_3344;
+    let sender_port = next_even_test_port_pair();
+    let sender_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, sender_port));
+    let mut sender = MainMioSender::listen(sender_addr, flow_id, 64).unwrap();
+    sender.set_tx_key(PskKey::new(128, b"12345678").unwrap());
+    sender.set_rx_key(PskKey::receiver(128, b"12345678").unwrap());
+    let mut store = SrpCredentialStore::new();
+    store.stage_password("testuser", b"testpassword").unwrap();
+    sender.enable_srp_authenticator(store);
+
+    let receiver_url = format!(
+        "rist://127.0.0.1:{sender_port}?secret=12345678&aes-type=128&username=testuser&password=testpassword"
+    );
+    let mut receiver = rist::Receiver::new(rist::Profile::Main).unwrap();
+    receiver.add_peer(&receiver_url).unwrap();
+    receiver.start().unwrap();
+
+    drive_main_sender_srp_authenticator(&mut sender);
+    assert!(sender.srp_authenticated());
+    send_main_session_probe(&mut sender);
+
+    let payload = mpegts_payload_7("LIBRIST SRP CALLER FROM RUST LISTENER");
+    for _ in 0..20 {
+        sender
+            .send_payload(&payload, ntp_now(), Instant::now())
+            .unwrap();
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(block) = receiver.read(Duration::from_millis(50)).unwrap() {
+            assert!(block
+                .payload()
+                .windows(b"LIBRIST SRP CALLER FROM RUST LISTENER".len())
+                .any(|window| window == b"LIBRIST SRP CALLER FROM RUST LISTENER"));
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the SRP-authenticated librist receiver caller"
+        );
+    }
+}
+
+#[test]
+fn pure_rust_main_receiver_caller_srp_to_librist_sender_listener() {
+    if !interop_enabled() {
+        return;
+    }
+    let _guard = lock_interop();
+
+    let flow_id = 0x1122_3344;
+    let sender_port = next_even_test_port_pair();
+    let sender_url = format!(
+        "rist://@127.0.0.1:{sender_port}?secret=12345678&aes-type=128&username=testuser&password=testpassword"
+    );
+    let sender_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, sender_port));
+    let mut sender = rist::Sender::new(rist::Profile::Main).unwrap();
+    sender.add_peer(&sender_url).unwrap();
+    sender.start().unwrap();
+
+    let mut receiver = MainMioReceiver::connect(
+        loopback_any(),
+        sender_addr,
+        flow_id,
+        "rust",
+        NackMode::Range,
+    )
+    .unwrap();
+    receiver.set_tx_key(PskKey::new(128, b"12345678").unwrap());
+    receiver.set_rx_key(PskKey::receiver(128, b"12345678").unwrap());
+    receiver.enable_srp_client("testuser", b"testpassword");
+    receiver
+        .send_keepalive_to(
+            sender_addr,
+            GreKeepalive::librist_default([1, 2, 3, 4, 5, 6]),
+        )
+        .unwrap();
+    receiver.start_srp_authentication().unwrap();
+    drive_main_receiver_srp_client(&mut receiver);
+    assert!(receiver.srp_authenticated());
+    send_main_receiver_session_probe(&mut receiver, sender_addr);
+
+    let payload = mpegts_payload_7("RUST SRP CALLER FROM LIBRIST LISTENER");
+    for _ in 0..20 {
+        sender.send(&payload).unwrap();
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let mut buf = [0u8; 1500];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some((_from, received)) = receiver.try_recv_payload(&mut buf).unwrap() {
+            assert!(received
+                .payload
+                .windows(b"RUST SRP CALLER FROM LIBRIST LISTENER".len())
+                .any(|window| window == b"RUST SRP CALLER FROM LIBRIST LISTENER"));
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the SRP-authenticated pure Rust receiver caller"
         );
         thread::sleep(Duration::from_millis(1));
     }
@@ -870,6 +883,21 @@ fn send_main_session_probe(sender: &mut MainMioSender) {
     thread::sleep(Duration::from_millis(20));
 }
 
+fn send_main_receiver_session_probe(receiver: &mut MainMioReceiver, peer: SocketAddr) {
+    receiver
+        .send_keepalive_to(peer, GreKeepalive::librist_default([1, 2, 3, 4, 5, 6]))
+        .unwrap();
+    receiver
+        .send_buffer_negotiation_to(peer, BufferNegotiation::session(1000, 250))
+        .unwrap();
+    let now = Instant::now();
+    receiver.poll_rtcp_and_send(now, ntp_now()).unwrap();
+    receiver
+        .poll_rtcp_and_send(now + Duration::from_secs(1), ntp_now())
+        .unwrap();
+    thread::sleep(Duration::from_millis(20));
+}
+
 fn drive_main_srp_client(sender: &mut MainMioSender) {
     let mut buf = [0; 1500];
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -878,6 +906,32 @@ fn drive_main_srp_client(sender: &mut MainMioSender) {
         assert!(
             Instant::now() < deadline,
             "timed out waiting for pure Rust SRP client"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn drive_main_sender_srp_authenticator(sender: &mut MainMioSender) {
+    let mut buf = [0u8; 2048];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !sender.srp_authenticated() {
+        sender.try_recv_event(&mut buf).unwrap();
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the pure Rust sender SRP authenticator"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn drive_main_receiver_srp_client(receiver: &mut MainMioReceiver) {
+    let mut buf = [0u8; 2048];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !receiver.srp_authenticated() {
+        receiver.try_recv_event(&mut buf).unwrap();
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the pure Rust receiver SRP client"
         );
         thread::sleep(Duration::from_millis(1));
     }

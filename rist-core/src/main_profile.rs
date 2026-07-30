@@ -239,6 +239,10 @@ impl MainSenderCore {
         self
     }
 
+    pub fn upgrade_gre_version(&mut self, gre_version: u8) {
+        self.gre_version = self.gre_version.max(gre_version);
+    }
+
     pub fn with_null_packet_suppression(mut self, enabled: bool) -> Self {
         self.simple = self.simple.with_null_packet_suppression(enabled);
         self
@@ -1267,6 +1271,18 @@ mod tests {
             decoded_negotiation.negotiation.receiver_current_buffer_ms,
             250
         );
+    }
+
+    #[test]
+    fn sender_gre_negotiation_only_upgrades_the_version() {
+        let mut sender = MainSenderCore::new(0x1122_3344, 64);
+
+        sender.upgrade_gre_version(2);
+        sender.upgrade_gre_version(1);
+
+        let keepalive = sender.build_keepalive(GreKeepalive::librist_default([1, 2, 3, 4, 5, 6]));
+        let decoded = KeepalivePacket::decode(&keepalive.bytes).unwrap();
+        assert_eq!(decoded.gre.version, 2);
     }
 
     #[test]
