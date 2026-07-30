@@ -27,12 +27,60 @@ use rist_core::{
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket as StdUdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket as StdUdpSocket};
 use std::time::Instant;
 
 const PENDING_SEND_CAPACITY: usize = 256;
 pub const DEFAULT_MAIN_EVENT_QUEUE_CAPACITY: usize = 256;
 pub const DEFAULT_MAIN_PEER_CAPACITY: usize = 256;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetworkInterface {
+    Default,
+    Address(IpAddr),
+    Index(u32),
+    Name(String),
+}
+
+impl NetworkInterface {
+    pub fn from_miface(value: &str) -> Self {
+        value
+            .parse()
+            .map(Self::Address)
+            .unwrap_or_else(|_| Self::Name(value.to_string()))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResolvedNetworkInterface {
+    index: u32,
+    ipv4: Ipv4Addr,
+    ipv6: Option<Ipv6Addr>,
+}
+
+pub fn network_interface_index(interface: &NetworkInterface) -> io::Result<u32> {
+    Ok(resolve_network_interface(interface)?.index)
+}
+
+pub fn network_interface_address(interface: &NetworkInterface, ipv4: bool) -> io::Result<IpAddr> {
+    let resolved = resolve_network_interface(interface)?;
+    if ipv4 {
+        if resolved.ipv4.is_unspecified() && !matches!(interface, NetworkInterface::Default) {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "network interface has no IPv4 address",
+            ));
+        }
+        Ok(IpAddr::V4(resolved.ipv4))
+    } else {
+        resolved.ipv6.map(IpAddr::V6).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "network interface has no IPv6 address",
+            )
+        })
+    }
+}
 
 struct PendingDatagram {
     bytes: Vec<u8>,
@@ -126,12 +174,33 @@ impl RtpUdpSocket {
         self.socket.set_multicast_loop_v4(on)
     }
 
+    pub fn set_multicast_loop_v6(&self, on: bool) -> io::Result<()> {
+        SockRef::from(&self.socket).set_multicast_loop_v6(on)
+    }
+
     pub fn set_multicast_ttl_v4(&self, ttl: u32) -> io::Result<()> {
         self.socket.set_multicast_ttl_v4(ttl)
     }
 
+    pub fn set_multicast_hops_v6(&self, hops: u32) -> io::Result<()> {
+        SockRef::from(&self.socket).set_multicast_hops_v6(hops)
+    }
+
     pub fn set_multicast_if_v4(&self, interface: Ipv4Addr) -> io::Result<()> {
         SockRef::from(&self.socket).set_multicast_if_v4(&interface)
+    }
+
+    pub fn set_multicast_if_v6(&self, interface: u32) -> io::Result<()> {
+        SockRef::from(&self.socket).set_multicast_if_v6(interface)
+    }
+
+    pub fn set_multicast_interface(&self, interface: &NetworkInterface) -> io::Result<()> {
+        let resolved = resolve_network_interface(interface)?;
+        if self.local_addr()?.is_ipv4() {
+            self.set_multicast_if_v4(resolved.ipv4)
+        } else {
+            self.set_multicast_if_v6(resolved.index)
+        }
     }
 
     pub fn join_multicast_v4(&self, multiaddr: Ipv4Addr, interface: Ipv4Addr) -> io::Result<()> {
@@ -140,6 +209,82 @@ impl RtpUdpSocket {
 
     pub fn leave_multicast_v4(&self, multiaddr: Ipv4Addr, interface: Ipv4Addr) -> io::Result<()> {
         self.socket.leave_multicast_v4(&multiaddr, &interface)
+    }
+
+    pub fn join_ssm_v4(
+        &self,
+        source: Ipv4Addr,
+        group: Ipv4Addr,
+        interface: Ipv4Addr,
+    ) -> io::Result<()> {
+        validate_ssm_v4(source, group)?;
+        SockRef::from(&self.socket).join_ssm_v4(&source, &group, &interface)
+    }
+
+    pub fn leave_ssm_v4(
+        &self,
+        source: Ipv4Addr,
+        group: Ipv4Addr,
+        interface: Ipv4Addr,
+    ) -> io::Result<()> {
+        validate_ssm_v4(source, group)?;
+        SockRef::from(&self.socket).leave_ssm_v4(&source, &group, &interface)
+    }
+
+    pub fn join_multicast_v6(&self, multiaddr: Ipv6Addr, interface: u32) -> io::Result<()> {
+        if !multiaddr.is_multicast() {
+            return Err(invalid_multicast_group(IpAddr::V6(multiaddr)));
+        }
+        self.socket.join_multicast_v6(&multiaddr, interface)
+    }
+
+    pub fn leave_multicast_v6(&self, multiaddr: Ipv6Addr, interface: u32) -> io::Result<()> {
+        if !multiaddr.is_multicast() {
+            return Err(invalid_multicast_group(IpAddr::V6(multiaddr)));
+        }
+        self.socket.leave_multicast_v6(&multiaddr, interface)
+    }
+
+    pub fn join_multicast(
+        &self,
+        group: IpAddr,
+        interface: &NetworkInterface,
+        source: Option<Ipv4Addr>,
+    ) -> io::Result<()> {
+        let resolved = resolve_network_interface(interface)?;
+        match (group, source) {
+            (IpAddr::V4(group), Some(source)) => self.join_ssm_v4(source, group, resolved.ipv4),
+            (IpAddr::V4(group), None) if group.is_multicast() => {
+                self.join_multicast_v4(group, resolved.ipv4)
+            }
+            (IpAddr::V4(group), None) => Err(invalid_multicast_group(IpAddr::V4(group))),
+            (IpAddr::V6(group), None) => self.join_multicast_v6(group, resolved.index),
+            (IpAddr::V6(_), Some(_)) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "IPv6 source-specific multicast is not supported by current librist",
+            )),
+        }
+    }
+
+    pub fn leave_multicast(
+        &self,
+        group: IpAddr,
+        interface: &NetworkInterface,
+        source: Option<Ipv4Addr>,
+    ) -> io::Result<()> {
+        let resolved = resolve_network_interface(interface)?;
+        match (group, source) {
+            (IpAddr::V4(group), Some(source)) => self.leave_ssm_v4(source, group, resolved.ipv4),
+            (IpAddr::V4(group), None) if group.is_multicast() => {
+                self.leave_multicast_v4(group, resolved.ipv4)
+            }
+            (IpAddr::V4(group), None) => Err(invalid_multicast_group(IpAddr::V4(group))),
+            (IpAddr::V6(group), None) => self.leave_multicast_v6(group, resolved.index),
+            (IpAddr::V6(_), Some(_)) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "IPv6 source-specific multicast is not supported by current librist",
+            )),
+        }
     }
 
     pub fn send_mpegts_payload(&mut self, timestamp: u32, payload: &[u8]) -> io::Result<usize> {
@@ -211,6 +356,167 @@ fn ensure_same_address_family(local: SocketAddr, peer: SocketAddr) -> io::Result
         io::ErrorKind::InvalidInput,
         format!("local address {local} and peer address {peer} use different IP families"),
     ))
+}
+
+fn invalid_multicast_group(group: IpAddr) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("{group} is not a multicast group"),
+    )
+}
+
+fn validate_ssm_v4(source: Ipv4Addr, group: Ipv4Addr) -> io::Result<()> {
+    if !group.is_multicast() {
+        return Err(invalid_multicast_group(IpAddr::V4(group)));
+    }
+    if source.is_unspecified() || source.is_multicast() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{source} is not a valid unicast multicast source"),
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_network_interface(interface: &NetworkInterface) -> io::Result<ResolvedNetworkInterface> {
+    match interface {
+        NetworkInterface::Default => Ok(ResolvedNetworkInterface {
+            index: 0,
+            ipv4: Ipv4Addr::UNSPECIFIED,
+            ipv6: Some(Ipv6Addr::UNSPECIFIED),
+        }),
+        NetworkInterface::Address(IpAddr::V4(ipv4)) => Ok(ResolvedNetworkInterface {
+            index: interface_index_for_address(IpAddr::V4(*ipv4))?.unwrap_or(0),
+            ipv4: *ipv4,
+            ipv6: None,
+        }),
+        NetworkInterface::Address(IpAddr::V6(ipv6)) => Ok(ResolvedNetworkInterface {
+            index: interface_index_for_address(IpAddr::V6(*ipv6))?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    format!("no network interface owns IPv6 address {ipv6}"),
+                )
+            })?,
+            ipv4: Ipv4Addr::UNSPECIFIED,
+            ipv6: Some(*ipv6),
+        }),
+        NetworkInterface::Index(index) => {
+            let ipv4 = interface_ipv4_for_index(*index)?.unwrap_or(Ipv4Addr::UNSPECIFIED);
+            let ipv6 = interface_ipv6_for_index(*index)?;
+            Ok(ResolvedNetworkInterface {
+                index: *index,
+                ipv4,
+                ipv6,
+            })
+        }
+        NetworkInterface::Name(name) => {
+            let index = interface_index_for_name(name)?;
+            let ipv4 = interface_ipv4_for_name(name)?.unwrap_or(Ipv4Addr::UNSPECIFIED);
+            let ipv6 = interface_ipv6_for_name(name)?;
+            Ok(ResolvedNetworkInterface { index, ipv4, ipv6 })
+        }
+    }
+}
+
+#[cfg(unix)]
+fn interface_index_for_name(name: &str) -> io::Result<u32> {
+    nix::net::if_::if_nametoindex(name).map_err(nix_to_io)
+}
+
+#[cfg(not(unix))]
+fn interface_index_for_name(name: &str) -> io::Result<u32> {
+    name.parse().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "this platform requires a numeric multicast interface index",
+        )
+    })
+}
+
+#[cfg(unix)]
+fn interface_ipv4_for_name(name: &str) -> io::Result<Option<Ipv4Addr>> {
+    let addresses = nix::ifaddrs::getifaddrs().map_err(nix_to_io)?;
+    Ok(addresses
+        .filter(|address| address.interface_name == name)
+        .filter_map(|address| address.address)
+        .find_map(|address| address.as_sockaddr_in().map(|address| address.ip())))
+}
+
+#[cfg(not(unix))]
+fn interface_ipv4_for_name(_name: &str) -> io::Result<Option<Ipv4Addr>> {
+    Ok(None)
+}
+
+#[cfg(unix)]
+fn interface_ipv6_for_name(name: &str) -> io::Result<Option<Ipv6Addr>> {
+    let addresses = nix::ifaddrs::getifaddrs().map_err(nix_to_io)?;
+    Ok(addresses
+        .filter(|address| address.interface_name == name)
+        .filter_map(|address| address.address)
+        .find_map(|address| address.as_sockaddr_in6().map(|address| address.ip())))
+}
+
+#[cfg(not(unix))]
+fn interface_ipv6_for_name(_name: &str) -> io::Result<Option<Ipv6Addr>> {
+    Ok(None)
+}
+
+#[cfg(unix)]
+fn interface_ipv4_for_index(index: u32) -> io::Result<Option<Ipv4Addr>> {
+    let name = nix::net::if_::if_indextoname(index)
+        .map_err(nix_to_io)?
+        .to_string_lossy()
+        .into_owned();
+    interface_ipv4_for_name(&name)
+}
+
+#[cfg(not(unix))]
+fn interface_ipv4_for_index(_index: u32) -> io::Result<Option<Ipv4Addr>> {
+    Ok(None)
+}
+
+#[cfg(unix)]
+fn interface_ipv6_for_index(index: u32) -> io::Result<Option<Ipv6Addr>> {
+    let name = nix::net::if_::if_indextoname(index)
+        .map_err(nix_to_io)?
+        .to_string_lossy()
+        .into_owned();
+    interface_ipv6_for_name(&name)
+}
+
+#[cfg(not(unix))]
+fn interface_ipv6_for_index(_index: u32) -> io::Result<Option<Ipv6Addr>> {
+    Ok(None)
+}
+
+#[cfg(unix)]
+fn interface_index_for_address(address: IpAddr) -> io::Result<Option<u32>> {
+    let addresses = nix::ifaddrs::getifaddrs().map_err(nix_to_io)?;
+    for interface in addresses {
+        let matches = match (address, interface.address) {
+            (IpAddr::V4(expected), Some(actual)) => actual
+                .as_sockaddr_in()
+                .is_some_and(|actual| actual.ip() == expected),
+            (IpAddr::V6(expected), Some(actual)) => actual
+                .as_sockaddr_in6()
+                .is_some_and(|actual| actual.ip() == expected),
+            _ => false,
+        };
+        if matches {
+            return interface_index_for_name(&interface.interface_name).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(not(unix))]
+fn interface_index_for_address(_address: IpAddr) -> io::Result<Option<u32>> {
+    Ok(None)
+}
+
+#[cfg(unix)]
+fn nix_to_io(error: nix::errno::Errno) -> io::Error {
+    io::Error::from_raw_os_error(error as i32)
 }
 
 fn simple_rtp_addr(rtcp: SocketAddr) -> io::Result<SocketAddr> {
@@ -489,6 +795,30 @@ impl SimpleMioSender {
         self.rtcp_socket.set_multicast_if_v4(interface)
     }
 
+    pub fn configure_multicast(
+        &self,
+        interface: &NetworkInterface,
+        ttl_or_hops: Option<u8>,
+        loopback: bool,
+    ) -> io::Result<()> {
+        self.rtp_socket.set_multicast_interface(interface)?;
+        self.rtcp_socket.set_multicast_interface(interface)?;
+        if self.local_addr()?.is_ipv4() {
+            self.set_multicast_loop_v4(loopback)?;
+            if let Some(ttl) = ttl_or_hops {
+                self.set_multicast_ttl_v4(u32::from(ttl))?;
+            }
+        } else {
+            self.rtp_socket.set_multicast_loop_v6(loopback)?;
+            self.rtcp_socket.set_multicast_loop_v6(loopback)?;
+            if let Some(hops) = ttl_or_hops {
+                self.rtp_socket.set_multicast_hops_v6(u32::from(hops))?;
+                self.rtcp_socket.set_multicast_hops_v6(u32::from(hops))?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn send_rtcp(&mut self, packet: &[u8]) -> io::Result<usize> {
         self.ensure_rtcp_pending_capacity()?;
         let peer = simple_rtcp_addr(self.peer.ok_or_else(no_remote_peer_error)?)?;
@@ -600,6 +930,30 @@ impl SimpleMioSender {
     pub fn leave_multicast_v4(&self, multiaddr: Ipv4Addr, interface: Ipv4Addr) -> io::Result<()> {
         self.rtp_socket.leave_multicast_v4(multiaddr, interface)?;
         self.rtcp_socket.leave_multicast_v4(multiaddr, interface)
+    }
+
+    pub fn join_multicast(
+        &self,
+        group: IpAddr,
+        interface: &NetworkInterface,
+        source: Option<Ipv4Addr>,
+    ) -> io::Result<()> {
+        self.rtp_socket.join_multicast(group, interface, source)?;
+        let result = self.rtcp_socket.join_multicast(group, interface, source);
+        if result.is_err() {
+            let _ = self.rtp_socket.leave_multicast(group, interface, source);
+        }
+        result
+    }
+
+    pub fn leave_multicast(
+        &self,
+        group: IpAddr,
+        interface: &NetworkInterface,
+        source: Option<Ipv4Addr>,
+    ) -> io::Result<()> {
+        self.rtp_socket.leave_multicast(group, interface, source)?;
+        self.rtcp_socket.leave_multicast(group, interface, source)
     }
 
     fn ensure_rtcp_pending_capacity(&self) -> io::Result<()> {
@@ -780,6 +1134,30 @@ impl SimpleMioReceiver {
     pub fn leave_multicast_v4(&self, multiaddr: Ipv4Addr, interface: Ipv4Addr) -> io::Result<()> {
         self.rtp_socket.leave_multicast_v4(multiaddr, interface)?;
         self.rtcp_socket.leave_multicast_v4(multiaddr, interface)
+    }
+
+    pub fn join_multicast(
+        &self,
+        group: IpAddr,
+        interface: &NetworkInterface,
+        source: Option<Ipv4Addr>,
+    ) -> io::Result<()> {
+        self.rtp_socket.join_multicast(group, interface, source)?;
+        let result = self.rtcp_socket.join_multicast(group, interface, source);
+        if result.is_err() {
+            let _ = self.rtp_socket.leave_multicast(group, interface, source);
+        }
+        result
+    }
+
+    pub fn leave_multicast(
+        &self,
+        group: IpAddr,
+        interface: &NetworkInterface,
+        source: Option<Ipv4Addr>,
+    ) -> io::Result<()> {
+        self.rtp_socket.leave_multicast(group, interface, source)?;
+        self.rtcp_socket.leave_multicast(group, interface, source)
     }
 }
 
@@ -1547,6 +1925,27 @@ impl MainMioSender {
         self.socket.set_multicast_if_v4(interface)
     }
 
+    pub fn configure_multicast(
+        &self,
+        interface: &NetworkInterface,
+        ttl_or_hops: Option<u8>,
+        loopback: bool,
+    ) -> io::Result<()> {
+        self.socket.set_multicast_interface(interface)?;
+        if self.local_addr()?.is_ipv4() {
+            self.socket.set_multicast_loop_v4(loopback)?;
+            if let Some(ttl) = ttl_or_hops {
+                self.socket.set_multicast_ttl_v4(u32::from(ttl))?;
+            }
+        } else {
+            self.socket.set_multicast_loop_v6(loopback)?;
+            if let Some(hops) = ttl_or_hops {
+                self.socket.set_multicast_hops_v6(u32::from(hops))?;
+            }
+        }
+        Ok(())
+    }
+
     fn handle_eapol_frame_from(
         &mut self,
         from: SocketAddr,
@@ -2110,6 +2509,27 @@ impl MainMioMultiSender {
 
     pub fn set_multicast_if_v4(&self, interface: Ipv4Addr) -> io::Result<()> {
         self.socket.set_multicast_if_v4(interface)
+    }
+
+    pub fn configure_multicast(
+        &self,
+        interface: &NetworkInterface,
+        ttl_or_hops: Option<u8>,
+        loopback: bool,
+    ) -> io::Result<()> {
+        self.socket.set_multicast_interface(interface)?;
+        if self.local_addr()?.is_ipv4() {
+            self.socket.set_multicast_loop_v4(loopback)?;
+            if let Some(ttl) = ttl_or_hops {
+                self.socket.set_multicast_ttl_v4(u32::from(ttl))?;
+            }
+        } else {
+            self.socket.set_multicast_loop_v6(loopback)?;
+            if let Some(hops) = ttl_or_hops {
+                self.socket.set_multicast_hops_v6(u32::from(hops))?;
+            }
+        }
+        Ok(())
     }
 
     pub fn stats(&self) -> SenderStats {
@@ -2932,6 +3352,24 @@ impl MainMioReceiver {
         self.socket.leave_multicast_v4(multiaddr, interface)
     }
 
+    pub fn join_multicast(
+        &self,
+        group: IpAddr,
+        interface: &NetworkInterface,
+        source: Option<Ipv4Addr>,
+    ) -> io::Result<()> {
+        self.socket.join_multicast(group, interface, source)
+    }
+
+    pub fn leave_multicast(
+        &self,
+        group: IpAddr,
+        interface: &NetworkInterface,
+        source: Option<Ipv4Addr>,
+    ) -> io::Result<()> {
+        self.socket.leave_multicast(group, interface, source)
+    }
+
     pub fn missing_sequences(&self) -> Vec<u32> {
         self.last_peer
             .and_then(|peer| self.peer_runtime.get(&peer))
@@ -3042,6 +3480,21 @@ mod tests {
 
     fn ipv6_loopback_any() -> SocketAddr {
         SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0))
+    }
+
+    fn loopback_interface() -> NetworkInterface {
+        #[cfg(target_os = "macos")]
+        {
+            NetworkInterface::Name("lo0".to_string())
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            NetworkInterface::Name("lo".to_string())
+        }
+        #[cfg(not(unix))]
+        {
+            NetworkInterface::Address(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        }
     }
 
     #[cfg(unix)]
@@ -3898,12 +4351,11 @@ mod tests {
         assert_eq!(received.payload, payload);
     }
 
-    #[cfg(not(target_os = "macos"))]
     #[test]
-    fn simple_profile_receives_multicast_payload() {
+    fn simple_profile_receives_ipv4_asm_payload_on_named_interface() {
         let flow_id = 0x1122_3344;
-        let interface = Ipv4Addr::UNSPECIFIED;
-        let mut receiver = SimpleMioReceiver::bind(
+        let interface = loopback_interface();
+        let mut receiver = SimpleMioReceiver::bind_reuse(
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
             flow_id,
             "rust",
@@ -3913,20 +4365,15 @@ mod tests {
         let port = receiver.local_addr().unwrap().port();
         let group = Ipv4Addr::new(239, 255, (port >> 8) as u8, port as u8);
         let multicast_addr = SocketAddr::V4(SocketAddrV4::new(group, port));
-        receiver.join_multicast_v4(group, interface).unwrap();
-
-        let mut sender = SimpleMioSender::connect(loopback_any(), multicast_addr, flow_id, 64)
-            .or_else(|_| {
-                SimpleMioSender::connect(
-                    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
-                    multicast_addr,
-                    flow_id,
-                    64,
-                )
-            })
+        receiver
+            .join_multicast(IpAddr::V4(group), &interface, None)
             .unwrap();
-        sender.set_multicast_loop_v4(true).unwrap();
-        sender.set_multicast_ttl_v4(1).unwrap();
+
+        let mut sender =
+            SimpleMioSender::connect(loopback_any(), multicast_addr, flow_id, 64).unwrap();
+        sender
+            .configure_multicast(&interface, Some(1), true)
+            .unwrap();
 
         for _ in 0..5 {
             sender
@@ -3943,7 +4390,90 @@ mod tests {
         let received = recv_payload_eventually(&mut receiver, &mut rx_buf);
         assert_eq!(received.payload, b"multicast");
 
-        receiver.leave_multicast_v4(group, interface).unwrap();
+        receiver
+            .leave_multicast(IpAddr::V4(group), &interface, None)
+            .unwrap();
+    }
+
+    #[test]
+    fn ipv4_ssm_accepts_the_configured_source() {
+        let interface = NetworkInterface::Address(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let mut receiver = RtpUdpSocket::bind_reuse(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
+            1,
+        )
+        .unwrap();
+        let port = receiver.local_addr().unwrap().port();
+        let group = Ipv4Addr::new(232, 255, (port >> 8) as u8, port as u8);
+        let destination = SocketAddr::V4(SocketAddrV4::new(group, port));
+        receiver
+            .join_multicast(IpAddr::V4(group), &interface, Some(Ipv4Addr::LOCALHOST))
+            .unwrap();
+
+        let mut buf = [0u8; 64];
+        let mut accepted = RtpUdpSocket::bind(loopback_any(), 3).unwrap();
+        accepted.set_multicast_interface(&interface).unwrap();
+        accepted.send_packet_to(destination, b"accepted").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Some((from, payload)) = receiver.recv_datagram(&mut buf).unwrap() {
+                assert_eq!(from.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+                assert_eq!(payload, b"accepted");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the accepted SSM source"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        receiver
+            .leave_multicast(IpAddr::V4(group), &interface, Some(Ipv4Addr::LOCALHOST))
+            .unwrap();
+    }
+
+    #[test]
+    fn main_profile_receives_ipv6_asm_payload_on_named_interface() {
+        let flow_id = 0x1122_3344;
+        let interface = loopback_interface();
+        let resolved = resolve_network_interface(&interface).unwrap();
+        let mut receiver = MainMioReceiver::bind_reuse(
+            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0)),
+            flow_id,
+            "rust",
+            NackMode::Range,
+        )
+        .unwrap();
+        let port = receiver.local_addr().unwrap().port();
+        let group = "ff02::114".parse::<Ipv6Addr>().unwrap();
+        let destination = SocketAddr::V6(SocketAddrV6::new(group, port, 0, resolved.index));
+        receiver
+            .join_multicast(IpAddr::V6(group), &interface, None)
+            .unwrap();
+
+        let mut sender =
+            MainMioSender::connect(ipv6_loopback_any(), destination, flow_id, 64).unwrap();
+        sender
+            .configure_multicast(&interface, Some(1), true)
+            .unwrap();
+        for _ in 0..5 {
+            sender
+                .send_payload(
+                    b"ipv6-multicast",
+                    ntp_from_unix_duration(Duration::from_secs(1)),
+                    Instant::now(),
+                )
+                .unwrap();
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let mut buf = [0u8; 1500];
+        let received = recv_main_payload_eventually(&mut receiver, &mut buf);
+        assert_eq!(received.payload, b"ipv6-multicast");
+        receiver
+            .leave_multicast(IpAddr::V6(group), &interface, None)
+            .unwrap();
     }
 
     #[test]

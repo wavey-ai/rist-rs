@@ -18,7 +18,7 @@ pub mod mio {
     pub use rist_mio::{
         MainMioMultiSend, MainMioMultiSender, MainMioPeer, MainMioPeerControlPacket,
         MainMioPeerPacket, MainMioReceiver, MainMioSender, MainMioSessionPoll, MainSenderEvent,
-        RtpUdpSocket, SimpleMioReceiver, SimpleMioSender,
+        NetworkInterface, RtpUdpSocket, SimpleMioReceiver, SimpleMioSender,
     };
 }
 
@@ -61,6 +61,9 @@ pub enum Error {
 
     #[error("address did not resolve: {0}")]
     AddressResolution(String),
+
+    #[error("invalid multicast configuration: {0}")]
+    InvalidMulticastConfig(String),
 
     #[error(transparent)]
     OrderedOutput(#[from] rist_core::OrderedPayloadBufferError),
@@ -109,7 +112,10 @@ pub struct SenderBuilder {
     history_packets: usize,
     virtual_ports: VirtualPorts,
     session_config: MainSessionConfig,
-    multicast_interface_v4: Option<Ipv4Addr>,
+    network_interface: rist_mio::NetworkInterface,
+    multicast_ttl: Option<u8>,
+    multicast_loopback: bool,
+    local_port: Option<u16>,
     initial_rtp_sequence: Option<u32>,
     null_packet_suppression: bool,
     psk: Option<PskOptions>,
@@ -132,7 +138,10 @@ impl SenderBuilder {
             history_packets: 1024,
             virtual_ports: VirtualPorts::default(),
             session_config: MainSessionConfig::default(),
-            multicast_interface_v4: None,
+            network_interface: rist_mio::NetworkInterface::Default,
+            multicast_ttl: None,
+            multicast_loopback: true,
+            local_port: None,
             initial_rtp_sequence: None,
             null_packet_suppression: false,
             psk: None,
@@ -183,6 +192,8 @@ impl SenderBuilder {
                 "password",
                 "srp-compat",
                 "miface",
+                "ttl",
+                "local-port",
                 "rtp-sequence",
                 "virt-src-port",
                 "virt-dst-port",
@@ -211,16 +222,15 @@ impl SenderBuilder {
             self.srp_store = None;
         }
         self.srp_compat_legacy = config.srp_compat_legacy;
-        self.multicast_interface_v4 = parse_miface_v4(config.endpoint.miface.as_deref())?;
+        self.network_interface = parse_network_interface(config.endpoint.miface.as_deref());
+        self.multicast_ttl = config.endpoint.multicast_ttl;
+        self.local_port = config.endpoint.local_port;
         self.initial_rtp_sequence = parse_nonnegative_i32(config.advanced.rtp_sequence);
         self.virtual_ports = config.virtual_ports;
         self.session_config = config.connection.into();
         self.recovery = config.recovery;
         self.congestion_control = config.congestion_control;
         let peer = resolve_endpoint(&config.endpoint, self.local_explicit.then_some(self.local))?;
-        if !self.local_explicit {
-            self.local = default_local_for_peer(peer);
-        }
         self.peer = Some(peer);
         self.listening = false;
         Ok(self)
@@ -241,7 +251,6 @@ impl SenderBuilder {
                 "username",
                 "password",
                 "srp-compat",
-                "miface",
                 "rtp-sequence",
                 "virt-src-port",
                 "virt-dst-port",
@@ -272,7 +281,6 @@ impl SenderBuilder {
             self.srp_client = None;
         }
         self.srp_compat_legacy = config.srp_compat_legacy;
-        self.multicast_interface_v4 = parse_miface_v4(config.endpoint.miface.as_deref())?;
         self.initial_rtp_sequence = parse_nonnegative_i32(config.advanced.rtp_sequence);
         self.virtual_ports = config.virtual_ports;
         self.session_config = config.connection.into();
@@ -306,7 +314,27 @@ impl SenderBuilder {
     }
 
     pub fn multicast_interface_v4(mut self, interface: Ipv4Addr) -> Self {
-        self.multicast_interface_v4 = Some(interface);
+        self.network_interface = rist_mio::NetworkInterface::Address(IpAddr::V4(interface));
+        self
+    }
+
+    pub fn network_interface(mut self, interface: rist_mio::NetworkInterface) -> Self {
+        self.network_interface = interface;
+        self
+    }
+
+    pub fn multicast_ttl(mut self, ttl: u8) -> Self {
+        self.multicast_ttl = Some(ttl);
+        self
+    }
+
+    pub fn multicast_loopback(mut self, enabled: bool) -> Self {
+        self.multicast_loopback = enabled;
+        self
+    }
+
+    pub fn local_port(mut self, port: u16) -> Self {
+        self.local_port = Some(port);
         self
     }
 
@@ -353,12 +381,33 @@ impl SenderBuilder {
         self
     }
 
-    pub fn connect(self) -> Result<Sender> {
-        let peer = if self.listening {
+    pub fn connect(mut self) -> Result<Sender> {
+        let mut peer = if self.listening {
             None
         } else {
             Some(self.peer.ok_or(Error::MissingPeer)?)
         };
+        if let Some(peer) = &mut peer {
+            configure_peer_network(
+                &mut self.local,
+                self.local_explicit,
+                peer,
+                &self.network_interface,
+                self.local_port,
+            )?;
+            if self.multicast_ttl.is_some() && !peer.ip().is_multicast() {
+                return Err(Error::InvalidMulticastConfig(
+                    "ttl requires a multicast peer".to_string(),
+                ));
+            }
+        } else if let Some(port) = self.local_port {
+            self.local.set_port(port);
+        }
+        if self.multicast_ttl == Some(0) {
+            return Err(Error::InvalidMulticastConfig(
+                "multicast TTL or hop limit must be between 1 and 255".to_string(),
+            ));
+        }
         match self.profile {
             Profile::Simple => {
                 let mut sender = match peer {
@@ -374,8 +423,12 @@ impl SenderBuilder {
                         self.history_packets,
                     )?,
                 };
-                if let Some(interface) = self.multicast_interface_v4 {
-                    sender.set_multicast_if_v4(interface)?;
+                if peer.is_some_and(|peer| peer.ip().is_multicast()) {
+                    sender.configure_multicast(
+                        &self.network_interface,
+                        self.multicast_ttl,
+                        self.multicast_loopback,
+                    )?;
                 }
                 if let Some(sequence) = self.initial_rtp_sequence {
                     sender.set_next_sequence(sequence);
@@ -403,8 +456,12 @@ impl SenderBuilder {
                 sender.set_ports(self.virtual_ports.src, self.virtual_ports.dst);
                 sender.set_session_config(self.session_config);
                 sender.set_recovery_config(self.recovery, self.congestion_control);
-                if let Some(interface) = self.multicast_interface_v4 {
-                    sender.set_multicast_if_v4(interface)?;
+                if peer.is_some_and(|peer| peer.ip().is_multicast()) {
+                    sender.configure_multicast(
+                        &self.network_interface,
+                        self.multicast_ttl,
+                        self.multicast_loopback,
+                    )?;
                 }
                 if let Some(sequence) = self.initial_rtp_sequence {
                     sender.set_next_rtp_sequence(sequence);
@@ -900,6 +957,10 @@ pub struct ReceiverBuilder {
     srp_compat_legacy: bool,
     recovery: RecoveryConfig,
     congestion_control: CongestionControlMode,
+    network_interface: rist_mio::NetworkInterface,
+    multicast_group: Option<IpAddr>,
+    multicast_source: Option<Ipv4Addr>,
+    local_port: Option<u16>,
 }
 
 impl ReceiverBuilder {
@@ -920,6 +981,10 @@ impl ReceiverBuilder {
             srp_compat_legacy: false,
             recovery: RecoveryConfig::default(),
             congestion_control: CongestionControlMode::default(),
+            network_interface: rist_mio::NetworkInterface::Default,
+            multicast_group: None,
+            multicast_source: None,
+            local_port: None,
         }
     }
 
@@ -954,6 +1019,8 @@ impl ReceiverBuilder {
                 "username",
                 "password",
                 "srp-compat",
+                "miface",
+                "source",
                 "session-timeout",
                 "keepalive-interval",
                 "profile",
@@ -987,7 +1054,29 @@ impl ReceiverBuilder {
         self.session_config = config.connection.into();
         self.recovery = config.recovery;
         self.congestion_control = config.congestion_control;
-        self.local = resolve_endpoint(&config.endpoint, None)?;
+        self.network_interface = parse_network_interface(config.endpoint.miface.as_deref());
+        self.multicast_source = config.endpoint.multicast_source;
+        let endpoint = resolve_endpoint(&config.endpoint, None)?;
+        if endpoint.ip().is_multicast() {
+            if endpoint.is_ipv6() && self.multicast_source.is_some() {
+                return Err(Error::InvalidMulticastConfig(
+                    "current librist supports source-specific multicast only for IPv4".to_string(),
+                ));
+            }
+            self.multicast_group = Some(endpoint.ip());
+            self.local = unspecified_for(endpoint);
+        } else {
+            if self.multicast_source.is_some() {
+                return Err(Error::InvalidMulticastConfig(
+                    "source requires an IPv4 multicast listen address".to_string(),
+                ));
+            }
+            if config.endpoint.miface.is_some() {
+                return Err(Error::UnsupportedUrlOption("miface".to_string()));
+            }
+            self.multicast_group = None;
+            self.local = endpoint;
+        }
         self.local_explicit = true;
         self.peer = None;
         self.listening = true;
@@ -1010,6 +1099,8 @@ impl ReceiverBuilder {
                 "username",
                 "password",
                 "srp-compat",
+                "miface",
+                "local-port",
                 "session-timeout",
                 "keepalive-interval",
                 "profile",
@@ -1041,9 +1132,13 @@ impl ReceiverBuilder {
         self.session_config = config.connection.into();
         self.recovery = config.recovery;
         self.congestion_control = config.congestion_control;
+        self.network_interface = parse_network_interface(config.endpoint.miface.as_deref());
+        self.local_port = config.endpoint.local_port;
         let peer = resolve_endpoint(&config.endpoint, self.local_explicit.then_some(self.local))?;
-        if !self.local_explicit {
-            self.local = default_local_for_peer(peer);
+        if peer.ip().is_multicast() {
+            return Err(Error::InvalidMulticastConfig(
+                "multicast receivers must use a listen URL".to_string(),
+            ));
         }
         self.peer = Some(peer);
         self.listening = false;
@@ -1067,6 +1162,35 @@ impl ReceiverBuilder {
 
     pub fn session_config(mut self, config: MainSessionConfig) -> Self {
         self.session_config = config;
+        self
+    }
+
+    pub fn network_interface(mut self, interface: rist_mio::NetworkInterface) -> Self {
+        self.network_interface = interface;
+        self
+    }
+
+    pub fn multicast_interface_v4(mut self, interface: Ipv4Addr) -> Self {
+        self.network_interface = rist_mio::NetworkInterface::Address(IpAddr::V4(interface));
+        self
+    }
+
+    pub fn multicast_source_v4(mut self, source: Ipv4Addr) -> Self {
+        self.multicast_source = Some(source);
+        self
+    }
+
+    pub fn local_port(mut self, port: u16) -> Self {
+        self.local_port = Some(port);
+        self
+    }
+
+    pub fn listen_multicast(mut self, group: SocketAddr) -> Self {
+        self.multicast_group = Some(group.ip());
+        self.local = unspecified_for(group);
+        self.local_explicit = true;
+        self.peer = None;
+        self.listening = true;
         self
     }
 
@@ -1114,12 +1238,32 @@ impl ReceiverBuilder {
         self
     }
 
-    pub fn bind(self) -> Result<Receiver> {
-        let peer = if self.listening {
+    pub fn bind(mut self) -> Result<Receiver> {
+        let mut peer = if self.listening {
             None
         } else {
             Some(self.peer.ok_or(Error::MissingPeer)?)
         };
+        if let Some(peer) = &mut peer {
+            configure_peer_network(
+                &mut self.local,
+                self.local_explicit,
+                peer,
+                &self.network_interface,
+                self.local_port,
+            )?;
+        } else if let Some(port) = self.local_port {
+            self.local.set_port(port);
+        }
+        if self.multicast_source.is_some()
+            && !self
+                .multicast_group
+                .is_some_and(|group| matches!(group, IpAddr::V4(_)))
+        {
+            return Err(Error::InvalidMulticastConfig(
+                "source requires an IPv4 multicast listen address".to_string(),
+            ));
+        }
         match self.profile {
             Profile::Simple => {
                 let mut receiver = match peer {
@@ -1130,6 +1274,14 @@ impl ReceiverBuilder {
                         self.cname,
                         self.nack_mode,
                     )?,
+                    None if self.multicast_group.is_some() => {
+                        rist_mio::SimpleMioReceiver::bind_reuse(
+                            self.local,
+                            self.flow_id,
+                            self.cname,
+                            self.nack_mode,
+                        )?
+                    }
                     None => rist_mio::SimpleMioReceiver::bind(
                         self.local,
                         self.flow_id,
@@ -1138,6 +1290,13 @@ impl ReceiverBuilder {
                     )?,
                 };
                 receiver.set_recovery_config(self.recovery, self.congestion_control);
+                if let Some(group) = self.multicast_group {
+                    receiver.join_multicast(
+                        group,
+                        &self.network_interface,
+                        self.multicast_source,
+                    )?;
+                }
                 Ok(Receiver::Simple(receiver))
             }
             Profile::Main => {
@@ -1149,6 +1308,14 @@ impl ReceiverBuilder {
                         self.cname,
                         self.nack_mode,
                     )?,
+                    None if self.multicast_group.is_some() => {
+                        rist_mio::MainMioReceiver::bind_reuse(
+                            self.local,
+                            self.flow_id,
+                            self.cname,
+                            self.nack_mode,
+                        )?
+                    }
                     None => rist_mio::MainMioReceiver::bind(
                         self.local,
                         self.flow_id,
@@ -1158,6 +1325,13 @@ impl ReceiverBuilder {
                 };
                 receiver.set_session_config(self.session_config);
                 receiver.set_recovery_config(self.recovery, self.congestion_control);
+                if let Some(group) = self.multicast_group {
+                    receiver.join_multicast(
+                        group,
+                        &self.network_interface,
+                        self.multicast_source,
+                    )?;
+                }
                 if let Some(psk) = self.psk {
                     receiver.set_tx_key(psk.tx_key()?);
                     receiver.set_rx_key(psk.rx_key()?);
@@ -1408,6 +1582,15 @@ fn default_local_for_peer(peer: SocketAddr) -> SocketAddr {
     SocketAddr::new(ip, 0)
 }
 
+fn unspecified_for(address: SocketAddr) -> SocketAddr {
+    let ip = if address.is_ipv4() {
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+    } else {
+        IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+    };
+    SocketAddr::new(ip, address.port())
+}
+
 fn resolve_endpoint(endpoint: &Endpoint, preferred: Option<SocketAddr>) -> Result<SocketAddr> {
     let address = format_endpoint(endpoint);
     let addresses = (endpoint.host.as_str(), endpoint.port)
@@ -1431,6 +1614,43 @@ fn format_endpoint(endpoint: &Endpoint) -> String {
     } else {
         format!("{}:{}", endpoint.host, endpoint.port)
     }
+}
+
+fn parse_network_interface(miface: Option<&str>) -> rist_mio::NetworkInterface {
+    miface.map_or(rist_mio::NetworkInterface::Default, |value| {
+        rist_mio::NetworkInterface::from_miface(value)
+    })
+}
+
+fn configure_peer_network(
+    local: &mut SocketAddr,
+    local_explicit: bool,
+    peer: &mut SocketAddr,
+    interface: &rist_mio::NetworkInterface,
+    local_port: Option<u16>,
+) -> Result<()> {
+    if let SocketAddr::V6(peer_v6) = peer {
+        if peer_v6.ip().is_multicast() && peer_v6.scope_id() == 0 {
+            let interface_index = rist_mio::network_interface_index(interface)?;
+            if interface_index != 0 {
+                peer_v6.set_scope_id(interface_index);
+            }
+        }
+    }
+    if !local_explicit {
+        *local = if matches!(interface, rist_mio::NetworkInterface::Default) {
+            default_local_for_peer(*peer)
+        } else {
+            SocketAddr::new(
+                rist_mio::network_interface_address(interface, peer.is_ipv4())?,
+                0,
+            )
+        };
+    }
+    if let Some(port) = local_port {
+        local.set_port(port);
+    }
+    Ok(())
 }
 
 fn parse_miface_v4(miface: Option<&str>) -> Result<Option<Ipv4Addr>> {
@@ -1469,6 +1689,7 @@ mod tests {
     use super::*;
     use rist_core::packet::gre::{KeepalivePacket, ReducedPacket};
     use rist_core::packet::rtp::RtpPacket;
+    use std::net::UdpSocket;
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -1488,6 +1709,44 @@ mod tests {
         let reduced = ReducedPacket::decode(&buf[..len]).unwrap();
         let rtp = RtpPacket::decode(reduced.payload).unwrap();
         rtp.payload.to_vec()
+    }
+
+    fn loopback_miface() -> &'static str {
+        #[cfg(target_os = "macos")]
+        {
+            "lo0"
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            "lo"
+        }
+        #[cfg(not(unix))]
+        {
+            "127.0.0.1"
+        }
+    }
+
+    fn next_even_port_pair() -> u16 {
+        for _ in 0..128 {
+            let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let port = socket.local_addr().unwrap().port();
+            drop(socket);
+            let base = if port % 2 == 0 {
+                port
+            } else {
+                port.saturating_add(1)
+            };
+            if base == u16::MAX {
+                continue;
+            }
+            if let (Ok(_rtp), Ok(_rtcp)) = (
+                UdpSocket::bind((Ipv4Addr::LOCALHOST, base)),
+                UdpSocket::bind((Ipv4Addr::LOCALHOST, base + 1)),
+            ) {
+                return base;
+            }
+        }
+        panic!("failed to allocate an even UDP port pair");
     }
 
     fn drive_srp_authentication(
@@ -1594,6 +1853,176 @@ mod tests {
             let mut buf = [0u8; 1500];
             let payload = recv_eventually(&mut receiver, &mut buf);
             assert_eq!(payload.payload, b"ipv6-builder");
+        }
+    }
+
+    #[test]
+    fn multicast_urls_round_trip_ipv4_asm_for_both_profiles() {
+        for profile in [Profile::Simple, Profile::Main] {
+            let port = next_even_port_pair();
+            let group = Ipv4Addr::new(239, 254, (port >> 8) as u8, port as u8);
+            let listener_url = format!("rist://@{group}:{port}?miface={}", loopback_miface());
+            let mut receiver = Receiver::builder(profile)
+                .listen_url(&listener_url)
+                .unwrap()
+                .bind()
+                .unwrap();
+
+            let local_port = next_even_port_pair();
+            let sender_url = format!(
+                "rist://{group}:{port}?miface={}&ttl=1&local-port={local_port}",
+                loopback_miface()
+            );
+            let mut sender = Sender::builder(profile)
+                .peer_url(&sender_url)
+                .unwrap()
+                .connect()
+                .unwrap();
+            assert_eq!(sender.local_addr().unwrap().port(), local_port);
+
+            for _ in 0..5 {
+                sender.send(b"ipv4-asm").unwrap();
+                thread::sleep(Duration::from_millis(10));
+            }
+            let mut buf = [0u8; 1500];
+            let payload = recv_eventually(&mut receiver, &mut buf);
+            assert_eq!(payload.payload, b"ipv4-asm");
+        }
+    }
+
+    #[test]
+    fn multicast_urls_round_trip_ipv4_ssm() {
+        let port = next_even_port_pair();
+        let group = Ipv4Addr::new(232, 254, (port >> 8) as u8, port as u8);
+        let listener_url = format!("rist://@{group}:{port}?miface=127.0.0.1&source=127.0.0.1");
+        let mut receiver = Receiver::builder(Profile::Main)
+            .listen_url(&listener_url)
+            .unwrap()
+            .bind()
+            .unwrap();
+        let sender_url = format!("rist://{group}:{port}?miface=127.0.0.1&ttl=1");
+        let mut sender = Sender::builder(Profile::Main)
+            .peer_url(&sender_url)
+            .unwrap()
+            .connect()
+            .unwrap();
+
+        sender.send(b"ipv4-ssm").unwrap();
+        let mut buf = [0u8; 1500];
+        let payload = recv_eventually(&mut receiver, &mut buf);
+        assert_eq!(payload.payload, b"ipv4-ssm");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn multicast_urls_round_trip_ipv6_asm_for_both_profiles() {
+        for profile in [Profile::Simple, Profile::Main] {
+            let port = next_even_port_pair();
+            let group = "ff02::114".parse::<Ipv6Addr>().unwrap();
+            let listener_url = format!("rist://@[{group}]:{port}?miface={}", loopback_miface());
+            let mut receiver = Receiver::builder(profile)
+                .listen_url(&listener_url)
+                .unwrap()
+                .bind()
+                .unwrap();
+            let sender_url = format!("rist://[{group}]:{port}?miface={}&ttl=1", loopback_miface());
+            let mut sender = Sender::builder(profile)
+                .peer_url(&sender_url)
+                .unwrap()
+                .connect()
+                .unwrap();
+
+            for _ in 0..5 {
+                sender.send(b"ipv6-asm").unwrap();
+                thread::sleep(Duration::from_millis(10));
+            }
+            let mut buf = [0u8; 1500];
+            let payload = recv_eventually(&mut receiver, &mut buf);
+            assert_eq!(payload.payload, b"ipv6-asm");
+        }
+    }
+
+    #[test]
+    fn multicast_builders_reject_invalid_role_and_option_combinations() {
+        assert!(matches!(
+            Sender::builder(Profile::Main)
+                .peer_url("rist://127.0.0.1:9000?ttl=1")
+                .unwrap()
+                .connect(),
+            Err(Error::InvalidMulticastConfig(_))
+        ));
+        assert!(matches!(
+            Receiver::builder(Profile::Main).listen_url("rist://@127.0.0.1:9000?source=127.0.0.1"),
+            Err(Error::InvalidMulticastConfig(_))
+        ));
+        assert!(matches!(
+            Receiver::builder(Profile::Main).peer_url("rist://239.0.0.1:9000"),
+            Err(Error::InvalidMulticastConfig(_))
+        ));
+    }
+
+    #[test]
+    fn local_port_urls_bind_sender_and_receiver_callers_for_both_profiles() {
+        for profile in [Profile::Simple, Profile::Main] {
+            let mut receiver = Receiver::builder(profile).bind().unwrap();
+            let receiver_addr = receiver.local_addr().unwrap();
+            let sender_port = next_even_port_pair();
+            let sender_url = format!(
+                "rist://127.0.0.1:{}?local-port={sender_port}",
+                receiver_addr.port()
+            );
+            let mut sender = Sender::builder(profile)
+                .peer_url(&sender_url)
+                .unwrap()
+                .connect()
+                .unwrap();
+            assert_eq!(sender.local_addr().unwrap().port(), sender_port);
+            sender.send(b"sender-local-port").unwrap();
+            let mut buf = [0u8; 1500];
+            assert_eq!(
+                recv_eventually(&mut receiver, &mut buf).payload,
+                b"sender-local-port"
+            );
+
+            let mut listener = Sender::builder(profile)
+                .listen_addr(loopback_any())
+                .connect()
+                .unwrap();
+            let listener_addr = listener.local_addr().unwrap();
+            let caller_port = next_even_port_pair();
+            let caller_url = format!(
+                "rist://127.0.0.1:{}?local-port={caller_port}",
+                listener_addr.port()
+            );
+            let mut caller = Receiver::builder(profile)
+                .peer_url(&caller_url)
+                .unwrap()
+                .bind()
+                .unwrap();
+            assert_eq!(caller.local_addr().unwrap().port(), caller_port);
+            caller.send_feedback().unwrap().unwrap();
+
+            let mut control = [0u8; 1500];
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                listener
+                    .try_recv_feedback_and_retransmit(&mut control)
+                    .unwrap();
+                match listener.send(b"receiver-local-port") {
+                    Ok(_) => break,
+                    Err(Error::Io(error)) if error.kind() == io::ErrorKind::NotConnected => {}
+                    Err(error) => panic!("listener send failed: {error}"),
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out discovering the receiver caller"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(
+                recv_eventually(&mut caller, &mut buf).payload,
+                b"receiver-local-port"
+            );
         }
     }
 

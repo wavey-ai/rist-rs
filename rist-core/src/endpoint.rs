@@ -1,6 +1,7 @@
 use crate::main_profile::{DEFAULT_VIRT_DST_PORT, DEFAULT_VIRT_SRC_PORT};
 use crate::{Error, Profile, Result};
 use std::fmt;
+use std::net::Ipv4Addr;
 use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9,6 +10,9 @@ pub struct Endpoint {
     pub port: u16,
     pub listen: bool,
     pub miface: Option<String>,
+    pub multicast_ttl: Option<u8>,
+    pub multicast_source: Option<Ipv4Addr>,
+    pub local_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,6 +187,9 @@ impl PeerConfig {
     pub fn parse(url: &str) -> Result<Self> {
         let parsed = parse_rist_url(url)?;
         let mut miface = None;
+        let mut multicast_ttl = None;
+        let mut multicast_source = None;
+        let mut local_port = None;
         let mut virtual_ports = VirtualPorts::default();
         let mut recovery = RecoveryConfig::default();
         let mut congestion_control = CongestionControlMode::default();
@@ -230,6 +237,9 @@ impl PeerConfig {
                 "virt-src-port" => virtual_ports.src = parse_u16(key, value)?,
                 "virt-dst-port" => virtual_ports.dst = parse_u16(key, value)?,
                 "miface" => miface = non_empty_string(value),
+                "ttl" => multicast_ttl = Some(parse_nonzero_u8(key, value)?),
+                "source" => multicast_source = Some(parse_ipv4(key, value)?),
+                "local-port" => local_port = Some(parse_nonzero_u16(key, value)?),
                 "weight" => advanced.weight = parse_u32(key, value)?,
                 "compression" => advanced.compression = Some(parse_i32(key, value)?),
                 "session-timeout" => connection.session_timeout = parse_millis(key, value)?,
@@ -318,6 +328,9 @@ impl PeerConfig {
                 port: parsed.port,
                 listen: parsed.listen,
                 miface,
+                multicast_ttl,
+                multicast_source,
+                local_port,
             },
             virtual_ports,
             recovery,
@@ -434,6 +447,35 @@ fn parse_u8(key: &str, value: &str) -> Result<u8> {
     })
 }
 
+fn parse_nonzero_u8(key: &str, value: &str) -> Result<u8> {
+    let parsed = parse_u8(key, value)?;
+    if parsed == 0 {
+        return Err(Error::InvalidQueryValue {
+            key: key.to_string(),
+            value: value.to_string(),
+        });
+    }
+    Ok(parsed)
+}
+
+fn parse_nonzero_u16(key: &str, value: &str) -> Result<u16> {
+    let parsed = parse_u16(key, value)?;
+    if parsed == 0 {
+        return Err(Error::InvalidQueryValue {
+            key: key.to_string(),
+            value: value.to_string(),
+        });
+    }
+    Ok(parsed)
+}
+
+fn parse_ipv4(key: &str, value: &str) -> Result<Ipv4Addr> {
+    value.parse().map_err(|_| Error::InvalidQueryValue {
+        key: key.to_string(),
+        value: value.to_string(),
+    })
+}
+
 fn parse_u64(key: &str, value: &str) -> Result<u64> {
     value.parse().map_err(|_| Error::InvalidQueryValue {
         key: key.to_string(),
@@ -529,6 +571,9 @@ mod tests {
         assert_eq!(config.endpoint.port, 5000);
         assert!(config.endpoint.listen);
         assert_eq!(config.endpoint.miface, None);
+        assert_eq!(config.endpoint.multicast_ttl, None);
+        assert_eq!(config.endpoint.multicast_source, None);
+        assert_eq!(config.endpoint.local_port, None);
     }
 
     #[test]
@@ -560,13 +605,19 @@ mod tests {
     #[test]
     fn parses_extended_librist_url_options() {
         let config = PeerConfig::parse(
-            "rist://example.com:8000?virt-src-port=9000&virt-dst-port=9001&miface=en0&session-timeout=5000&keepalive-interval=700&congestion-control=aggressive&timing-mode=arrival&weight=4&compression=1&stream-id=3&rtp-timestamp=11&rtp-sequence=12&rtp-ptype=98&multiplex-mode=virt-src-port&multiplex-filter=abcd&profile=advanced&verbose-level=7&username=user&password=pass",
+            "rist://example.com:8000?virt-src-port=9000&virt-dst-port=9001&miface=en0&ttl=42&source=192.0.2.1&local-port=7000&session-timeout=5000&keepalive-interval=700&congestion-control=aggressive&timing-mode=arrival&weight=4&compression=1&stream-id=3&rtp-timestamp=11&rtp-sequence=12&rtp-ptype=98&multiplex-mode=virt-src-port&multiplex-filter=abcd&profile=advanced&verbose-level=7&username=user&password=pass",
         )
         .unwrap();
 
         assert_eq!(config.virtual_ports.src, 9000);
         assert_eq!(config.virtual_ports.dst, 9001);
         assert_eq!(config.endpoint.miface.as_deref(), Some("en0"));
+        assert_eq!(config.endpoint.multicast_ttl, Some(42));
+        assert_eq!(
+            config.endpoint.multicast_source,
+            Some(Ipv4Addr::new(192, 0, 2, 1))
+        );
+        assert_eq!(config.endpoint.local_port, Some(7000));
         assert_eq!(
             config.connection.session_timeout,
             Duration::from_millis(5000)
@@ -592,6 +643,22 @@ mod tests {
         assert_eq!(config.advanced.verbose_level, Some(7));
         assert_eq!(config.srp_username.as_deref(), Some("user"));
         assert_eq!(config.srp_password.as_deref(), Some("pass"));
+    }
+
+    #[test]
+    fn rejects_invalid_multicast_and_local_binding_options() {
+        for url in [
+            "rist://239.0.0.1:8000?ttl=0",
+            "rist://239.0.0.1:8000?ttl=256",
+            "rist://239.0.0.1:8000?source=not-an-ip",
+            "rist://127.0.0.1:8000?local-port=0",
+            "rist://127.0.0.1:8000?local-port=65536",
+        ] {
+            assert!(matches!(
+                PeerConfig::parse(url),
+                Err(Error::InvalidQueryValue { .. })
+            ));
+        }
     }
 
     #[test]
