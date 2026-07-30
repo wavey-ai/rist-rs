@@ -456,10 +456,28 @@ review; the findings above remain the audit of the originally reviewed commit.
   RTCP sockets. Media and control traffic use their assigned sockets. Rust
   endpoints support all caller and listener directions. C-supported Main roles
   pass plaintext and SRP black-box tests in both directions. Simple reverse
-  roles pass Rust-to-Rust tests as a Rust extension.
+  roles pass Rust-to-Rust tests as a Rust extension. Sockets request the current
+  C buffer target and enforce its safe floor. Bounded scratch storage detects
+  caller-buffer truncation. Oversized datagrams fail before protocol parsing.
 - [ ] **M4 pending.**
 - [ ] **M5 pending.**
 - [ ] **M6 pending.**
+
+### Needletail priority
+
+Needletail uses Main-profile IPv4 unicast from a caller to a local listener.
+It sends 1,316-byte MPEG-TS payloads with flow ID `0x11223344`.
+
+The pure protocol path now has the required roles, recovery, URL controls,
+backpressure, socket sizing, truncation handling, and current-C interoperability.
+
+Two product-level work items remain:
+
+1. Select `rist-pure` for `av-contrib` production ingest.
+2. Pass live 4K, sustained-loss, recovery, CPU, memory, and continuity gates.
+
+Multicast, multipath, reflector, and Advanced profile do not block Needletail's
+current contribution path.
 
 ### M0: Establish a truthful baseline
 
@@ -588,7 +606,10 @@ Tasks:
    C-to-C baseline.
 9. [ ] Add ASM/SSM multicast, TTL/hop limit, interface names, and local-port
    binding.
-10. [ ] Configure socket buffers and detect truncated datagrams.
+10. [x] Configure socket buffers and detect truncated datagrams.
+    Sockets request the current C 8 MiB target and require the historical
+    one-fifth of 1 MiB floor. Small caller buffers use bounded scratch storage.
+    Oversized datagrams fail before protocol parsing.
 11. [ ] Implement weight-zero duplication and weighted balancing without
     per-packet allocation.
 12. [ ] Add recovery priority and RTT tie-breaking.

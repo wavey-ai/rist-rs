@@ -26,11 +26,16 @@ use rist_core::{
 };
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket as StdUdpSocket};
 use std::time::Instant;
 
 const PENDING_SEND_CAPACITY: usize = 256;
+pub const TARGET_SOCKET_BUFFER_SIZE: usize = 8 * 1024 * 1024;
+pub const MINIMUM_SOCKET_BUFFER_SIZE: usize = 1024 * 1024 / 5;
+pub const MAX_RIST_DATAGRAM_SIZE: usize = 10_000;
+const SAFE_RECEIVE_CAPACITY: usize = MAX_RIST_DATAGRAM_SIZE + 1;
 pub const DEFAULT_MAIN_EVENT_QUEUE_CAPACITY: usize = 256;
 pub const DEFAULT_MAIN_PEER_CAPACITY: usize = 256;
 
@@ -87,6 +92,60 @@ struct PendingDatagram {
     peer: SocketAddr,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SocketBufferSizes {
+    pub receive: usize,
+    pub send: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SimpleSocketBufferSizes {
+    pub rtp: SocketBufferSizes,
+    pub rtcp: SocketBufferSizes,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TruncatedDatagram {
+    pub peer: SocketAddr,
+    pub datagram_size: usize,
+    pub buffer_capacity: usize,
+}
+
+impl fmt::Display for TruncatedDatagram {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}-byte UDP datagram from {} exceeded the {}-byte receive buffer",
+            self.datagram_size, self.peer, self.buffer_capacity
+        )
+    }
+}
+
+impl std::error::Error for TruncatedDatagram {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OversizedDatagram {
+    pub peer: Option<SocketAddr>,
+    pub observed_size: Option<usize>,
+}
+
+impl fmt::Display for OversizedDatagram {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (self.peer, self.observed_size) {
+            (Some(peer), Some(size)) => write!(
+                formatter,
+                "{size}-byte UDP datagram from {peer} exceeded the {MAX_RIST_DATAGRAM_SIZE}-byte RIST limit"
+            ),
+            _ => write!(
+                formatter,
+                "UDP datagram exceeded the {MAX_RIST_DATAGRAM_SIZE}-byte RIST limit"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for OversizedDatagram {}
+
 fn no_remote_peer_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::NotConnected,
@@ -99,37 +158,35 @@ pub struct RtpUdpSocket {
     peer: Option<SocketAddr>,
     next_sequence: u16,
     ssrc: u32,
+    receive_scratch: Vec<u8>,
 }
 
 impl RtpUdpSocket {
     pub fn bind(local: SocketAddr, ssrc: u32) -> io::Result<Self> {
-        Ok(Self {
-            socket: UdpSocket::bind(local)?,
-            peer: None,
-            next_sequence: 0,
-            ssrc,
-        })
+        Self::from_socket(UdpSocket::bind(local)?, None, ssrc)
     }
 
     pub fn bind_reuse(local: SocketAddr, ssrc: u32) -> io::Result<Self> {
-        Ok(Self {
-            socket: bind_reuse_udp(local)?,
-            peer: None,
-            next_sequence: 0,
-            ssrc,
-        })
+        Self::from_socket(bind_reuse_udp(local)?, None, ssrc)
     }
 
     pub fn connect(local: SocketAddr, peer: SocketAddr, ssrc: u32) -> io::Result<Self> {
         ensure_same_address_family(local, peer)?;
         let socket = UdpSocket::bind(local)?;
         socket.connect(peer)?;
-        Ok(Self {
+        Self::from_socket(socket, Some(peer), ssrc)
+    }
+
+    fn from_socket(socket: UdpSocket, peer: Option<SocketAddr>, ssrc: u32) -> io::Result<Self> {
+        let socket = Self {
             socket,
-            peer: Some(peer),
+            peer,
             next_sequence: 0,
             ssrc,
-        })
+            receive_scratch: vec![0u8; SAFE_RECEIVE_CAPACITY],
+        };
+        socket.configure_optimal_socket_buffers()?;
+        Ok(socket)
     }
 
     pub fn register(
@@ -201,6 +258,42 @@ impl RtpUdpSocket {
         } else {
             self.set_multicast_if_v6(resolved.index)
         }
+    }
+
+    pub fn socket_buffer_sizes(&self) -> io::Result<SocketBufferSizes> {
+        let socket = SockRef::from(&self.socket);
+        Ok(SocketBufferSizes {
+            receive: socket.recv_buffer_size()?,
+            send: socket.send_buffer_size()?,
+        })
+    }
+
+    pub fn set_socket_buffer_sizes(
+        &self,
+        receive: usize,
+        send: usize,
+    ) -> io::Result<SocketBufferSizes> {
+        validate_socket_buffer_size(receive)?;
+        validate_socket_buffer_size(send)?;
+        let socket = SockRef::from(&self.socket);
+        socket.set_recv_buffer_size(receive)?;
+        socket.set_send_buffer_size(send)?;
+        self.socket_buffer_sizes()
+    }
+
+    pub fn configure_optimal_socket_buffers(&self) -> io::Result<SocketBufferSizes> {
+        let socket = SockRef::from(&self.socket);
+        configure_optimal_socket_buffer(
+            || socket.recv_buffer_size(),
+            |size| socket.set_recv_buffer_size(size),
+            "receive",
+        )?;
+        configure_optimal_socket_buffer(
+            || socket.send_buffer_size(),
+            |size| socket.set_send_buffer_size(size),
+            "send",
+        )?;
+        self.socket_buffer_sizes()
     }
 
     pub fn join_multicast_v4(&self, multiaddr: Ipv4Addr, interface: Ipv4Addr) -> io::Result<()> {
@@ -324,9 +417,58 @@ impl RtpUdpSocket {
         &mut self,
         buf: &'a mut [u8],
     ) -> io::Result<Option<(SocketAddr, &'a [u8])>> {
-        match self.socket.recv_from(buf) {
-            Ok((len, from)) => Ok(Some((from, &buf[..len]))),
+        if buf.len() >= SAFE_RECEIVE_CAPACITY {
+            return match self.socket.recv_from(buf) {
+                Ok((len, from)) if len > MAX_RIST_DATAGRAM_SIZE => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    OversizedDatagram {
+                        peer: Some(from),
+                        observed_size: Some(len),
+                    },
+                )),
+                Ok((len, from)) => Ok(Some((from, &buf[..len]))),
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(None),
+                #[cfg(windows)]
+                Err(err) if err.raw_os_error() == Some(10040) => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    OversizedDatagram {
+                        peer: None,
+                        observed_size: None,
+                    },
+                )),
+                Err(err) => Err(err),
+            };
+        }
+
+        match self.socket.recv_from(&mut self.receive_scratch) {
+            Ok((len, from)) if len > MAX_RIST_DATAGRAM_SIZE => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                OversizedDatagram {
+                    peer: Some(from),
+                    observed_size: Some(len),
+                },
+            )),
+            Ok((len, from)) if len > buf.len() => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                TruncatedDatagram {
+                    peer: from,
+                    datagram_size: len,
+                    buffer_capacity: buf.len(),
+                },
+            )),
+            Ok((len, from)) => {
+                buf[..len].copy_from_slice(&self.receive_scratch[..len]);
+                Ok(Some((from, &buf[..len])))
+            }
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            #[cfg(windows)]
+            Err(err) if err.raw_os_error() == Some(10040) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                OversizedDatagram {
+                    peer: None,
+                    observed_size: None,
+                },
+            )),
             Err(err) => Err(err),
         }
     }
@@ -334,6 +476,40 @@ impl RtpUdpSocket {
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
     }
+}
+
+fn validate_socket_buffer_size(size: usize) -> io::Result<()> {
+    if !(MINIMUM_SOCKET_BUFFER_SIZE..=i32::MAX as usize).contains(&size) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "socket buffer size must be between {MINIMUM_SOCKET_BUFFER_SIZE} and i32::MAX bytes"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn configure_optimal_socket_buffer(
+    get: impl Fn() -> io::Result<usize>,
+    set: impl Fn(usize) -> io::Result<()>,
+    direction: &str,
+) -> io::Result<usize> {
+    let mut size = get()?;
+    if size < TARGET_SOCKET_BUFFER_SIZE {
+        let _ = set(TARGET_SOCKET_BUFFER_SIZE);
+        size = get()?;
+    }
+    if size < MINIMUM_SOCKET_BUFFER_SIZE {
+        set(MINIMUM_SOCKET_BUFFER_SIZE)?;
+        size = get()?;
+    }
+    if size < MINIMUM_SOCKET_BUFFER_SIZE {
+        return Err(io::Error::other(format!(
+            "UDP {direction} buffer is {size} bytes; at least {MINIMUM_SOCKET_BUFFER_SIZE} bytes are required"
+        )));
+    }
+    Ok(size)
 }
 
 fn simple_rtcp_addr(rtp: SocketAddr) -> io::Result<SocketAddr> {
@@ -918,6 +1094,23 @@ impl SimpleMioSender {
         self.rtcp_socket.local_addr()
     }
 
+    pub fn socket_buffer_sizes(&self) -> io::Result<SimpleSocketBufferSizes> {
+        Ok(SimpleSocketBufferSizes {
+            rtp: self.rtp_socket.socket_buffer_sizes()?,
+            rtcp: self.rtcp_socket.socket_buffer_sizes()?,
+        })
+    }
+
+    pub fn set_socket_buffer_sizes(
+        &self,
+        receive: usize,
+        send: usize,
+    ) -> io::Result<SimpleSocketBufferSizes> {
+        self.rtp_socket.set_socket_buffer_sizes(receive, send)?;
+        self.rtcp_socket.set_socket_buffer_sizes(receive, send)?;
+        self.socket_buffer_sizes()
+    }
+
     pub fn peer_addr(&self) -> Option<SocketAddr> {
         self.peer
     }
@@ -1120,6 +1313,23 @@ impl SimpleMioReceiver {
 
     pub fn rtcp_local_addr(&self) -> io::Result<SocketAddr> {
         self.rtcp_socket.local_addr()
+    }
+
+    pub fn socket_buffer_sizes(&self) -> io::Result<SimpleSocketBufferSizes> {
+        Ok(SimpleSocketBufferSizes {
+            rtp: self.rtp_socket.socket_buffer_sizes()?,
+            rtcp: self.rtcp_socket.socket_buffer_sizes()?,
+        })
+    }
+
+    pub fn set_socket_buffer_sizes(
+        &self,
+        receive: usize,
+        send: usize,
+    ) -> io::Result<SimpleSocketBufferSizes> {
+        self.rtp_socket.set_socket_buffer_sizes(receive, send)?;
+        self.rtcp_socket.set_socket_buffer_sizes(receive, send)?;
+        self.socket_buffer_sizes()
     }
 
     pub fn peer_addr(&self) -> Option<SocketAddr> {
@@ -1913,6 +2123,18 @@ impl MainMioSender {
         self.socket.local_addr()
     }
 
+    pub fn socket_buffer_sizes(&self) -> io::Result<SocketBufferSizes> {
+        self.socket.socket_buffer_sizes()
+    }
+
+    pub fn set_socket_buffer_sizes(
+        &self,
+        receive: usize,
+        send: usize,
+    ) -> io::Result<SocketBufferSizes> {
+        self.socket.set_socket_buffer_sizes(receive, send)
+    }
+
     pub fn set_multicast_loop_v4(&self, on: bool) -> io::Result<()> {
         self.socket.set_multicast_loop_v4(on)
     }
@@ -2497,6 +2719,18 @@ impl MainMioMultiSender {
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
+    }
+
+    pub fn socket_buffer_sizes(&self) -> io::Result<SocketBufferSizes> {
+        self.socket.socket_buffer_sizes()
+    }
+
+    pub fn set_socket_buffer_sizes(
+        &self,
+        receive: usize,
+        send: usize,
+    ) -> io::Result<SocketBufferSizes> {
+        self.socket.set_socket_buffer_sizes(receive, send)
     }
 
     pub fn set_multicast_loop_v4(&self, on: bool) -> io::Result<()> {
@@ -3338,6 +3572,18 @@ impl MainMioReceiver {
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
+    }
+
+    pub fn socket_buffer_sizes(&self) -> io::Result<SocketBufferSizes> {
+        self.socket.socket_buffer_sizes()
+    }
+
+    pub fn set_socket_buffer_sizes(
+        &self,
+        receive: usize,
+        send: usize,
+    ) -> io::Result<SocketBufferSizes> {
+        self.socket.set_socket_buffer_sizes(receive, send)
     }
 
     pub fn peer_addr(&self) -> Option<SocketAddr> {
@@ -4287,6 +4533,116 @@ mod tests {
     }
 
     #[test]
+    fn rtp_udp_socket_configures_the_librist_buffer_floor() {
+        let socket = RtpUdpSocket::bind(loopback_any(), 1).unwrap();
+        let sizes = socket.socket_buffer_sizes().unwrap();
+
+        assert!(sizes.receive >= MINIMUM_SOCKET_BUFFER_SIZE);
+        assert!(sizes.send >= MINIMUM_SOCKET_BUFFER_SIZE);
+        assert_eq!(
+            socket
+                .set_socket_buffer_sizes(MINIMUM_SOCKET_BUFFER_SIZE - 1, i32::MAX as usize)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn rtp_udp_socket_reports_and_discards_truncated_datagrams() {
+        let mut receiver = RtpUdpSocket::bind(loopback_any(), 1).unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+        let sender = StdUdpSocket::bind(loopback_any()).unwrap();
+        sender.send_to(&[0x5a; 128], receiver_addr).unwrap();
+
+        let mut small = [0u8; 32];
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match receiver.recv_datagram(&mut small) {
+                Err(error) => {
+                    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                    let truncated = error
+                        .get_ref()
+                        .and_then(|source| source.downcast_ref::<TruncatedDatagram>())
+                        .expect("truncation must use the typed error");
+                    assert_eq!(truncated.peer, sender.local_addr().unwrap());
+                    assert_eq!(truncated.datagram_size, 128);
+                    assert_eq!(truncated.buffer_capacity, small.len());
+                    break;
+                }
+                Ok(None) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for the oversized datagram"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Ok(Some(_)) => panic!("oversized datagram was accepted"),
+            }
+        }
+
+        sender.send_to(b"complete", receiver_addr).unwrap();
+        let mut complete = [0u8; 32];
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match receiver.recv_datagram(&mut complete).unwrap() {
+                Some((from, payload)) => {
+                    assert_eq!(from, sender.local_addr().unwrap());
+                    assert_eq!(payload, b"complete");
+                    break;
+                }
+                None => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for the complete datagram"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rtp_udp_socket_rejects_datagrams_above_the_librist_limit() {
+        let mut receiver = RtpUdpSocket::bind(loopback_any(), 1).unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+        let sender = StdUdpSocket::bind(loopback_any()).unwrap();
+        sender
+            .send_to(&vec![0x5a; MAX_RIST_DATAGRAM_SIZE + 512], receiver_addr)
+            .unwrap();
+
+        let mut buf = vec![0u8; SAFE_RECEIVE_CAPACITY];
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match receiver.recv_datagram(&mut buf) {
+                Err(error) => {
+                    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                    let oversized = error
+                        .get_ref()
+                        .and_then(|source| source.downcast_ref::<OversizedDatagram>())
+                        .expect("oversized input must use the typed error");
+                    if let Some(peer) = oversized.peer {
+                        assert_eq!(peer, sender.local_addr().unwrap());
+                    }
+                    if let Some(size) = oversized.observed_size {
+                        assert!(size > MAX_RIST_DATAGRAM_SIZE);
+                    }
+                    break;
+                }
+                Ok(None) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for the oversized datagram"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Ok(Some(_)) => panic!("oversized datagram was accepted"),
+            }
+        }
+    }
+
+    #[test]
     fn simple_profile_recovers_dropped_udp_payload() {
         let flow_id = 0x1122_3344;
         let now = Instant::now();
@@ -4534,6 +4890,57 @@ mod tests {
         let recovered = recv_main_payload_eventually(&mut receiver, &mut rx_buf);
         assert!(recovered.recovered);
         assert_eq!(recovered.payload, b"lost");
+    }
+
+    #[test]
+    fn main_profile_streams_needletail_mpegts_with_full_receive_headroom() {
+        const PACKETS: u64 = 64;
+
+        let flow_id = 0x1122_3344;
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut payload = Vec::with_capacity(7 * TS_PACKET_SIZE);
+        for pid in 0x0100..0x0107 {
+            payload.extend_from_slice(&ts_packet(pid, b"needletail"));
+        }
+        assert_eq!(payload.len(), 1_316);
+
+        let mut receiver =
+            MainMioReceiver::bind(loopback_any(), flow_id, "needletail", NackMode::Range).unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+        let mut sender =
+            MainMioSender::connect(loopback_any(), receiver_addr, flow_id, 8_192).unwrap();
+        let mut receive = vec![0u8; 65_536];
+
+        for _ in 0..PACKETS {
+            sender.send_payload(&payload, ntp, Instant::now()).unwrap();
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut received_packets = 0;
+        while received_packets < PACKETS {
+            match receiver.try_recv_payload(&mut receive).unwrap() {
+                Some((_from, received)) => {
+                    assert_eq!(received.payload, payload);
+                    received_packets += 1;
+                }
+                None => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for the Needletail payload burst"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+
+        let stats = receiver.stats();
+        assert_eq!(stats.received_packets, PACKETS);
+        assert_eq!(stats.received_bytes, PACKETS * 1_316);
+        assert!(receiver
+            .socket
+            .receive_scratch
+            .iter()
+            .all(|byte| *byte == 0));
     }
 
     #[test]

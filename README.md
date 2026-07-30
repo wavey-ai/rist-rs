@@ -44,7 +44,10 @@ A red cross means that required work or verification remains.
   - Simple passes current-C sender to Rust receiver tests.
   - Current librist 0.2.20 crashes in its Simple IPv6 receiver, including a C-to-C baseline.
 - ❌ ASM and SSM multicast behavior
-- ❌ Socket buffers and truncated-datagram detection
+- ✅ Socket buffers and truncated-datagram detection
+  - Sockets request the current librist 8 MiB target and require its historical safe floor.
+  - Small caller buffers use bounded scratch storage and return typed truncation errors.
+  - Datagrams above librist's 10,000-byte limit fail before protocol parsing.
 - ❌ Allocation-free weighted multipath transmission
 - ❌ Recovery priority and RTT route selection
 - ❌ RTT muting, failure handling, trickle traffic, and rejoin behavior
@@ -53,6 +56,19 @@ A red cross means that required work or verification remains.
 - ❌ Advanced profile data, control, recovery, encryption, and negotiation
 - ❌ Complete public API and URL-option parity
 - ❌ Measured throughput, latency, memory, and recovery parity
+
+### Needletail Readiness
+
+Needletail uses Main-profile IPv4 unicast from a caller to a local listener.
+Media uses 1,316-byte MPEG-TS payloads and flow ID `0x11223344`.
+
+- ✅ Main caller-to-listener data and control interoperate with current librist.
+- ✅ Bounded recovery supports Needletail's buffer, bandwidth, RTT, reorder, retry, and congestion controls.
+- ✅ Socket buffers, backpressure, exact recovery bytes, and truncated-datagram handling are ready.
+- ❌ `av-contrib` production ingest still selects the librist-backed receiver.
+- ❌ Live 4K, sustained-loss, recovery, CPU, memory, and continuity qualification remains.
+
+Two product-level work items remain before Needletail can select pure RIST by default.
 
 ## Usage
 
