@@ -3770,8 +3770,20 @@ mod tests {
     use rist_core::packet::rtp::RtpPacket;
     use rist_core::time::ntp_from_unix_duration;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6, UdpSocket as StdUdpSocket};
+    use std::sync::{Mutex, MutexGuard};
     use std::thread;
     use std::time::Duration;
+
+    const SRP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+    // Debug-mode 2048-bit SRP exchanges can each consume several seconds.
+    // Serialize them so CPU contention does not cause test-only timeouts.
+    static SRP_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_srp_test() -> MutexGuard<'static, ()> {
+        SRP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     fn loopback_any() -> SocketAddr {
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
@@ -3964,6 +3976,7 @@ mod tests {
 
     #[test]
     fn main_profile_reverse_roles_use_caller_and_listener_srp_roles() {
+        let _srp_test = lock_srp_test();
         let flow_id = 0x1122_3344;
         let ntp = ntp_from_unix_duration(Duration::from_secs(1));
         let mut sender = MainMioSender::listen(loopback_any(), flow_id, 64).unwrap();
@@ -3991,7 +4004,7 @@ mod tests {
 
         let mut sender_buf = [0u8; 2048];
         let mut receiver_buf = [0u8; 2048];
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + SRP_HANDSHAKE_TIMEOUT;
         while !sender.srp_authenticated() || !receiver.srp_authenticated() {
             sender.try_recv_event(&mut sender_buf).unwrap();
             receiver.try_recv_event(&mut receiver_buf).unwrap();
@@ -4220,6 +4233,7 @@ mod tests {
 
     #[test]
     fn main_profile_isolates_authentication_and_liveness_by_peer() {
+        let _srp_test = lock_srp_test();
         let flow_id = 0x2000;
         let ntp = ntp_from_unix_duration(Duration::from_secs(1));
         let now = Instant::now();
@@ -4245,7 +4259,7 @@ mod tests {
         authenticated_sender.start_srp_authentication().unwrap();
         let mut receiver_buf = [0u8; 1500];
         let mut sender_buf = [0u8; 1500];
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + SRP_HANDSHAKE_TIMEOUT;
         while !authenticated_sender.srp_authenticated()
             || receiver.peer_authenticated(authenticated_addr) != Some(true)
         {
@@ -5385,6 +5399,7 @@ mod tests {
 
     #[test]
     fn main_profile_multi_sender_authenticates_each_peer_independently() {
+        let _srp_test = lock_srp_test();
         let flow_id = 0x1122_3344;
         let ntp = ntp_from_unix_duration(Duration::from_secs(1));
         let mut receiver_a =
@@ -5529,6 +5544,7 @@ mod tests {
 
     #[test]
     fn main_profile_rebinds_only_after_fresh_peer_authentication() {
+        let _srp_test = lock_srp_test();
         let flow_id = 0x1122_3344;
         let ntp = ntp_from_unix_duration(Duration::from_secs(1));
         let now = Instant::now();
@@ -5615,6 +5631,7 @@ mod tests {
 
     #[test]
     fn main_profile_reauthenticates_a_restarted_peer_on_the_same_tuple() {
+        let _srp_test = lock_srp_test();
         let flow_id = 0x1122_3344;
         let mut receiver =
             MainMioReceiver::bind(loopback_any(), flow_id, "receiver", NackMode::Range).unwrap();
@@ -5671,6 +5688,7 @@ mod tests {
 
     #[test]
     fn main_profile_caller_reauthenticates_after_listener_restart() {
+        let _srp_test = lock_srp_test();
         let flow_id = 0x1122_3344;
         let mut receiver =
             MainMioReceiver::bind(loopback_any(), flow_id, "receiver", NackMode::Range).unwrap();
@@ -5724,6 +5742,7 @@ mod tests {
 
     #[test]
     fn main_profile_srp_authenticates_before_payload() {
+        let _srp_test = lock_srp_test();
         let flow_id = 0x1122_3344;
         let now = Instant::now();
         let ntp = ntp_from_unix_duration(Duration::from_secs(1));
@@ -5757,6 +5776,7 @@ mod tests {
 
     #[test]
     fn main_profile_srp_reauthenticates_after_password_rollover() {
+        let _srp_test = lock_srp_test();
         let flow_id = 0x1122_3344;
         let now = Instant::now();
         let ntp = ntp_from_unix_duration(Duration::from_secs(1));
@@ -6102,7 +6122,7 @@ mod tests {
         sender_buf: &mut [u8],
         receiver_buf: &mut [u8],
     ) {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + SRP_HANDSHAKE_TIMEOUT;
         while sender.peer_srp_authenticated(peer) != Some(true)
             || receiver.peer_authenticated(sender_addr) != Some(true)
         {
@@ -6122,7 +6142,7 @@ mod tests {
         sender_buf: &mut [u8],
         receiver_buf: &mut [u8],
     ) {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + SRP_HANDSHAKE_TIMEOUT;
         while !sender.srp_authenticated() || !receiver.srp_authenticated() {
             receiver.try_recv_eapol_and_respond(receiver_buf).unwrap();
             sender.try_recv_eapol_and_respond(sender_buf).unwrap();
