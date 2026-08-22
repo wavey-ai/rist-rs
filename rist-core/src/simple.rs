@@ -665,7 +665,7 @@ impl SimpleReceiverCore {
         } else {
             packet.payload.to_vec()
         };
-        let currently_missing = self.missing_tracker.missing_sequences().count();
+        let currently_missing = self.missing_tracker.missing_len();
         self.stats.record_receive(
             payload.len(),
             observation.duplicate,

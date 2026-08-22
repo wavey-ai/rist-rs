@@ -1011,19 +1011,22 @@ impl MainReceiverCore {
     }
 
     fn flow_mut(&mut self, flow_id: u32) -> Result<&mut SimpleReceiverCore> {
-        if !self.flows.contains_key(&flow_id) && self.flows.len() >= self.max_flows {
-            return Err(crate::Error::MainFlowCapacityExceeded {
-                maximum: self.max_flows,
-            });
+        if !self.flows.contains_key(&flow_id) {
+            if self.flows.len() >= self.max_flows {
+                return Err(crate::Error::MainFlowCapacityExceeded {
+                    maximum: self.max_flows,
+                });
+            }
+            self.flows.insert(
+                flow_id,
+                SimpleReceiverCore::new(flow_id, self.cname.clone(), self.nack_mode)
+                    .with_recovery_config(self.recovery.clone(), self.congestion_control),
+            );
         }
-        let cname = self.cname.clone();
-        let nack_mode = self.nack_mode;
-        let recovery = self.recovery.clone();
-        let congestion_control = self.congestion_control;
-        Ok(self.flows.entry(flow_id).or_insert_with(|| {
-            SimpleReceiverCore::new(flow_id, cname, nack_mode)
-                .with_recovery_config(recovery, congestion_control)
-        }))
+        Ok(self
+            .flows
+            .get_mut(&flow_id)
+            .expect("RIST Main receiver flow must exist"))
     }
 
     fn decode_reduced<'a>(&mut self, packet: &'a [u8]) -> Result<DecodedReduced<'a>> {

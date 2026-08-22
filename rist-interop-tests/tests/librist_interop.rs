@@ -405,6 +405,172 @@ fn librist_main_sender_to_pure_rust_receiver() {
 }
 
 #[test]
+fn librist_main_sender_sustains_4k_rate_through_16_bit_wrap_without_nacks() {
+    if !interop_enabled() {
+        return;
+    }
+    let _guard = lock_interop();
+
+    const TARGET_BITRATE_BPS: u64 = 25_000_000;
+    const PAYLOAD_BYTES: usize = 1_316;
+    const PACKETS: u32 = u16::MAX as u32 + 1 + 1_024;
+    const PACE_BATCH_PACKETS: u32 = 32;
+
+    let flow_id = 0x1122_3344;
+    let receiver_port = next_even_test_port_pair();
+    let receiver_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, receiver_port));
+    let mut receiver = MainMioReceiver::bind(
+        receiver_addr,
+        flow_id,
+        "rust-4k-sequence-wrap",
+        NackMode::Range,
+    )
+    .unwrap();
+    let sender_url = format!("rist://127.0.0.1:{}", receiver.local_addr().unwrap().port());
+    let mut sender = rist::Sender::new(rist::Profile::Main).unwrap();
+    sender.add_peer(&sender_url).unwrap();
+    sender.start().unwrap();
+
+    let mut payload = mpegts_payload_7("LIBRIST 4K RATE SEQUENCE WRAP");
+    let mut receiver_buf = vec![0u8; 65_536];
+    let mut received_packets = 0u32;
+    let started = Instant::now();
+    let packet_bits = (PAYLOAD_BYTES * 8) as u64;
+
+    for sent_packets in 0..PACKETS {
+        payload[4..8].copy_from_slice(&sent_packets.to_be_bytes());
+        sender.send(&payload).unwrap();
+
+        while let Some((_from, received)) = receiver.try_recv_payload(&mut receiver_buf).unwrap() {
+            assert_eq!(received.payload.len(), PAYLOAD_BYTES);
+            assert!(received.newly_missing.is_empty());
+            assert!(!received.recovered);
+            assert!(!received.duplicate);
+            let application_sequence = u32::from_be_bytes(
+                received.payload[4..8]
+                    .try_into()
+                    .expect("missing 4K probe sequence"),
+            );
+            assert_eq!(application_sequence, received_packets);
+            received_packets += 1;
+        }
+
+        if (sent_packets + 1) % PACE_BATCH_PACKETS == 0 {
+            let now = Instant::now();
+            receiver.poll_rtcp_and_send(now, ntp_now()).unwrap();
+            let target_elapsed = Duration::from_nanos(
+                u64::from(sent_packets + 1) * packet_bits * 1_000_000_000 / TARGET_BITRATE_BPS,
+            );
+            if let Some(delay) = target_elapsed.checked_sub(started.elapsed()) {
+                thread::sleep(delay);
+            }
+        }
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while received_packets < PACKETS {
+        while let Some((_from, received)) = receiver.try_recv_payload(&mut receiver_buf).unwrap() {
+            assert_eq!(received.payload.len(), PAYLOAD_BYTES);
+            assert!(received.newly_missing.is_empty());
+            assert!(!received.recovered);
+            assert!(!received.duplicate);
+            let application_sequence = u32::from_be_bytes(
+                received.payload[4..8]
+                    .try_into()
+                    .expect("missing 4K probe sequence"),
+            );
+            assert_eq!(application_sequence, received_packets);
+            received_packets += 1;
+        }
+        receiver
+            .poll_rtcp_and_send(Instant::now(), ntp_now())
+            .unwrap();
+        assert!(
+            Instant::now() < deadline,
+            "timed out after receiving {received_packets} of {PACKETS} sustained packets"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    let peer = receiver
+        .peer_addr()
+        .expect("pure receiver lost the librist peer");
+    let flow_stats = receiver
+        .peer_flow_ids(peer)
+        .expect("pure receiver lost the librist peer flows")
+        .into_iter()
+        .filter_map(|flow_id| receiver.peer_flow_stats(peer, flow_id))
+        .collect::<Vec<_>>();
+    assert!(
+        !flow_stats.is_empty(),
+        "librist peer exposed no media flows"
+    );
+    let stats_received_packets = flow_stats
+        .iter()
+        .map(|stats| stats.received_packets)
+        .sum::<u64>();
+    let stats_duplicate_packets = flow_stats
+        .iter()
+        .map(|stats| stats.duplicate_packets)
+        .sum::<u64>();
+    let stats_total_missing_packets = flow_stats
+        .iter()
+        .map(|stats| stats.total_missing_packets)
+        .sum::<u64>();
+    let stats_currently_missing_packets = flow_stats
+        .iter()
+        .map(|stats| stats.currently_missing_packets)
+        .sum::<u64>();
+    let stats_recovered_packets = flow_stats
+        .iter()
+        .map(|stats| stats.recovered_packets)
+        .sum::<u64>();
+    let stats_feedback_packets = flow_stats
+        .iter()
+        .map(|stats| stats.feedback_packets)
+        .sum::<u64>();
+    let elapsed = started.elapsed();
+    let payload_mbps =
+        f64::from(PACKETS) * PAYLOAD_BYTES as f64 * 8.0 / elapsed.as_secs_f64() / 1_000_000.0;
+    let maximum_feedback_packets = elapsed
+        .as_secs()
+        .saturating_add(2)
+        .saturating_mul(flow_stats.len() as u64);
+    assert_eq!(received_packets, PACKETS);
+    assert_eq!(stats_received_packets, u64::from(PACKETS));
+    assert_eq!(stats_duplicate_packets, 0);
+    assert_eq!(
+        stats_total_missing_packets, 0,
+        "zero-loss run generated missing state"
+    );
+    assert_eq!(
+        stats_currently_missing_packets, 0,
+        "zero-loss run retained missing state"
+    );
+    assert_eq!(
+        stats_recovered_packets, 0,
+        "zero-loss run unexpectedly entered recovery"
+    );
+    assert!(
+        stats_feedback_packets <= maximum_feedback_packets,
+        "zero-loss run generated {} feedback packets in {:.3}s; expected at most {maximum_feedback_packets} periodic reports",
+        stats_feedback_packets,
+        elapsed.as_secs_f64()
+    );
+    eprintln!(
+        "librist-to-Rust wrap: packets={PACKETS} bytes={} elapsed={:.3}s payload_rate={payload_mbps:.3}Mbps flows={} duplicates={} missing_total={} missing_current={} recovered={} feedback={}",
+        u64::from(PACKETS) * PAYLOAD_BYTES as u64,
+        elapsed.as_secs_f64(),
+        flow_stats.len(),
+        stats_duplicate_packets,
+        stats_total_missing_packets,
+        stats_currently_missing_packets,
+        stats_recovered_packets,
+        stats_feedback_packets
+    );
+}
+
+#[test]
 fn librist_main_sender_recovers_every_injected_loss_for_pure_rust_receiver() {
     if !interop_enabled() {
         return;

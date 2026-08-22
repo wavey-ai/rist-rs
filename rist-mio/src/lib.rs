@@ -2990,25 +2990,27 @@ impl MainMioReceiver {
         if self.configured_peer.is_some_and(|peer| peer != from) {
             return Ok(None);
         }
-        if !self.peer_runtime.contains_key(&from) && self.peer_runtime.len() >= self.max_peers {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                format!("RIST Main receiver peer capacity is {}", self.max_peers),
-            ));
+        if !self.peer_runtime.contains_key(&from) {
+            if self.peer_runtime.len() >= self.max_peers {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!("RIST Main receiver peer capacity is {}", self.max_peers),
+                ));
+            }
+            self.peer_runtime.insert(
+                from,
+                MainReceiverPeerRuntime {
+                    core: self.core.fresh_session(),
+                    timers: MainSessionTimers::with_config(self.timers.config()),
+                    srp: self.srp.clone(),
+                    srp_client: self.srp_client.clone(),
+                },
+            );
         }
-        let core = self.core.fresh_session();
-        let timers = MainSessionTimers::with_config(self.timers.config());
-        let srp = self.srp.clone();
-        let srp_client = self.srp_client.clone();
         let runtime = self
             .peer_runtime
-            .entry(from)
-            .or_insert_with(|| MainReceiverPeerRuntime {
-                core,
-                timers,
-                srp,
-                srp_client,
-            });
+            .get_mut(&from)
+            .expect("RIST Main receiver peer runtime must exist");
         let packet = runtime
             .core
             .decode_datagram(datagram)
@@ -4942,6 +4944,144 @@ mod tests {
             .receive_scratch
             .iter()
             .all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn main_profile_sender_sustains_needletail_mpegts_to_a_raw_udp_sink() {
+        const PACKETS: u64 = 8_448;
+        const PACKETS_PER_BURST: u64 = 8;
+
+        let flow_id = 0x1122_3344;
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut payload = Vec::with_capacity(7 * TS_PACKET_SIZE);
+        for pid in 0x0100..0x0107 {
+            payload.extend_from_slice(&ts_packet(pid, b"needletail-raw-sink"));
+        }
+
+        let receiver = StdUdpSocket::bind(loopback_any()).unwrap();
+        SockRef::from(&receiver)
+            .set_recv_buffer_size(16 * 1024 * 1024)
+            .unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+        let receiver_thread = thread::spawn(move || {
+            let mut buf = [0u8; 2_048];
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut received_packets = 0;
+            while received_packets < PACKETS {
+                match receiver.recv_from(&mut buf) {
+                    Ok((len, _)) => {
+                        let reduced = ReducedPacket::decode(&buf[..len]).unwrap();
+                        let rtp = RtpPacket::decode(reduced.payload).unwrap();
+                        assert_eq!(u64::from(rtp.header.sequence_number), received_packets);
+                        received_packets += 1;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "raw sink timed out after {received_packets} of {PACKETS} packets"
+                        );
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("raw sink receive failed: {error}"),
+                }
+            }
+        });
+
+        let mut sender =
+            MainMioSender::connect(loopback_any(), receiver_addr, flow_id, 16_384).unwrap();
+        for index in 0..PACKETS {
+            sender.send_payload(&payload, ntp, Instant::now()).unwrap();
+            if index % PACKETS_PER_BURST == PACKETS_PER_BURST - 1 {
+                thread::sleep(Duration::from_millis(4));
+            }
+        }
+
+        receiver_thread.join().unwrap();
+        assert_eq!(sender.pending_send_len(), 0);
+        assert_eq!(sender.stats().sent_packets, PACKETS);
+    }
+
+    #[test]
+    fn main_profile_sustains_needletail_mpegts_while_receiving_concurrently() {
+        const PACKETS: u64 = 8_448;
+        const PACKETS_PER_BURST: u64 = 8;
+
+        let flow_id = 0x1122_3344;
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut payload = Vec::with_capacity(7 * TS_PACKET_SIZE);
+        for pid in 0x0100..0x0107 {
+            payload.extend_from_slice(&ts_packet(pid, b"needletail-sustained"));
+        }
+        assert_eq!(payload.len(), 1_316);
+
+        let mut receiver =
+            MainMioReceiver::bind(loopback_any(), flow_id, "needletail", NackMode::Range).unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+        let expected_payload = payload.clone();
+        let receiver_thread = thread::spawn(move || {
+            let mut receive = vec![0u8; 65_536];
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut last_rtcp = Instant::now();
+            let mut received_packets = 0;
+
+            while received_packets < PACKETS {
+                let mut drained = 0;
+                while drained < 128 {
+                    match receiver.try_recv_payload(&mut receive).unwrap() {
+                        Some((_from, received)) => {
+                            assert_eq!(received.sequence as u64, received_packets);
+                            assert_eq!(received.payload, expected_payload);
+                            received_packets += 1;
+                            drained += 1;
+                        }
+                        None => break,
+                    }
+                }
+
+                let now = Instant::now();
+                if now.duration_since(last_rtcp) >= Duration::from_millis(20) {
+                    receiver.poll_rtcp_and_send(now, ntp_now()).unwrap();
+                    last_rtcp = now;
+                }
+                assert!(
+                    now < deadline,
+                    "timed out after receiving {received_packets} of {PACKETS} sustained packets; stats={:?}",
+                    receiver.stats()
+                );
+                if drained == 0 {
+                    thread::sleep(Duration::from_millis(1));
+                } else if drained == 128 {
+                    thread::yield_now();
+                }
+            }
+
+            receiver.stats()
+        });
+
+        let mut sender =
+            MainMioSender::connect(loopback_any(), receiver_addr, flow_id, 16_384).unwrap();
+        let mut feedback = vec![0u8; 65_536];
+        for index in 0..PACKETS {
+            sender.send_payload(&payload, ntp, Instant::now()).unwrap();
+            if index % PACKETS_PER_BURST == PACKETS_PER_BURST - 1 {
+                while sender
+                    .try_recv_feedback_and_retransmit(&mut feedback)
+                    .unwrap()
+                    .is_some()
+                {}
+                thread::sleep(Duration::from_millis(4));
+            }
+        }
+
+        let sender_stats = sender.stats();
+        let receiver_stats = receiver_thread.join().unwrap();
+        assert_eq!(sender.pending_send_len(), 0);
+        assert_eq!(sender_stats.sent_packets, PACKETS);
+        assert_eq!(sender_stats.retransmitted_packets, 0);
+        assert_eq!(receiver_stats.received_packets, PACKETS);
+        assert_eq!(receiver_stats.total_missing_packets, 0);
+        assert_eq!(receiver_stats.currently_missing_packets, 0);
     }
 
     #[test]

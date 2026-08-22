@@ -421,6 +421,9 @@ impl MissingTracker {
         max_retries: u32,
     ) -> Vec<u32> {
         self.expire(now);
+        if self.missing_count == 0 {
+            return Vec::new();
+        }
         let mut due = Vec::with_capacity(self.missing_count);
         for slot in &mut self.slots {
             let SequenceState::Missing {
@@ -480,6 +483,9 @@ impl MissingTracker {
     }
 
     fn expire(&mut self, now: Instant) {
+        if self.missing_count == 0 {
+            return;
+        }
         for slot in &mut self.slots {
             let expired = match slot.state {
                 SequenceState::Missing {
