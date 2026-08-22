@@ -1170,6 +1170,32 @@ pub struct SimpleMioReceiver {
     configured_peer: Option<SocketAddr>,
 }
 
+/// Mio readiness for a Simple Profile receiver refers to its RTP payload socket.
+/// RTCP processing remains deadline-driven through the receiver methods.
+impl Source for SimpleMioReceiver {
+    fn register(
+        &mut self,
+        registry: &Registry,
+        token: Token,
+        interests: Interest,
+    ) -> io::Result<()> {
+        self.rtp_socket.register(registry, token, interests)
+    }
+
+    fn reregister(
+        &mut self,
+        registry: &Registry,
+        token: Token,
+        interests: Interest,
+    ) -> io::Result<()> {
+        self.rtp_socket.reregister(registry, token, interests)
+    }
+
+    fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
+        self.rtp_socket.deregister(registry)
+    }
+}
+
 impl SimpleMioReceiver {
     pub fn bind(
         local: SocketAddr,
@@ -2906,6 +2932,30 @@ pub struct MainMioReceiver {
     max_peers: usize,
 }
 
+impl Source for MainMioReceiver {
+    fn register(
+        &mut self,
+        registry: &Registry,
+        token: Token,
+        interests: Interest,
+    ) -> io::Result<()> {
+        self.socket.register(registry, token, interests)
+    }
+
+    fn reregister(
+        &mut self,
+        registry: &Registry,
+        token: Token,
+        interests: Interest,
+    ) -> io::Result<()> {
+        self.socket.reregister(registry, token, interests)
+    }
+
+    fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
+        self.socket.deregister(registry)
+    }
+}
+
 struct MainReceiverPeerRuntime {
     core: MainReceiverCore,
     timers: MainSessionTimers,
@@ -4405,6 +4455,62 @@ mod tests {
         let mut main_buf = [0u8; 1500];
         let payload = recv_main_payload_eventually(&mut main_receiver, &mut main_buf);
         assert_eq!(payload.payload, b"main-ipv6");
+    }
+
+    #[test]
+    fn receivers_expose_mio_payload_readiness() {
+        let flow_id = 0x1122_3344;
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+
+        let mut simple_receiver =
+            SimpleMioReceiver::bind(loopback_any(), flow_id, "ready", NackMode::Range).unwrap();
+        let mut simple_poll = mio::Poll::new().unwrap();
+        simple_poll
+            .registry()
+            .register(&mut simple_receiver, Token(7), Interest::READABLE)
+            .unwrap();
+        let mut simple_sender = SimpleMioSender::connect(
+            loopback_any(),
+            simple_receiver.local_addr().unwrap(),
+            flow_id,
+            64,
+        )
+        .unwrap();
+        simple_sender
+            .send_payload(b"simple-ready", ntp, Instant::now())
+            .unwrap();
+        let mut simple_events = mio::Events::with_capacity(4);
+        simple_poll
+            .poll(&mut simple_events, Some(Duration::from_secs(1)))
+            .unwrap();
+        assert!(simple_events
+            .iter()
+            .any(|event| event.token() == Token(7) && event.is_readable()));
+
+        let mut main_receiver =
+            MainMioReceiver::bind(loopback_any(), flow_id, "ready", NackMode::Range).unwrap();
+        let mut main_poll = mio::Poll::new().unwrap();
+        main_poll
+            .registry()
+            .register(&mut main_receiver, Token(9), Interest::READABLE)
+            .unwrap();
+        let mut main_sender = MainMioSender::connect(
+            loopback_any(),
+            main_receiver.local_addr().unwrap(),
+            flow_id,
+            64,
+        )
+        .unwrap();
+        main_sender
+            .send_payload(b"main-ready", ntp, Instant::now())
+            .unwrap();
+        let mut main_events = mio::Events::with_capacity(4);
+        main_poll
+            .poll(&mut main_events, Some(Duration::from_secs(1)))
+            .unwrap();
+        assert!(main_events
+            .iter()
+            .any(|event| event.token() == Token(9) && event.is_readable()));
     }
 
     #[test]
