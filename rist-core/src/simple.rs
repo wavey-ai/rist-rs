@@ -297,8 +297,13 @@ struct TailProbeState {
     last_sent_at: Option<Instant>,
     last_sequence: u32,
     probed: bool,
-    /// Smoothed gap between data packets (1/16), in microseconds.
+    /// Smoothed gap between data packets (1/16), in microseconds: the
+    /// mean, pauses between bursts included.
     gap_micros: f64,
+    /// Smoothed gap inside a burst (1/8): of the gaps no longer than the
+    /// mean only. Both start at the first gap.
+    burst_gap_micros: f64,
+    gaps_seen: bool,
     /// Probe allowance: tail_probe_max_per_mille per data packet, capped.
     tokens: f64,
 }
@@ -311,7 +316,16 @@ impl TailProbeState {
     fn on_send(&mut self, sequence: u32, now: Instant, per_mille: u32) {
         if let Some(last) = self.last_sent_at {
             let gap = now.saturating_duration_since(last).as_micros() as f64;
-            self.gap_micros += (gap - self.gap_micros) / 16.0;
+            if !self.gaps_seen {
+                self.gaps_seen = true;
+                self.gap_micros = gap;
+                self.burst_gap_micros = gap;
+            } else {
+                if gap <= self.gap_micros {
+                    self.burst_gap_micros += (gap - self.burst_gap_micros) / 8.0;
+                }
+                self.gap_micros += (gap - self.gap_micros) / 16.0;
+            }
         }
         self.last_sent_at = Some(now);
         self.last_sequence = sequence;
@@ -320,10 +334,14 @@ impl TailProbeState {
     }
 
     /// The idle time after which the last packet is probed: a few usual
-    /// packet gaps, at least 2 ms. A sender that never pauses (CBR) never
-    /// reaches it.
+    /// gaps inside a burst, at least 2 ms. Bursts of n packets every T
+    /// have a mean gap of about T / n, so a few mean gaps would exceed T
+    /// for small n (low-rate video, audio) and the next burst would always
+    /// come first; the gaps inside a burst are the ones no longer than the
+    /// mean. A sender that never pauses (CBR) has every gap near the mean
+    /// and never reaches it.
     fn idle(&self) -> Duration {
-        Duration::from_micros((4.0 * self.gap_micros) as u64).max(TAIL_PROBE_MIN_IDLE)
+        Duration::from_micros((4.0 * self.burst_gap_micros) as u64).max(TAIL_PROBE_MIN_IDLE)
     }
 }
 
@@ -506,7 +524,8 @@ impl SimpleSenderCore {
     /// has room. Single-peer senders only.
     fn tail_probe_at(&self) -> Option<Instant> {
         let last_sent = self.tail.last_sent_at?;
-        if self.tail.probed || self.tail.tokens < 1.0 {
+        // Nothing is known about the stream's gaps before its second packet.
+        if self.tail.probed || self.tail.tokens < 1.0 || !self.tail.gaps_seen {
             return None;
         }
         match self.tuning.tail_probe {
@@ -3141,6 +3160,39 @@ mod tests {
     }
 
     #[test]
+    fn tail_probe_fires_after_every_burst_of_a_low_rate_stream() {
+        let t = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        // 2 and 3 packets 100 us apart every 40 ms (25 fps under 1 Mbit/s):
+        // the mean gap is 13 to 20 ms, four of them more than a frame.
+        for per_frame in [2_u32, 3] {
+            let mut sender =
+                SimpleSenderCore::new(FLOW, 1_024).with_recovery_tuning(RecoveryTuning {
+                    tail_probe: TailProbe::On,
+                    tail_probe_max_per_mille: 1_000,
+                    ..RecoveryTuning::default()
+                });
+            let mut probes = Vec::new();
+            for frame in 0..50_u32 {
+                let start = t + ms(40 * u64::from(frame));
+                for index in 0..per_frame {
+                    let at = start + Duration::from_micros(100 * u64::from(index));
+                    sender.send_payload(b"frame part", ntp, at);
+                }
+                let last = start + Duration::from_micros(100 * u64::from(per_frame - 1));
+                // Due 2 ms after the burst, well before the next one.
+                assert_eq!(sender.next_repair_at(), Some(last + ms(2)), "{per_frame}");
+                for repair in sender.poll_repairs_at(start + ms(39)) {
+                    probes.push(repair.sequence);
+                }
+            }
+            let tails = (0..50).map(|frame| frame * per_frame + per_frame - 1);
+            assert_eq!(probes, tails.collect::<Vec<_>>(), "{per_frame}");
+            assert_eq!(sender.stats().tail_probes, 50);
+        }
+    }
+
+    #[test]
     fn tail_probe_never_fires_for_a_sender_that_does_not_pause() {
         let t = Instant::now();
         let ntp = ntp_from_unix_duration(Duration::from_secs(1));
@@ -3160,6 +3212,22 @@ mod tests {
         let last = t + Duration::from_micros(999 * 2_200);
         let due = sender.next_repair_at().unwrap();
         assert!(due > last + Duration::from_micros(8_700) && due <= last + ms(9));
+
+        // Nor with jitter: gaps of 1.9 to 2.5 ms.
+        let mut jittered =
+            SimpleSenderCore::new(FLOW, 1_024).with_recovery_tuning(RecoveryTuning {
+                tail_probe: TailProbe::On,
+                tail_probe_max_per_mille: 1_000,
+                ..RecoveryTuning::default()
+            });
+        let mut at = t;
+        let mut probes = 0;
+        for index in 0..1_000_u64 {
+            at += Duration::from_micros(1_900 + (index * 7_919 % 601));
+            probes += jittered.poll_repairs_at(at).len();
+            jittered.send_payload(b"cbr", ntp, at);
+        }
+        assert_eq!(probes, 0);
     }
 
     #[test]
