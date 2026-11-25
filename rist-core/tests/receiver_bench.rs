@@ -15,8 +15,13 @@
 //! The file uses only API that already existed at rist-rs 904e3e8, so the same
 //! file can be dropped into an old checkout to compare.
 //!
+//! After the data, a tail (`RIST_BENCH_TAIL_MS`, default 300) keeps polling
+//! and delivering repairs without new data, so the final counts show holes
+//! that were really not repaired rather than repairs still in flight.
+//!
 //! Environment: `RIST_BENCH_SECS` (default 30), `RIST_BENCH_RTT_MS` (default
-//! 30), `RIST_BENCH_CASES` (comma list of case names, default all).
+//! 30), `RIST_BENCH_TAIL_MS` (default 300), `RIST_BENCH_CASES` (comma list of
+//! case names, default all).
 
 use rist_core::packet::rtcp::NackMode;
 use rist_core::time::ntp_now;
@@ -64,7 +69,8 @@ fn run_case(name: &str, packets_per_second: u64, loss_per_mille: u64) {
     let mut retransmits: VecDeque<(Instant, Vec<u8>)> = VecDeque::new();
     let mut batch: Vec<Vec<u8>> = Vec::with_capacity(64);
 
-    let total_ticks = seconds * 1000;
+    let data_ticks = seconds * 1000;
+    let total_ticks = data_ticks + env_u64("RIST_BENCH_TAIL_MS", 300);
     let start = Instant::now();
     let mut timed = Duration::ZERO;
     let mut accepted = 0_u64;
@@ -87,7 +93,11 @@ fn run_case(name: &str, packets_per_second: u64, loss_per_mille: u64) {
 
         // Untimed: produce this millisecond's packets and due retransmissions.
         batch.clear();
-        let count = packets_per_second * (tick + 1) / 1000 - packets_per_second * tick / 1000;
+        let count = if tick < data_ticks {
+            packets_per_second * (tick + 1) / 1000 - packets_per_second * tick / 1000
+        } else {
+            0
+        };
         for _ in 0..count {
             let packet = sender.send_payload(&payload, ntp, now);
             data_sent += 1;
