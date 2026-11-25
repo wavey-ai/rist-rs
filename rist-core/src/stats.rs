@@ -7,6 +7,20 @@ pub struct SenderStats {
     pub retransmitted_bytes: u64,
     pub feedback_packets: u64,
     pub rtt_micros: Option<u64>,
+    /// Sequences requested by received NACKs (before any refusal).
+    pub nack_requests: u64,
+    /// Requested sequences no longer (or never) in the send history.
+    pub retransmit_refused_not_in_history: u64,
+    /// Requested sequences older than the recovery buffer.
+    pub retransmit_refused_too_old: u64,
+    /// Retransmissions refused by the max_bitrate cap.
+    pub retransmit_refused_bitrate: u64,
+    /// Retransmissions refused because the previous one was less than an RTT ago.
+    pub retransmit_refused_spacing: u64,
+    /// Retransmissions refused because the sequence reached max_retries.
+    pub retransmit_refused_max_retries: u64,
+    /// Feedback packets that failed to decode.
+    pub feedback_decode_errors: u64,
 }
 
 impl SenderStats {
@@ -19,6 +33,13 @@ impl SenderStats {
             retransmitted_bytes: 0,
             feedback_packets: 0,
             rtt_micros: None,
+            nack_requests: 0,
+            retransmit_refused_not_in_history: 0,
+            retransmit_refused_too_old: 0,
+            retransmit_refused_bitrate: 0,
+            retransmit_refused_spacing: 0,
+            retransmit_refused_max_retries: 0,
+            feedback_decode_errors: 0,
         }
     }
 
@@ -63,6 +84,25 @@ pub struct ReceiverStats {
     pub currently_missing_packets: u64,
     pub feedback_packets: u64,
     pub rtt_micros: Option<u64>,
+    /// RTCP packets sent that carried a NACK (also counted in feedback_packets).
+    pub nack_packets: u64,
+    /// Sequences requested in NACK packets that were sent.
+    pub nack_entries_sent: u64,
+    /// Due sequences held back (packet limit or return-bandwidth refusal);
+    /// they stay due and are requested later.
+    pub nack_entries_deferred: u64,
+    /// Holes still missing when they reached the recovery age.
+    pub holes_expired: u64,
+    /// Missing sequences beyond the 16-bit NACK horizon (never requestable).
+    pub holes_unaddressable: u64,
+    /// Open holes discarded by a sender restart or reconfiguration.
+    pub holes_reset: u64,
+    /// Packets that arrived after their hole had expired.
+    pub late_packets: u64,
+    /// Holes that reached max_retries NACKs.
+    pub retries_exhausted: u64,
+    /// Holes not requested because a NACK could no longer arrive in time.
+    pub nack_too_late: u64,
 }
 
 impl ReceiverStats {
@@ -77,6 +117,15 @@ impl ReceiverStats {
             currently_missing_packets: 0,
             feedback_packets: 0,
             rtt_micros: None,
+            nack_packets: 0,
+            nack_entries_sent: 0,
+            nack_entries_deferred: 0,
+            holes_expired: 0,
+            holes_unaddressable: 0,
+            holes_reset: 0,
+            late_packets: 0,
+            retries_exhausted: 0,
+            nack_too_late: 0,
         }
     }
 
@@ -115,6 +164,21 @@ impl ReceiverStats {
 
     pub(crate) fn record_feedback(&mut self) {
         self.feedback_packets += 1;
+    }
+
+    pub(crate) fn record_nack_packet(&mut self, entries: usize) {
+        self.feedback_packets += 1;
+        self.nack_packets += 1;
+        self.nack_entries_sent += entries as u64;
+    }
+
+    pub(crate) fn apply_tracker_counters(&mut self, counters: crate::recovery::TrackerCounters) {
+        self.holes_expired = counters.holes_expired;
+        self.holes_unaddressable = counters.holes_unaddressable;
+        self.holes_reset = counters.holes_reset;
+        self.late_packets = counters.late_packets;
+        self.retries_exhausted = counters.retries_exhausted;
+        self.nack_too_late = counters.nack_too_late;
     }
 }
 
