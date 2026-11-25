@@ -174,6 +174,51 @@ fn librist_simple_sender_to_pure_rust_receiver() {
 }
 
 #[test]
+fn librist_simple_sender_answers_pure_rust_receiver_echo_requests() {
+    if !interop_enabled() {
+        return;
+    }
+    let _guard = lock_interop();
+    let flow_id = 0x1122_3344;
+    let receiver_port = next_even_test_port_pair();
+    let receiver_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, receiver_port));
+    let mut receiver =
+        SimpleMioReceiver::bind(receiver_addr, flow_id, "rust", NackMode::Range).unwrap();
+    let sender_url = format!("rist://127.0.0.1:{}", receiver.local_addr().unwrap().port());
+    let mut sender = rist::Sender::new(rist::Profile::Simple).unwrap();
+    sender.add_peer(&sender_url).unwrap();
+    sender.start().unwrap();
+
+    // The rist-rs receiver sends an echo request with its reports; the
+    // librist sender answers on the RTCP port and the receiver takes an
+    // RTT sample from the answer (not from repairs: nothing is lost).
+    let payload = mpegts_payload("LIBRIST SIMPLE ECHO");
+    let mut buf = [0; 1500];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while receiver.stats().rtt_samples_echo == 0 {
+        sender.send(&payload).unwrap();
+        while receiver.try_recv_payload(&mut buf).unwrap().is_some() {}
+        while receiver
+            .try_recv_rtcp_and_respond(&mut buf)
+            .unwrap()
+            .is_some()
+        {}
+        receiver
+            .poll_rtcp_and_send(Instant::now(), ntp_now())
+            .unwrap();
+        assert!(
+            Instant::now() < deadline,
+            "no echo RTT sample from the librist Simple sender: {:?}",
+            receiver.stats()
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    let stats = receiver.stats();
+    assert_eq!(stats.rtt_samples_karn, 0, "{stats:?}");
+    assert!(stats.rtt_micros.is_some(), "{stats:?}");
+}
+
+#[test]
 fn librist_simple_sender_to_pure_rust_ipv6_receiver() {
     if !interop_enabled() {
         return;
@@ -687,10 +732,37 @@ fn librist_main_sender_recovers_every_injected_loss_for_pure_rust_receiver() {
         sum(|stats| stats.retry_packets_received) >= 4,
         "librist repairs not seen as retries: {flow_stats:?}"
     );
-    assert!(
-        sum(|stats| stats.rtt_samples_echo + stats.rtt_samples_karn) >= 1,
-        "no RTT measured against librist: {flow_stats:?}"
-    );
+    // The echo round trip on its own: Karn samples from the repairs above
+    // would hide a librist sender that ignores or mis-parses the rist-rs
+    // receiver's echo requests.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        proxy.poll().unwrap();
+        while receiver
+            .try_recv_payload(&mut receiver_buf)
+            .unwrap()
+            .is_some()
+        {}
+        receiver
+            .poll_rtcp_and_send(Instant::now(), ntp_now())
+            .unwrap();
+        proxy.poll().unwrap();
+        let echo_samples = receiver
+            .peer_flow_ids(peer)
+            .unwrap()
+            .into_iter()
+            .filter_map(|flow_id| receiver.peer_flow_stats(peer, flow_id))
+            .map(|stats| stats.rtt_samples_echo)
+            .sum::<u64>();
+        if echo_samples >= 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "librist sender never answered an echo request: {flow_stats:?}"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
 }
 
 #[test]
@@ -780,32 +852,99 @@ fn librist_receiver_gets_echo_answers_from_pure_rust_sender() {
     }
     let _guard = lock_interop();
 
+    // librist starts a peer's RTT at its effective rtt_min (about 125 ms
+    // with the default buffer) and moves it by one eighth per echo
+    // response it accepts (only responses that carry the SSRC of its
+    // request). Once echo is on it ignores receiver reports, and a receiver
+    // has no other RTT source, so a flow RTT that falls to a few ms on
+    // loopback proves that librist took the rist-rs sender's answers.
     let port = next_even_test_port_pair();
     let receiver_url = format!("rist://@127.0.0.1:{port}");
     let receiver_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
-    let mut receiver = rist::Receiver::new(rist::Profile::Main).unwrap();
-    receiver.add_peer(&receiver_url).unwrap();
-    receiver.start().unwrap();
+    let receiver = rist::tokio::AsyncReceiver::bind(rist::Profile::Main, &receiver_url).unwrap();
     let mut sender =
         MainMioSender::connect(loopback_any(), receiver_addr, 0x1122_3344, 64).unwrap();
     send_main_session_probe(&mut sender);
-
-    // librist's receiver sends an echo request with its periodic RTCP
-    // (every 100 ms); the rist-rs sender answers each one.
-    let payload = mpegts_payload_7("PURE RUST ECHO");
-    let mut sender_buf = vec![0; 65_536];
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while sender.stats().echo_responses < 2 {
+    librist_rtt_follows_echo_answers(&receiver, || {
         sender
-            .send_payload(&payload, ntp_now(), Instant::now())
+            .send_payload(
+                &mpegts_payload_7("PURE RUST ECHO"),
+                ntp_now(),
+                Instant::now(),
+            )
             .unwrap();
-        while sender.try_recv_event(&mut sender_buf).unwrap().is_some() {}
-        let _ = receiver.read(Duration::from_millis(5)).unwrap();
+        let mut buf = vec![0; 65_536];
+        while sender.try_recv_event(&mut buf).unwrap().is_some() {}
+        sender.stats()
+    });
+}
+
+#[test]
+fn librist_simple_receiver_gets_echo_answers_from_pure_rust_sender() {
+    if !interop_enabled() {
+        return;
+    }
+    let _guard = lock_interop();
+
+    let port = next_even_test_port_pair();
+    let receiver_url = format!("rist://@127.0.0.1:{port}");
+    let receiver_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+    let receiver = rist::tokio::AsyncReceiver::bind(rist::Profile::Simple, &receiver_url).unwrap();
+    let sender_port = next_even_test_port_pair();
+    let sender_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, sender_port));
+    let mut sender = SimpleMioSender::connect(sender_addr, receiver_addr, 0x1122_3344, 64).unwrap();
+    sender.send_rtcp(&simple_rtcp_probe(0x1122_3344)).unwrap();
+    let mut buf = vec![0; 65_536];
+    librist_rtt_follows_echo_answers(&receiver, || {
+        sender
+            .send_payload(
+                &mpegts_payload_7("PURE RUST SIMPLE ECHO"),
+                ntp_now(),
+                Instant::now(),
+            )
+            .unwrap();
+        while sender
+            .try_recv_feedback_and_retransmit_at(&mut buf, ntp_now())
+            .unwrap()
+            .is_some()
+        {}
+        sender.stats()
+    });
+}
+
+/// Drives `step` (send a packet, serve feedback, return the sender's stats)
+/// every 5 ms until the librist receiver's flow RTT (reported once a
+/// second) has fallen from its starting value of at least 20 ms to under a
+/// quarter of it, and checks that the rist-rs sender answered echo
+/// requests. An unanswered or rejected echo leaves the RTT where it started.
+fn librist_rtt_follows_echo_answers(
+    receiver: &rist::tokio::AsyncReceiver,
+    mut step: impl FnMut() -> rist_core::SenderStats,
+) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut reported = Vec::new();
+    loop {
+        let sender_stats = step();
+        while receiver.try_recv().unwrap().is_some() {}
+        if let Some(stats) = receiver.raw_stats().filter(|stats| stats.peer_count >= 1) {
+            if reported.last() != Some(&stats.rtt) {
+                reported.push(stats.rtt);
+            }
+            let start = reported.iter().copied().max().unwrap_or(0);
+            if start >= 20 && stats.rtt * 4 < start {
+                assert!(
+                    sender_stats.echo_responses >= 2,
+                    "librist RTT fell without echo answers: {sender_stats:?}"
+                );
+                return;
+            }
+        }
         assert!(
             Instant::now() < deadline,
-            "librist receiver sent no echo request: {:?}",
-            sender.stats()
+            "librist receiver RTT did not follow the echo answers \
+             (RTT ms per stats report: {reported:?}); sender: {sender_stats:?}"
         );
+        thread::sleep(Duration::from_millis(5));
     }
 }
 
