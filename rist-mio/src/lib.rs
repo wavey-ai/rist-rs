@@ -4833,7 +4833,11 @@ mod tests {
         sender.send_echo_request_at(ntp).unwrap();
         let mut rx_buf = [0u8; 1500];
         let deadline = Instant::now() + Duration::from_secs(1);
-        while receiver.try_recv_rtcp_and_respond(&mut rx_buf).unwrap().is_none() {
+        while receiver
+            .try_recv_rtcp_and_respond(&mut rx_buf)
+            .unwrap()
+            .is_none()
+        {
             assert!(Instant::now() < deadline, "timed out waiting for the echo");
             thread::sleep(Duration::from_millis(1));
         }
@@ -4864,7 +4868,10 @@ mod tests {
             retries.extend(recv_feedback_eventually(&mut sender, &mut feedback_buf));
         }
         assert_eq!(
-            retries.iter().map(|retry| retry.sequence).collect::<Vec<_>>(),
+            retries
+                .iter()
+                .map(|retry| retry.sequence)
+                .collect::<Vec<_>>(),
             (0..500).map(|n| 2 * n + 1).collect::<Vec<_>>()
         );
     }

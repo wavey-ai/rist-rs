@@ -1374,7 +1374,9 @@ mod tests {
         assert_eq!(sender.stats().retransmit_refused_max_retries, 1);
         assert_eq!(bitrate_limited.stats().retransmit_refused_bitrate, 1);
         assert_eq!(expired.stats().retransmit_refused_too_old, 1);
-        assert!(expired.retransmit_at(&[old.sequence + 50], start).is_empty());
+        assert!(expired
+            .retransmit_at(&[old.sequence + 50], start)
+            .is_empty());
         assert_eq!(expired.stats().retransmit_refused_not_in_history, 1);
         assert_eq!(expired.stats().nack_requests, 2);
 
@@ -1495,7 +1497,8 @@ mod tests {
         let mut receiver = SimpleReceiverCore::new(0x1122_3344, "rust", NackMode::Range)
             .with_recovery_config(recovery, CongestionControlMode::Normal);
         for n in 0..=holes {
-            let packet = encode_packet(RtpHeader::new_mpegts((2 * n) as u16, 0, 0x1122_3344), b"ts");
+            let packet =
+                encode_packet(RtpHeader::new_mpegts((2 * n) as u16, 0, 0x1122_3344), b"ts");
             receiver.accept_packet(&packet).unwrap();
         }
         let start = Instant::now();
@@ -1541,7 +1544,12 @@ mod tests {
         // The next poll serves the repeat of the oldest holes first, then
         // the holes never requested.
         let mut packets = Vec::new();
-        receiver.poll_rtcp_into(start + 2 * DEFAULT_RTCP_FEEDBACK_INTERVAL, 0, &mut packets, 64);
+        receiver.poll_rtcp_into(
+            start + 2 * DEFAULT_RTCP_FEEDBACK_INTERVAL,
+            0,
+            &mut packets,
+            64,
+        );
         let requested = packets
             .iter()
             .flat_map(|packet| decode_nacks_from_compound(packet).unwrap())
@@ -1617,7 +1625,10 @@ mod tests {
         receiver.missing_tracker.observe_at(u32::MAX - 1, start);
         receiver.stats.received_packets = 1;
         let packet = encode_packet(RtpHeader::new_mpegts(2, 0, 1), b"ts");
-        assert_eq!(receiver.accept_packet_at(&packet, start).unwrap().sequence, 2);
+        assert_eq!(
+            receiver.accept_packet_at(&packet, start).unwrap().sequence,
+            2
+        );
         let report = receiver.receiver_report(0);
         assert_eq!(report.highest_sequence, 2);
         // Expected u32::MAX-1 ..= 2 (5 packets), received 2.

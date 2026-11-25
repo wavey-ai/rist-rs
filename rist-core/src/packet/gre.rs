@@ -1211,7 +1211,8 @@ mod tests {
             );
             let mut tx = PskKey::from_nonce(128, 0, b"secret", [9, 9, 9, version]).unwrap();
             let mut rx = PskKey::receiver(128, b"secret").unwrap();
-            let encrypted = encode_encrypted_reduced_payload(version, 5, reduced, b"secure", &mut tx);
+            let encrypted =
+                encode_encrypted_reduced_payload(version, 5, reduced, b"secure", &mut tx);
             match decode_main_packet(&encrypted, Some(&mut rx)).unwrap() {
                 MainPacket::Reduced(packet) => {
                     assert_eq!(packet.reduced, reduced);

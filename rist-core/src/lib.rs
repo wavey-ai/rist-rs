@@ -40,8 +40,8 @@ pub use mpegts::{expand_null_packets, suppress_null_packets, NullPacketSuppressi
 pub use packet::gre::MainPacket;
 pub use profile::Profile;
 pub use recovery::{
-    MissingTracker, OrderedPayloadBuffer, OrderedPayloadBufferError, ReceiverObservation,
-    SenderHistory,
+    HoleInfo, HoleStatus, MissingTracker, NackSchedule, OrderedPayloadBuffer,
+    OrderedPayloadBufferError, ReceiverObservation, RecoveredHole, SenderHistory, TrackerCounters,
 };
 pub use sequence::SequenceExtender;
 pub use simple::{

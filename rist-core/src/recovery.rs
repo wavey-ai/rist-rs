@@ -909,11 +909,19 @@ impl MissingTracker {
             }
             let highest = self.highest.expect("holes imply a highest sequence");
             assert!(highest.wrapping_sub(base) <= MAX_TRACKED_HOLE_DISTANCE);
-            assert_ne!(front.status, HoleStatus::Recovered, "front tombstones are popped");
+            assert_ne!(
+                front.status,
+                HoleStatus::Recovered,
+                "front tombstones are popped"
+            );
         }
         for (index, hole) in self.holes.iter().enumerate() {
             if index < self.fresh {
-                assert_ne!(hole.status, HoleStatus::Fresh, "fresh cursor skipped a hole");
+                assert_ne!(
+                    hole.status,
+                    HoleStatus::Fresh,
+                    "fresh cursor skipped a hole"
+                );
             }
             if hole.status == HoleStatus::Scheduled {
                 assert!(
@@ -1119,7 +1127,12 @@ mod tests {
         }
     }
 
-    fn take(tracker: &mut MissingTracker, now: Instant, plan: &NackSchedule, limit: usize) -> Vec<u32> {
+    fn take(
+        tracker: &mut MissingTracker,
+        now: Instant,
+        plan: &NackSchedule,
+        limit: usize,
+    ) -> Vec<u32> {
         let mut out = Vec::new();
         tracker.take_due_nacks(now, plan, limit, &mut out);
         tracker.check_invariants();
@@ -1365,7 +1378,10 @@ mod tests {
         };
         // Hole 1 was detected at +0 (deadline +100) and hole 3 at +40
         // (deadline +140): at +60 only hole 3 has 50 ms left.
-        assert_eq!(take(&mut tracker, start + ms(60), &plan, usize::MAX), vec![3]);
+        assert_eq!(
+            take(&mut tracker, start + ms(60), &plan, usize::MAX),
+            vec![3]
+        );
         assert_eq!(tracker.counters().nack_too_late, 1);
         assert_eq!(tracker.hole(1).unwrap().status, HoleStatus::Abandoned);
         assert_eq!(tracker.missing_len(), 2);
@@ -1427,10 +1443,14 @@ mod tests {
         let mut tracker = MissingTracker::with_limits(64, Duration::from_secs(1));
         tracker.observe_at(0, start);
         tracker.observe_at(4, start);
-        assert!(tracker.nacks_due(start + ms(14), ms(15), ms(20), 6, 20).is_empty());
+        assert!(tracker
+            .nacks_due(start + ms(14), ms(15), ms(20), 6, 20)
+            .is_empty());
         let now = start + ms(15);
         assert_eq!(tracker.nacks_due(now, ms(15), ms(20), 6, 20), vec![3, 2, 1]);
-        assert!(tracker.nacks_due(now + ms(19), ms(15), ms(20), 6, 20).is_empty());
+        assert!(tracker
+            .nacks_due(now + ms(19), ms(15), ms(20), 6, 20)
+            .is_empty());
         assert_eq!(
             tracker.nacks_due(now + ms(20), ms(15), ms(20), 6, 20),
             vec![3, 2, 1]

@@ -1262,8 +1262,8 @@ mod tests {
         let start = Instant::now();
         let ntp = ntp_from_unix_duration(Duration::from_secs(1));
         let mut receiver = MainReceiverCore::new(0x10, "rust", NackMode::Range);
-        let mut senders = [0x30_u32, 0x10, 0x20]
-            .map(|ssrc| (ssrc, MainSenderCore::new(ssrc, 4096)));
+        let mut senders =
+            [0x30_u32, 0x10, 0x20].map(|ssrc| (ssrc, MainSenderCore::new(ssrc, 4096)));
         for (_, sender) in &mut senders {
             for index in 0..=1_000_u32 {
                 let packet = sender.send_payload(&index.to_be_bytes(), ntp, start);
@@ -1278,7 +1278,10 @@ mod tests {
         let due = receiver.poll_rtcp_all(now + Duration::from_millis(20), ntp);
         // 500 isolated holes per flow: 3 packets of at most 200 records each.
         let flows = due.iter().map(|(flow_id, _)| *flow_id).collect::<Vec<_>>();
-        assert_eq!(flows, vec![0x10, 0x10, 0x10, 0x20, 0x20, 0x20, 0x30, 0x30, 0x30]);
+        assert_eq!(
+            flows,
+            vec![0x10, 0x10, 0x10, 0x20, 0x20, 0x20, 0x30, 0x30, 0x30]
+        );
         for (ssrc, sender) in &mut senders {
             let mut retries = 0;
             let mut first = None;
