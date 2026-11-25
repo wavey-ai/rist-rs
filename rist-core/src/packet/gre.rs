@@ -457,23 +457,56 @@ pub fn decode_main_packet(input: &[u8], key: Option<&mut PskKey>) -> Result<Main
             .ok_or(Error::UnsupportedGreProtocol(gre.protocol_type))?;
         key.decrypt(nonce.to_be_bytes(), gre.version, sequence, &input[offset..])?
     } else {
-        input[offset..].to_vec()
+        let payload = &input[offset..];
+        if is_reduced_payload(gre, payload) {
+            // Data path: copy only the media payload, not the whole datagram.
+            let packet = ReducedPacket::decode_after_gre(gre, payload)?;
+            return Ok(MainPacket::Reduced(OwnedReducedPacket {
+                gre,
+                vsf: packet.vsf,
+                reduced: packet.reduced,
+                payload: packet.payload.to_vec(),
+            }));
+        }
+        payload.to_vec()
     };
 
     decode_main_payload(gre, payload)
 }
 
+fn is_reduced_payload(gre: GreHeader, payload: &[u8]) -> bool {
+    match gre.protocol_type {
+        GRE_PROTOCOL_TYPE_REDUCED => true,
+        GRE_PROTOCOL_TYPE_VSF => VsfHeader::decode(payload).is_ok_and(|vsf| {
+            vsf.protocol_type == VSF_PROTOCOL_TYPE_RIST && vsf.subtype == VSF_SUBTYPE_REDUCED
+        }),
+        _ => false,
+    }
+}
+
+/// Builds an owned reduced packet from a decrypted buffer by dropping the
+/// headers in place instead of copying the payload into a new allocation.
+fn owned_reduced_from_buffer(gre: GreHeader, mut payload: Vec<u8>) -> Result<MainPacket> {
+    let (vsf, reduced, header_len) = {
+        let packet = ReducedPacket::decode_after_gre(gre, &payload)?;
+        (
+            packet.vsf,
+            packet.reduced,
+            payload.len() - packet.payload.len(),
+        )
+    };
+    payload.drain(..header_len);
+    Ok(MainPacket::Reduced(OwnedReducedPacket {
+        gre,
+        vsf,
+        reduced,
+        payload,
+    }))
+}
+
 fn decode_main_payload(gre: GreHeader, payload: Vec<u8>) -> Result<MainPacket> {
     match gre.protocol_type {
-        GRE_PROTOCOL_TYPE_REDUCED => {
-            let packet = ReducedPacket::decode_after_gre(gre, &payload)?;
-            Ok(MainPacket::Reduced(OwnedReducedPacket {
-                gre,
-                vsf: packet.vsf,
-                reduced: packet.reduced,
-                payload: packet.payload.to_vec(),
-            }))
-        }
+        GRE_PROTOCOL_TYPE_REDUCED => owned_reduced_from_buffer(gre, payload),
         GRE_PROTOCOL_TYPE_KEEPALIVE => Ok(MainPacket::Keepalive(
             KeepalivePacket::decode_after_gre(gre, &payload)?.into_owned(),
         )),
@@ -492,15 +525,7 @@ fn decode_main_payload(gre: GreHeader, payload: Vec<u8>) -> Result<MainPacket> {
                 });
             }
             match vsf.subtype {
-                VSF_SUBTYPE_REDUCED => {
-                    let packet = ReducedPacket::decode_after_gre(gre, &payload)?;
-                    Ok(MainPacket::Reduced(OwnedReducedPacket {
-                        gre,
-                        vsf: packet.vsf,
-                        reduced: packet.reduced,
-                        payload: packet.payload.to_vec(),
-                    }))
-                }
+                VSF_SUBTYPE_REDUCED => owned_reduced_from_buffer(gre, payload),
                 VSF_SUBTYPE_KEEPALIVE => Ok(MainPacket::Keepalive(
                     KeepalivePacket::decode_after_gre(gre, &payload)?.into_owned(),
                 )),
@@ -1164,5 +1189,41 @@ mod tests {
             decode_main_packet(&bytes, None).unwrap(),
             MainPacket::Unknown { payload, .. } if payload == b"opaque"
         ));
+    }
+
+    #[test]
+    fn main_datagram_decoder_matches_the_borrowed_reduced_decoder() {
+        let reduced = ReducedHeader {
+            src_port: 1971,
+            dst_port: 1968,
+        };
+        for version in [0, 1, 2] {
+            let clear = encode_reduced_payload(version, 70_000, reduced, b"ts-payload");
+            let borrowed = ReducedPacket::decode(&clear).unwrap();
+            assert_eq!(
+                decode_main_packet(&clear, None).unwrap(),
+                MainPacket::Reduced(OwnedReducedPacket {
+                    gre: borrowed.gre,
+                    vsf: borrowed.vsf,
+                    reduced,
+                    payload: b"ts-payload".to_vec(),
+                })
+            );
+            let mut tx = PskKey::from_nonce(128, 0, b"secret", [9, 9, 9, version]).unwrap();
+            let mut rx = PskKey::receiver(128, b"secret").unwrap();
+            let encrypted = encode_encrypted_reduced_payload(version, 5, reduced, b"secure", &mut tx);
+            match decode_main_packet(&encrypted, Some(&mut rx)).unwrap() {
+                MainPacket::Reduced(packet) => {
+                    assert_eq!(packet.reduced, reduced);
+                    assert_eq!(packet.vsf.is_some(), version >= 2);
+                    assert_eq!(packet.payload, b"secure");
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        // A truncated reduced header is still an error, not a silent drop.
+        let mut short = encode_reduced_payload(1, 1, reduced, b"");
+        short.truncate(short.len() - 1);
+        assert!(decode_main_packet(&short, None).is_err());
     }
 }
