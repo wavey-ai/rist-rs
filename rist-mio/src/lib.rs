@@ -177,12 +177,14 @@ impl RtpUdpSocket {
         Self::from_socket(socket, Some(peer), ssrc)
     }
 
+    /// The SSRC's least significant bit marks RIST retransmissions, so it
+    /// is cleared: with an odd SSRC every packet would read as a repair.
     fn from_socket(socket: UdpSocket, peer: Option<SocketAddr>, ssrc: u32) -> io::Result<Self> {
         let socket = Self {
             socket,
             peer,
             next_sequence: 0,
-            ssrc,
+            ssrc: ssrc & !1,
             receive_scratch: vec![0u8; SAFE_RECEIVE_CAPACITY],
         };
         socket.configure_optimal_socket_buffers()?;
@@ -4119,11 +4121,11 @@ mod tests {
     #[test]
     fn simple_receiver_counts_only_nacks_that_were_sent() {
         let mut receiver =
-            SimpleMioReceiver::bind(loopback_any(), 1, "receiver", NackMode::Range).unwrap();
+            SimpleMioReceiver::bind(loopback_any(), 2, "receiver", NackMode::Range).unwrap();
         receiver.set_recovery_tuning(static_tuning());
         let start = Instant::now();
         for n in 0..=250_u16 {
-            let packet = encode_packet(RtpHeader::new_mpegts(2 * n, 0, 1), b"ts");
+            let packet = encode_packet(RtpHeader::new_mpegts(2 * n, 0, 2), b"ts");
             receiver.core.accept_packet_at(&packet, start).unwrap();
         }
         // An IPv6 destination on an IPv4 socket: every send fails.
@@ -4994,7 +4996,7 @@ mod tests {
         let ipv4 = loopback_any();
         let ipv6 = ipv6_loopback_any();
 
-        let error = match SimpleMioSender::connect(ipv4, ipv6, 1, 64) {
+        let error = match SimpleMioSender::connect(ipv4, ipv6, 2, 64) {
             Ok(_) => panic!("mixed-family Simple sender unexpectedly connected"),
             Err(error) => error,
         };
@@ -5007,7 +5009,7 @@ mod tests {
         };
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
 
-        let error = match MainMioSender::connect(ipv4, ipv6, 1, 64) {
+        let error = match MainMioSender::connect(ipv4, ipv6, 2, 64) {
             Ok(_) => panic!("mixed-family Main sender unexpectedly connected"),
             Err(error) => error,
         };

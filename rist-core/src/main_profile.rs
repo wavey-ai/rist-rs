@@ -1332,6 +1332,18 @@ mod tests {
     }
 
     #[test]
+    fn main_sender_clears_the_retry_bit_of_an_odd_flow_id() {
+        let now = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut sender = MainSenderCore::new(0x1122_3345, 64);
+        let packet = sender.send_payload(b"payload", ntp, now);
+        let decoded = ReducedPacket::decode(&packet.bytes).unwrap();
+        let rtp = RtpPacket::decode(decoded.payload).unwrap();
+        assert_eq!(rtp.header.ssrc, 0x1122_3344);
+        assert_eq!(sender.stats().flow_id, 0x1122_3344);
+    }
+
+    #[test]
     fn main_session_timers_schedule_keepalive_and_timeout() {
         let start = Instant::now();
         let mut timers = MainSessionTimers::with_config(MainSessionConfig {

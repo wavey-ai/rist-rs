@@ -328,7 +328,12 @@ impl TailProbeState {
 }
 
 impl SimpleSenderCore {
+    /// A sender with flow id `ssrc`. The least significant bit marks
+    /// retransmissions on the wire, so it is cleared (as librist does with
+    /// `flow_id &= ~1`): an odd value would make every original look like a
+    /// repair to the receiver.
     pub fn new(ssrc: u32, history_packets: usize) -> Self {
+        let ssrc = ssrc & !1;
         Self {
             ssrc,
             cname: "rust".to_string(),
@@ -2713,7 +2718,7 @@ mod tests {
             max_bitrate: 100_000,
             ..RecoveryConfig::default()
         };
-        let mut sender = SimpleSenderCore::new(1, 8)
+        let mut sender = SimpleSenderCore::new(2, 8)
             .with_recovery_config(recovery.clone(), CongestionControlMode::Normal);
         let packet = sender.send_payload(b"payload", ntp, start);
 
@@ -2724,7 +2729,7 @@ mod tests {
 
         recovery.max_retries = 20;
         recovery.max_bitrate = 1;
-        let mut bitrate_limited = SimpleSenderCore::new(1, 8)
+        let mut bitrate_limited = SimpleSenderCore::new(2, 8)
             .with_recovery_config(recovery.clone(), CongestionControlMode::Off);
         let large = bitrate_limited.send_payload(&vec![0; 256], ntp, start);
         assert!(bitrate_limited
@@ -2732,7 +2737,7 @@ mod tests {
             .is_empty());
 
         recovery.max_bitrate = 100_000;
-        let mut expired = SimpleSenderCore::new(1, 8)
+        let mut expired = SimpleSenderCore::new(2, 8)
             .with_recovery_config(recovery.clone(), CongestionControlMode::Off);
         let old = expired.send_payload(b"old", ntp, start);
         expired.send_payload(b"successor", ntp, start);
@@ -2753,7 +2758,7 @@ mod tests {
         assert_eq!(expired.stats().retransmit_refused_not_in_history, 1);
         assert_eq!(expired.stats().nack_requests, 2);
 
-        let mut spaced = SimpleSenderCore::new(1, 8)
+        let mut spaced = SimpleSenderCore::new(2, 8)
             .with_recovery_config(recovery, CongestionControlMode::Normal);
         let packet = spaced.send_payload(b"spaced", ntp, start);
         assert_eq!(spaced.retransmit_at(&[packet.sequence], start).len(), 1);
@@ -3643,6 +3648,38 @@ mod tests {
         // The receiver report names the flow, not the retry SSRC.
         let report = receiver.build_receiver_report(ntp);
         assert_eq!(&report[8..12], &0x1122_3344u32.to_be_bytes());
+    }
+
+    #[test]
+    fn sender_clears_the_retry_bit_of_an_odd_ssrc() {
+        let now = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut sender = SimpleSenderCore::new(0x1122_3345, 64);
+        let mut receiver = SimpleReceiverCore::new(0x1122_3344, "rust", NackMode::Range);
+        let packets = (0..3)
+            .map(|index| sender.send_payload(&[index], ntp, now))
+            .collect::<Vec<_>>();
+        for packet in &packets {
+            assert_eq!(
+                RtpPacket::decode(&packet.bytes).unwrap().header.ssrc,
+                0x1122_3344
+            );
+        }
+        receiver.accept_packet(&packets[0].bytes).unwrap();
+        receiver.accept_packet(&packets[2].bytes).unwrap();
+        // Originals are not repairs.
+        assert_eq!(receiver.stats().retry_packets_received, 0);
+        let retry = sender.retransmit_at(&[1], now);
+        assert_eq!(
+            RtpPacket::decode(&retry[0].bytes).unwrap().header.ssrc,
+            0x1122_3345
+        );
+        assert!(receiver.accept_packet(&retry[0].bytes).unwrap().recovered);
+        assert_eq!(receiver.stats().retry_packets_received, 1);
+        // RTCP and stats name the even flow id too.
+        assert_eq!(&sender.build_sender_report(ntp)[4..8], &0x1122_3344u32.to_be_bytes());
+        assert_eq!(&sender.build_echo_request(ntp)[4..8], &0x1122_3344u32.to_be_bytes());
+        assert_eq!(sender.stats().flow_id, 0x1122_3344);
     }
 
     #[test]
