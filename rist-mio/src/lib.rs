@@ -1282,14 +1282,27 @@ impl SimpleMioReceiver {
         self.core.poll_rtcp(now, now_ntp)
     }
 
+    /// Sends every due RTCP packet (all due NACK packets, oldest holes
+    /// first, or a periodic receiver report) and returns the bytes sent.
     pub fn poll_rtcp_and_send(&mut self, now: Instant, now_ntp: u64) -> io::Result<Option<usize>> {
         let Some(peer) = self.last_rtcp_peer else {
             return Ok(None);
         };
-        let Some(packet) = self.poll_rtcp_packet(now, now_ntp) else {
+        let mut packets = Vec::new();
+        self.core.poll_rtcp_into(
+            now,
+            now_ntp,
+            &mut packets,
+            rist_core::simple::MAX_NACK_PACKETS_PER_POLL,
+        );
+        if packets.is_empty() {
             return Ok(None);
-        };
-        self.rtcp_socket.send_packet_to(peer, &packet).map(Some)
+        }
+        let mut sent = 0;
+        for packet in &packets {
+            sent += self.rtcp_socket.send_packet_to(peer, packet)?;
+        }
+        Ok(Some(sent))
     }
 
     pub fn send_feedback(&mut self) -> io::Result<Option<usize>> {
@@ -3040,27 +3053,24 @@ impl MainMioReceiver {
         if self.configured_peer.is_some_and(|peer| peer != from) {
             return Ok(None);
         }
-        if !self.peer_runtime.contains_key(&from) {
-            if self.peer_runtime.len() >= self.max_peers {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    format!("RIST Main receiver peer capacity is {}", self.max_peers),
-                ));
-            }
-            self.peer_runtime.insert(
-                from,
-                MainReceiverPeerRuntime {
+        let peers = self.peer_runtime.len();
+        let runtime = match self.peer_runtime.entry(from) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                if peers >= self.max_peers {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        format!("RIST Main receiver peer capacity is {}", self.max_peers),
+                    ));
+                }
+                entry.insert(MainReceiverPeerRuntime {
                     core: self.core.fresh_session(),
                     timers: MainSessionTimers::with_config(self.timers.config()),
                     srp: self.srp.clone(),
                     srp_client: self.srp_client.clone(),
-                },
-            );
-        }
-        let runtime = self
-            .peer_runtime
-            .get_mut(&from)
-            .expect("RIST Main receiver peer runtime must exist");
+                })
+            }
+        };
         let packet = runtime
             .core
             .decode_datagram(datagram)
@@ -3107,7 +3117,7 @@ impl MainMioReceiver {
             MainPacket::Reduced(packet) => {
                 let payload = runtime
                     .core
-                    .accept_reduced(packet.reduced, &packet.payload)
+                    .accept_reduced_at(packet.reduced, &packet.payload, now)
                     .map_err(core_to_io_error)?;
                 self.last_peer = Some(from);
                 runtime.timers.observe_peer_activity(now);
@@ -4807,6 +4817,56 @@ mod tests {
         let recovered = recv_payload_eventually(&mut receiver, &mut rx_buf);
         assert!(recovered.recovered);
         assert_eq!(recovered.payload, b"lost");
+    }
+
+    #[test]
+    fn simple_profile_poll_sends_every_due_nack_packet() {
+        let flow_id = 0x1122_3344;
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut receiver =
+            SimpleMioReceiver::bind(loopback_any(), flow_id, "rust", NackMode::Range).unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+        let mut sender =
+            SimpleMioSender::connect(loopback_any(), receiver_addr, flow_id, 2048).unwrap();
+
+        // The receiver learns its RTCP peer from the sender's echo request.
+        sender.send_echo_request_at(ntp).unwrap();
+        let mut rx_buf = [0u8; 1500];
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while receiver.try_recv_rtcp_and_respond(&mut rx_buf).unwrap().is_none() {
+            assert!(Instant::now() < deadline, "timed out waiting for the echo");
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        let now = Instant::now();
+        for index in 0..=1_000_u32 {
+            let packet = sender.build_payload(&index.to_be_bytes(), ntp, now);
+            if index % 2 == 0 {
+                sender.send_outbound(&packet).unwrap();
+                recv_payload_eventually(&mut receiver, &mut rx_buf);
+            }
+        }
+        assert_eq!(receiver.core.missing_sequences().len(), 500);
+
+        let polled = Instant::now();
+        assert_eq!(receiver.poll_rtcp_and_send(polled, ntp).unwrap(), None);
+        let sent = receiver
+            .poll_rtcp_and_send(polled + Duration::from_millis(20), ntp)
+            .unwrap()
+            .unwrap();
+        // 200 + 200 + 100 single-hole records, each packet with RR + SDES.
+        assert!(sent > 2_000, "{sent} bytes");
+        assert_eq!(receiver.stats().nack_packets, 3);
+
+        let mut feedback_buf = [0u8; 1500];
+        let mut retries = Vec::new();
+        while retries.len() < 500 {
+            retries.extend(recv_feedback_eventually(&mut sender, &mut feedback_buf));
+        }
+        assert_eq!(
+            retries.iter().map(|retry| retry.sequence).collect::<Vec<_>>(),
+            (0..500).map(|n| 2 * n + 1).collect::<Vec<_>>()
+        );
     }
 
     #[test]
