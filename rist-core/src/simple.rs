@@ -1640,14 +1640,18 @@ impl SimpleReceiverCore {
             CongestionControlMode::Off | CongestionControlMode::Normal => 1.1,
         };
         // A copy of each NACK a few ms later (B2): the sender refuses it
-        // by its spacing when the first arrived. Not with congestion control
-        // off (the sender would serve every copy), and not when the gap
-        // would come near the sender's spacing (tiny rtt_min).
-        let copy_gap = (rtt / 20).clamp(Duration::from_millis(1), Duration::from_millis(5));
+        // by its spacing when the first arrived. The gap stays below
+        // 0.4 x rtt_min, under the spacing (0.9 x rtt_min) of a sender that
+        // has no RTT of its own (one that never polls its RTCP). Not with
+        // congestion control off (the sender would serve every copy), and
+        // not when that leaves less than 1 ms (tiny rtt_min).
+        let copy_gap = (rtt / 20)
+            .clamp(Duration::from_millis(1), Duration::from_millis(5))
+            .min(rtt_min.mul_f64(0.4));
         let copy_gap = (self.tuning.redundant_nacks
             && self.congestion_control != CongestionControlMode::Off
-            && copy_gap.saturating_mul(2) <= rtt)
-            .then_some(copy_gap);
+            && copy_gap >= Duration::from_millis(1))
+        .then_some(copy_gap);
         // The next attempt is 1.1 x rtt after the copy reached the sender.
         let repeat = NackRepeat {
             delay: rtt.mul_f64(multiplier)
@@ -2570,6 +2574,16 @@ mod tests {
         // A 1 ms copy gap would not stay below the sender's spacing.
         assert_eq!(nack_times(&mut receiver, t0, 0, 20, 1), vec![15, 18]);
         assert_eq!(receiver.stats().nack_copies_sent, 0);
+    }
+
+    #[test]
+    fn nack_copy_gap_stays_under_a_sender_spacing_of_rtt_min() {
+        // RTT 200 ms would give a 5 ms gap, but a sender without an RTT of
+        // its own spaces repairs by 0.9 x rtt_min = 4.5 ms: the gap is held
+        // at 0.4 x rtt_min = 2 ms so the copy is still refused.
+        let (mut receiver, t0) = receiver_with_hole(redundant_tuning(), RecoveryConfig::default());
+        learn_rtt(&mut receiver, ms(200));
+        assert_eq!(nack_times(&mut receiver, t0, 0, 20, 1), vec![15, 17]);
     }
 
     #[test]
