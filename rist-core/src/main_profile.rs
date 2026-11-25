@@ -688,7 +688,6 @@ pub struct MainReceiverCore {
     flow_reduced: FlowMap<ReducedHeader>,
     tx_key: Option<PskKey>,
     rx_key: Option<PskKey>,
-    rtcp_scratch: Vec<Vec<u8>>,
 }
 
 impl MainReceiverCore {
@@ -714,7 +713,6 @@ impl MainReceiverCore {
             flow_reduced: FlowMap::default(),
             tx_key: None,
             rx_key: None,
-            rtcp_scratch: Vec::new(),
         }
     }
 
@@ -829,21 +827,58 @@ impl MainReceiverCore {
         now_ntp: u64,
     ) -> Vec<(u32, MainReceiverFeedback)> {
         let mut due = Vec::new();
-        let mut packets = std::mem::take(&mut self.rtcp_scratch);
-        for index in 0..self.flow_order.len() {
-            let flow_id = self.flow_order[index];
-            packets.clear();
-            self.flows
+        self.poll_rtcp_all_with(now, now_ntp, |flow_id, feedback| {
+            due.push((flow_id, feedback));
+            true
+        });
+        due
+    }
+
+    /// [`Self::poll_rtcp_all`] for a transport that sends each packet as it
+    /// is built: `send` puts one wrapped packet of a flow on the wire and
+    /// returns whether it went out. Flows are polled in ascending flow-id
+    /// order, each for up to [`MAX_NACK_PACKETS_PER_POLL`] packets. Holes
+    /// count as requested only once `send` accepted their packet (see
+    /// [`SimpleReceiverCore::poll_rtcp_with`]). After the first refusal no
+    /// further packet is built: the refused packet's holes and every later
+    /// due hole stay due for the next poll. Returns the number of packets
+    /// `send` accepted.
+    pub fn poll_rtcp_all_with<F>(&mut self, now: Instant, now_ntp: u64, mut send: F) -> usize
+    where
+        F: FnMut(u32, MainReceiverFeedback) -> bool,
+    {
+        let Self {
+            flows,
+            flow_order,
+            flow_reduced,
+            gre_version,
+            next_gre_sequence,
+            tx_key,
+            ..
+        } = self;
+        let mut accepted = 0;
+        let mut refused = false;
+        for &flow_id in flow_order.iter() {
+            if refused {
+                break;
+            }
+            let reduced = reply_reduced(flow_reduced.get(&flow_id).copied());
+            accepted += flows
                 .get_mut(&flow_id)
                 .expect("listed Main receiver flow must exist")
-                .poll_rtcp_into(now, now_ntp, &mut packets, MAX_NACK_PACKETS_PER_POLL);
-            for packet in packets.drain(..) {
-                let feedback = self.wrap_feedback_payload_for_flow(flow_id, &packet);
-                due.push((flow_id, feedback));
-            }
+                .poll_rtcp_with(now, now_ntp, MAX_NACK_PACKETS_PER_POLL, |packet| {
+                    let feedback = wrap_receiver_feedback(
+                        *gre_version,
+                        next_gre_sequence,
+                        tx_key,
+                        reduced,
+                        packet,
+                    );
+                    refused = !send(flow_id, feedback);
+                    !refused
+                });
         }
-        self.rtcp_scratch = packets;
-        due
+        accepted
     }
 
     pub fn handle_rtcp(
@@ -872,16 +907,7 @@ impl MainReceiverCore {
     }
 
     fn wrap_feedback_payload(&mut self, feedback: &[u8]) -> MainReceiverFeedback {
-        let reduced = self
-            .last_reduced
-            .map(|reduced| ReducedHeader {
-                src_port: reduced.dst_port,
-                dst_port: reduced.src_port,
-            })
-            .unwrap_or(ReducedHeader {
-                src_port: DEFAULT_VIRT_DST_PORT,
-                dst_port: DEFAULT_VIRT_SRC_PORT,
-            });
+        let reduced = reply_reduced(self.last_reduced);
         self.wrap_feedback_with_reduced(reduced, feedback)
     }
 
@@ -890,18 +916,7 @@ impl MainReceiverCore {
         flow_id: u32,
         feedback: &[u8],
     ) -> MainReceiverFeedback {
-        let reduced = self
-            .flow_reduced
-            .get(&flow_id)
-            .copied()
-            .map(|reduced| ReducedHeader {
-                src_port: reduced.dst_port,
-                dst_port: reduced.src_port,
-            })
-            .unwrap_or(ReducedHeader {
-                src_port: DEFAULT_VIRT_DST_PORT,
-                dst_port: DEFAULT_VIRT_SRC_PORT,
-            });
+        let reduced = reply_reduced(self.flow_reduced.get(&flow_id).copied());
         self.wrap_feedback_with_reduced(reduced, feedback)
     }
 
@@ -910,16 +925,13 @@ impl MainReceiverCore {
         reduced: ReducedHeader,
         feedback: &[u8],
     ) -> MainReceiverFeedback {
-        let gre_sequence = self.next_gre_sequence();
-        let bytes = if let Some(key) = &mut self.tx_key {
-            encode_encrypted_reduced_payload(self.gre_version, gre_sequence, reduced, feedback, key)
-        } else {
-            encode_reduced_payload(self.gre_version, gre_sequence, reduced, feedback)
-        };
-        MainReceiverFeedback {
-            gre_sequence,
-            bytes,
-        }
+        wrap_receiver_feedback(
+            self.gre_version,
+            &mut self.next_gre_sequence,
+            &mut self.tx_key,
+            reduced,
+            feedback,
+        )
     }
 
     pub fn build_keepalive(&mut self, keepalive: GreKeepalive<'_>) -> MainControlPacket {
@@ -1110,6 +1122,40 @@ impl DecodedReduced<'_> {
     }
 }
 
+/// Wraps one receiver RTCP compound in a reduced-overhead GRE packet (and
+/// encrypts it with `tx_key`), consuming one GRE sequence.
+fn wrap_receiver_feedback(
+    gre_version: u8,
+    next_gre_sequence: &mut u32,
+    tx_key: &mut Option<PskKey>,
+    reduced: ReducedHeader,
+    feedback: &[u8],
+) -> MainReceiverFeedback {
+    let gre_sequence = *next_gre_sequence;
+    *next_gre_sequence = gre_sequence.wrapping_add(1);
+    let bytes = if let Some(key) = tx_key {
+        encode_encrypted_reduced_payload(gre_version, gre_sequence, reduced, feedback, key)
+    } else {
+        encode_reduced_payload(gre_version, gre_sequence, reduced, feedback)
+    };
+    MainReceiverFeedback {
+        gre_sequence,
+        bytes,
+    }
+}
+
+fn reply_reduced(flow_reduced: Option<ReducedHeader>) -> ReducedHeader {
+    flow_reduced
+        .map(|reduced| ReducedHeader {
+            src_port: reduced.dst_port,
+            dst_port: reduced.src_port,
+        })
+        .unwrap_or(ReducedHeader {
+            src_port: DEFAULT_VIRT_DST_PORT,
+            dst_port: DEFAULT_VIRT_SRC_PORT,
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1296,6 +1342,51 @@ mod tests {
             assert_eq!(stats.nack_packets, 3);
             assert_eq!(stats.nack_entries_sent, 500);
         }
+    }
+
+    #[test]
+    fn main_poll_rtcp_all_with_stops_at_a_refused_send_and_keeps_holes_due() {
+        let start = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut receiver = MainReceiverCore::new(0x10, "rust", NackMode::Range);
+        for ssrc in [0x10_u32, 0x20] {
+            let mut sender = MainSenderCore::new(ssrc, 4096);
+            for index in 0..=1_000_u32 {
+                let packet = sender.send_payload(&index.to_be_bytes(), ntp, start);
+                if index % 2 == 0 {
+                    receiver.accept_packet(&packet.bytes).unwrap();
+                }
+            }
+        }
+        let now = Instant::now();
+        assert!(receiver.poll_rtcp_all(now, ntp).is_empty());
+        let first_poll = now + Duration::from_millis(20);
+        // Accept the first packet of flow 0x10, refuse the second.
+        let mut offered = Vec::new();
+        let accepted = receiver.poll_rtcp_all_with(first_poll, ntp, |flow_id, _| {
+            offered.push(flow_id);
+            offered.len() == 1
+        });
+        assert_eq!(accepted, 1);
+        assert_eq!(offered, vec![0x10, 0x10], "nothing offered after a refusal");
+        let stats = receiver.stats_for_flow(0x10).unwrap();
+        assert_eq!(stats.nack_packets, 1);
+        assert_eq!(stats.nack_entries_sent, 200);
+        assert_eq!(stats.nack_entries_deferred, 300);
+        assert_eq!(receiver.stats_for_flow(0x20).unwrap().nack_packets, 0);
+
+        // The next poll requests the refused holes and the untouched flow.
+        let due = receiver.poll_rtcp_all(first_poll + Duration::from_millis(20), ntp);
+        let flows = due.iter().map(|(flow_id, _)| *flow_id).collect::<Vec<_>>();
+        assert_eq!(flows, vec![0x10, 0x10, 0x10, 0x20, 0x20, 0x20]);
+        assert_eq!(
+            receiver.stats_for_flow(0x10).unwrap().nack_entries_sent,
+            200 + 500
+        );
+        assert_eq!(
+            receiver.stats_for_flow(0x20).unwrap().nack_entries_sent,
+            500
+        );
     }
 
     #[test]

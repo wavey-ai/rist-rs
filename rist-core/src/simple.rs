@@ -3,7 +3,7 @@ use crate::packet::rtcp::{
     decode_compound, decode_nacks_from_compound, encode_echo, encode_empty_receiver_report,
     encode_nack, encode_nack_chunk, encode_receiver_report, encode_sdes_cname,
     encode_sender_report, Echo, EchoKind, NackMode, ReceiverReport, RtcpPacket, SenderReport,
-    MAX_NACK_RECORDS_PER_PACKET,
+    MAX_NACK_PACKET_REQUESTS, MAX_NACK_RECORDS_PER_PACKET,
 };
 use crate::packet::rtp::{
     encode_packet, encode_packet_with_extension, RistRtpExtension, RtpHeader, RtpPacket,
@@ -618,6 +618,7 @@ pub struct SimpleReceiverCore {
     return_window_started: Instant,
     return_window_bytes: u64,
     nack_scratch: Vec<u32>,
+    nack_packet_scratch: Vec<u8>,
 }
 
 impl SimpleReceiverCore {
@@ -639,6 +640,7 @@ impl SimpleReceiverCore {
             return_window_started: Instant::now(),
             return_window_bytes: 0,
             nack_scratch: Vec::new(),
+            nack_packet_scratch: Vec::new(),
         }
     }
 
@@ -819,8 +821,9 @@ impl SimpleReceiverCore {
     /// requested only when its packet is returned: holes beyond
     /// `max_packets` stay due, and holes refused by the return bandwidth
     /// (`return_max_bitrate`, or `max_bitrate`) are deferred to the next
-    /// budget window. When no NACK goes out, a due periodic receiver report
-    /// is returned instead.
+    /// budget window. A hole is requested at most once per poll, whatever
+    /// the repeat delay. When no NACK goes out, a due periodic receiver
+    /// report is returned instead.
     pub fn poll_rtcp_into(
         &mut self,
         now: Instant,
@@ -828,9 +831,39 @@ impl SimpleReceiverCore {
         out: &mut Vec<Vec<u8>>,
         max_packets: usize,
     ) -> usize {
+        self.poll_rtcp_with(now, now_ntp, max_packets, |packet| {
+            out.push(packet.to_vec());
+            true
+        })
+    }
+
+    /// [`Self::poll_rtcp_into`] for a transport that sends each packet as it
+    /// is built: `send` puts one packet on the wire and returns whether it
+    /// went out. Holes count as requested (NACK count, repeat schedule,
+    /// [`ReceiverStats`] NACK counters) only once `send` accepted their
+    /// packet. When `send` returns `false`, the holes of that packet and of
+    /// every packet not yet built stay due from `now`, nothing more is sent
+    /// in this poll, and the return bandwidth charged for the refused packet
+    /// is given back. Returns the number of packets `send` accepted.
+    pub fn poll_rtcp_with<F>(
+        &mut self,
+        now: Instant,
+        now_ntp: u64,
+        max_packets: usize,
+        mut send: F,
+    ) -> usize
+    where
+        F: FnMut(&[u8]) -> bool,
+    {
         if max_packets == 0 {
             return 0;
         }
+        // Nothing is offered to `send` after it refused a packet.
+        let mut refused = false;
+        let mut send = |packet: &[u8]| {
+            refused = refused || !send(packet);
+            !refused
+        };
         let due = self.rtcp.poll_receiver(now);
         let mut produced = 0;
         if due.feedback
@@ -839,12 +872,14 @@ impl SimpleReceiverCore {
                 .next_nack_at()
                 .is_some_and(|at| at <= now)
         {
-            produced = self.push_due_nacks(now, now_ntp, out, max_packets);
+            produced = self.push_due_nacks(now, now_ntp, max_packets, &mut send);
         }
         if due.report && produced == 0 {
-            self.stats.record_feedback();
-            out.push(self.build_receiver_report(now_ntp));
-            produced = 1;
+            let report = self.build_receiver_report(now_ntp);
+            if send(&report) {
+                self.stats.record_feedback();
+                produced = 1;
+            }
         }
         produced
     }
@@ -859,12 +894,16 @@ impl SimpleReceiverCore {
         repeat.max(rtt_min).min(self.recovery.rtt_max.max(rtt_min))
     }
 
+    /// Takes the due holes once, sized by what `max_packets` packets can
+    /// carry, and encodes them into packets oldest first. Holes committed
+    /// here are never taken again in the same poll, even with a zero repeat
+    /// delay; holes that do not fit stay due from `now`.
     fn push_due_nacks(
         &mut self,
         now: Instant,
         now_ntp: u64,
-        out: &mut Vec<Vec<u8>>,
         max_packets: usize,
+        send: &mut dyn FnMut(&[u8]) -> bool,
     ) -> usize {
         let repeat = self.nack_repeat_delay();
         let schedule = NackSchedule {
@@ -874,29 +913,25 @@ impl SimpleReceiverCore {
             min_time_left: Duration::ZERO,
         };
         let mut due = std::mem::take(&mut self.nack_scratch);
-        let mut prefix = Vec::new();
+        due.clear();
+        // A Range packet can carry up to MAX_NACK_PACKET_REQUESTS contiguous
+        // sequences, so take enough for every packet left to be full; at most
+        // the whole horizon, which bounds the tracked holes anyway.
+        let limit = max_packets
+            .saturating_mul(MAX_NACK_PACKET_REQUESTS)
+            .min(MAX_TRACKED_HOLE_DISTANCE as usize + 1);
+        self.missing_tracker
+            .take_due_nacks(now, &schedule, limit, &mut due);
         let mut produced = 0;
-        while produced < max_packets {
-            due.clear();
-            // Every packet carries at least MAX_NACK_RECORDS_PER_PACKET
-            // sequences, so this never takes more than the packets left.
-            let limit = (max_packets - produced)
-                .saturating_mul(MAX_NACK_RECORDS_PER_PACKET)
-                .min(MAX_TRACKED_HOLE_DISTANCE as usize + 1);
-            self.missing_tracker
-                .take_due_nacks(now, &schedule, limit, &mut due);
-            if due.is_empty() {
-                break;
-            }
-            if prefix.is_empty() {
-                self.encode_receiver_report(now_ntp, &mut prefix);
-            }
-            let mut sent = 0;
-            let mut refused = false;
+        let mut sent = 0;
+        let mut retry_at = now;
+        if !due.is_empty() {
+            let mut packet = std::mem::take(&mut self.nack_packet_scratch);
+            packet.clear();
+            self.encode_receiver_report(now_ntp, &mut packet);
+            let prefix_len = packet.len();
             while sent < due.len() && produced < max_packets {
-                let mut packet =
-                    Vec::with_capacity(prefix.len() + 12 + 4 * MAX_NACK_RECORDS_PER_PACKET);
-                packet.extend_from_slice(&prefix);
+                packet.truncate(prefix_len);
                 let count = encode_nack_chunk(
                     self.nack_mode,
                     self.flow_id,
@@ -905,26 +940,25 @@ impl SimpleReceiverCore {
                     &mut packet,
                 );
                 if !self.allow_return_bytes(now, packet.len()) {
-                    refused = true;
+                    retry_at = self.return_window_started + Duration::from_secs(1);
+                    break;
+                }
+                if !send(&packet) {
+                    self.return_window_bytes =
+                        self.return_window_bytes.saturating_sub(packet.len() as u64);
                     break;
                 }
                 self.missing_tracker
                     .commit_nacks(&due[sent..sent + count], now, repeat);
                 self.stats.record_nack_packet(count);
-                out.push(packet);
                 produced += 1;
                 sent += count;
             }
-            if sent < due.len() {
-                let retry_at = if refused {
-                    self.return_window_started + Duration::from_secs(1)
-                } else {
-                    now
-                };
-                self.missing_tracker.defer_nacks(&due[sent..], retry_at);
-                self.stats.nack_entries_deferred += (due.len() - sent) as u64;
-                break;
-            }
+            self.nack_packet_scratch = packet;
+        }
+        if sent < due.len() {
+            self.missing_tracker.defer_nacks(&due[sent..], retry_at);
+            self.stats.nack_entries_deferred += (due.len() - sent) as u64;
         }
         due.clear();
         self.nack_scratch = due;
@@ -1685,6 +1719,136 @@ mod tests {
         let repair = receiver.accept_packet_at(&packet(65_533), start).unwrap();
         assert!(repair.recovered);
         assert_eq!(repair.sequence, 65_533);
+    }
+
+    #[test]
+    fn zero_repeat_sends_one_nack_per_poll() {
+        let recovery = RecoveryConfig {
+            rtt_min: Duration::ZERO,
+            rtt_max: Duration::ZERO,
+            reorder_buffer: Duration::ZERO,
+            length_min: Duration::from_secs(5),
+            length_max: Duration::from_secs(5),
+            ..RecoveryConfig::default()
+        };
+        let (mut receiver, start) = lossy_receiver(recovery, 1);
+        assert_eq!(receiver.missing_sequences(), vec![1]);
+        for tick in 1..=3_u32 {
+            let now = start + DEFAULT_RTCP_FEEDBACK_INTERVAL * tick;
+            let mut packets = Vec::new();
+            assert_eq!(receiver.poll_rtcp_into(now, 0, &mut packets, 64), 1);
+            assert_eq!(decode_nacks_from_compound(&packets[0]).unwrap(), vec![1]);
+            assert_eq!(receiver.missing_tracker.hole(1).unwrap().nack_count, tick);
+        }
+        let stats = receiver.stats();
+        assert_eq!(stats.nack_packets, 3);
+        assert_eq!(stats.nack_entries_sent, 3);
+        assert_eq!(stats.nack_entries_deferred, 0);
+    }
+
+    fn contiguous_loss_receiver(lost: u16) -> (SimpleReceiverCore, Instant) {
+        let mut receiver = SimpleReceiverCore::new(1, "rust", NackMode::Range);
+        let start = Instant::now();
+        for sequence in [0, lost + 1] {
+            let packet = encode_packet(RtpHeader::new_mpegts(sequence, 0, 1), b"ts");
+            receiver.accept_packet_at(&packet, start).unwrap();
+        }
+        assert_eq!(receiver.poll_rtcp_into(start, 0, &mut Vec::new(), 1), 0);
+        (receiver, start)
+    }
+
+    #[test]
+    fn one_packet_poll_carries_a_whole_contiguous_burst_in_ranges() {
+        let (mut receiver, start) = contiguous_loss_receiver(1_000);
+        let packet = receiver
+            .poll_rtcp(start + DEFAULT_RTCP_FEEDBACK_INTERVAL, 0)
+            .unwrap();
+        assert_eq!(
+            decode_nacks_from_compound(&packet).unwrap(),
+            (1..=1_000).collect::<Vec<_>>()
+        );
+        let stats = receiver.stats();
+        assert_eq!(stats.nack_entries_sent, 1_000);
+        assert_eq!(stats.nack_entries_deferred, 0);
+        assert_eq!(receiver.missing_tracker.hole(1_000).unwrap().nack_count, 1);
+    }
+
+    #[test]
+    fn one_packet_poll_stops_at_the_per_packet_sequence_cap() {
+        let (mut receiver, start) = contiguous_loss_receiver(5_000);
+        let packet = receiver
+            .poll_rtcp(start + DEFAULT_RTCP_FEEDBACK_INTERVAL, 0)
+            .unwrap();
+        let requested = decode_nacks_from_compound(&packet).unwrap();
+        assert_eq!(requested.len(), MAX_NACK_PACKET_REQUESTS);
+        assert_eq!(requested[0], 1);
+        let stats = receiver.stats();
+        assert_eq!(stats.nack_entries_sent, MAX_NACK_PACKET_REQUESTS as u64);
+        assert_eq!(stats.nack_entries_deferred, 0);
+        assert_eq!(receiver.missing_tracker.hole(4_096).unwrap().nack_count, 1);
+        assert_eq!(receiver.missing_tracker.hole(4_097).unwrap().nack_count, 0);
+    }
+
+    #[test]
+    fn a_refused_send_commits_only_the_packets_that_went_out() {
+        let (mut receiver, start) = lossy_receiver(RecoveryConfig::default(), 1_000);
+        let now = start + DEFAULT_RTCP_FEEDBACK_INTERVAL;
+        let mut calls = 0;
+        let mut accepted = Vec::new();
+        let produced = receiver.poll_rtcp_with(now, 0, 64, |packet| {
+            calls += 1;
+            if calls <= 2 {
+                accepted.push(packet.to_vec());
+                true
+            } else {
+                false
+            }
+        });
+        assert_eq!(produced, 2);
+        // Nothing is offered after the refusal, not even a report.
+        assert_eq!(calls, 3);
+        let sent = accepted
+            .iter()
+            .flat_map(|packet| decode_nacks_from_compound(packet).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(sent, (0..400).map(|n| 2 * n + 1).collect::<Vec<_>>());
+        let stats = receiver.stats();
+        assert_eq!(stats.nack_packets, 2);
+        assert_eq!(stats.feedback_packets, 2);
+        assert_eq!(stats.nack_entries_sent, 400);
+        assert_eq!(stats.nack_entries_deferred, 600);
+        let bytes = accepted.iter().map(Vec::len).sum::<usize>() as u64;
+        assert_eq!(receiver.return_window_bytes, bytes);
+        assert_eq!(receiver.missing_tracker.hole(799).unwrap().nack_count, 1);
+        let refused = receiver.missing_tracker.hole(801).unwrap();
+        assert_eq!(refused.nack_count, 0);
+        assert_eq!(refused.last_nack_at, None);
+        assert_eq!(refused.next_nack_at, Some(now));
+
+        // The next poll requests the refused holes (and repeats the sent ones).
+        let mut packets = Vec::new();
+        receiver.poll_rtcp_into(now + DEFAULT_RTCP_FEEDBACK_INTERVAL, 0, &mut packets, 64);
+        let requested = packets
+            .iter()
+            .flat_map(|packet| decode_nacks_from_compound(packet).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(requested.len(), 1_000);
+        assert_eq!(receiver.missing_tracker.hole(801).unwrap().nack_count, 1);
+    }
+
+    #[test]
+    fn a_refused_report_is_not_counted() {
+        let mut receiver = SimpleReceiverCore::new(1, "rust", NackMode::Range);
+        let start = Instant::now();
+        assert_eq!(receiver.poll_rtcp_into(start, 0, &mut Vec::new(), 1), 0);
+        let mut calls = 0;
+        let report_due = start + DEFAULT_RTCP_REPORT_INTERVAL;
+        let produced = receiver.poll_rtcp_with(report_due, 0, 1, |_| {
+            calls += 1;
+            false
+        });
+        assert_eq!((produced, calls), (0, 1));
+        assert_eq!(receiver.stats().feedback_packets, 0);
     }
 
     #[test]
