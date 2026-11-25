@@ -5,8 +5,10 @@ use crate::packet::rtcp::{
     encode_sender_report, Echo, EchoKind, NackMode, ReceiverReport, RtcpPacket, SenderReport,
     MAX_NACK_PACKET_REQUESTS, MAX_NACK_RECORDS_PER_PACKET,
 };
+#[cfg(test)]
+use crate::packet::rtp::encode_packet_with_extension;
 use crate::packet::rtp::{
-    encode_packet, encode_packet_with_extension, RistRtpExtension, RtpHeader, RtpPacket,
+    encode_packet_into, encode_packet_with_extension_into, RistRtpExtension, RtpHeader, RtpPacket,
     RTP_PAYLOAD_TYPE_MPEGTS,
 };
 use crate::recovery::{
@@ -289,6 +291,8 @@ pub struct SimpleSenderCore {
     tuning: RecoveryTuning,
     recovery_state: SimpleSenderPeerState,
     tail: TailProbeState,
+    /// The last packet when the history is disabled (zero packets).
+    scratch: Vec<u8>,
 }
 
 /// What the tail-loss probe (B4) knows about the data sent.
@@ -365,6 +369,7 @@ impl SimpleSenderCore {
             tuning: RecoveryTuning::default(),
             recovery_state: SimpleSenderPeerState::new(ssrc, history_packets),
             tail: TailProbeState::default(),
+            scratch: Vec::new(),
         }
         .with_history_retention()
     }
@@ -478,20 +483,60 @@ impl SimpleSenderCore {
         ntp_timestamp: u64,
         now: Instant,
     ) -> OutboundPacket {
+        self.store_payload(sequence, payload, ntp_timestamp, now);
+        OutboundPacket {
+            sequence,
+            retry: false,
+            bytes: self.stored_packet(sequence).to_vec(),
+        }
+    }
+
+    /// [`Self::send_payload`] without an owned copy: the RTP packet is
+    /// encoded once, straight into its send-history slot (whose buffer is
+    /// reused), and `send` gets the sequence and those bytes. Nothing is
+    /// allocated once the history is warm.
+    pub fn send_payload_with<R>(
+        &mut self,
+        payload: &[u8],
+        ntp_timestamp: u64,
+        now: Instant,
+        send: impl FnOnce(u32, &[u8]) -> R,
+    ) -> R {
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.wrapping_add(1);
+        self.store_payload(sequence, payload, ntp_timestamp, now);
+        send(sequence, self.stored_packet(sequence))
+    }
+
+    /// Encodes the RTP packet into the history (or the scratch buffer when
+    /// the history is disabled) and records the send.
+    fn store_payload(&mut self, sequence: u32, payload: &[u8], ntp_timestamp: u64, now: Instant) {
         let header = RtpHeader::new_mpegts(
             sequence as u16,
             mpegts_rtp_timestamp(ntp_timestamp),
             self.ssrc,
         );
-        let bytes = self.encode_payload(header, payload);
-        self.history.insert(sequence, bytes.clone(), now);
-        self.stats.record_send(bytes.len());
+        let suppress = self.null_packet_suppression;
+        let len = match self.history.insert_with(sequence, now, |out| {
+            encode_payload_into(suppress, header, payload, out)
+        }) {
+            Some(stored) => stored.payload_len,
+            None => {
+                self.scratch.clear();
+                encode_payload_into(suppress, header, payload, &mut self.scratch);
+                self.scratch.len()
+            }
+        };
+        self.stats.record_send(len);
         self.tail
             .on_send(sequence, now, self.tuning.tail_probe_max_per_mille);
-        OutboundPacket {
-            sequence,
-            retry: false,
-            bytes,
+    }
+
+    /// The packet [`Self::store_payload`] just stored for `sequence`.
+    fn stored_packet(&self, sequence: u32) -> &[u8] {
+        match self.history.get(sequence) {
+            Some(stored) => &stored.payload,
+            None => &self.scratch,
         }
     }
 
@@ -788,22 +833,22 @@ impl SimpleSenderCore {
         );
         encode_sdes_cname(self.ssrc, &self.cname, out);
     }
+}
 
-    fn encode_payload(&self, header: RtpHeader, payload: &[u8]) -> Vec<u8> {
-        if !self.null_packet_suppression
-            || payload.len() > 7 * crate::mpegts::TS_PACKET_SIZE_WITH_RS
-        {
-            return encode_packet(header, payload);
-        }
-
-        match suppress_null_packets(payload) {
-            Ok(suppressed) if suppressed.bytes_suppressed > 0 => encode_packet_with_extension(
-                header,
-                RistRtpExtension::new_npd(suppressed.npd_bits),
-                &suppressed.payload,
-            ),
-            _ => encode_packet(header, payload),
-        }
+/// The RTP packet for `payload`, null packets suppressed (with the NPD
+/// extension) when `suppress` is on and that saves bytes, appended to `out`.
+fn encode_payload_into(suppress: bool, header: RtpHeader, payload: &[u8], out: &mut Vec<u8>) {
+    if !suppress || payload.len() > 7 * crate::mpegts::TS_PACKET_SIZE_WITH_RS {
+        return encode_packet_into(header, payload, out);
+    }
+    match suppress_null_packets(payload) {
+        Ok(suppressed) if suppressed.bytes_suppressed > 0 => encode_packet_with_extension_into(
+            header,
+            RistRtpExtension::new_npd(suppressed.npd_bits),
+            &suppressed.payload,
+            out,
+        ),
+        _ => encode_packet_into(header, payload, out),
     }
 }
 

@@ -7,9 +7,10 @@ use crate::packet::gre::{
     encode_buffer_negotiation_payload, encode_eapol_payload,
     encode_encrypted_buffer_negotiation_payload, encode_encrypted_keepalive_payload,
     encode_encrypted_oob_payload, encode_encrypted_reduced_payload, encode_keepalive_payload,
-    encode_oob_payload, encode_reduced_payload, BufferNegotiation, BufferNegotiationPacket,
-    GreHeader, GreKeepalive, KeepalivePacket, MainPacket, OwnedBufferNegotiationPacket,
-    OwnedKeepalivePacket, OwnedReducedPacket, ReducedHeader, ReducedPacket,
+    encode_oob_payload, encode_reduced_payload, reduced_header, BufferNegotiation,
+    BufferNegotiationPacket, GreHeader, GreKeepalive, KeepalivePacket, MainPacket,
+    OwnedBufferNegotiationPacket, OwnedKeepalivePacket, OwnedReducedPacket, ReducedHeader,
+    ReducedPacket,
 };
 use crate::packet::rtcp::NackMode;
 use crate::packet::rtp::RtpPacket;
@@ -188,6 +189,17 @@ fn elapsed_at_least(now: Instant, then: Instant, duration: Duration) -> bool {
         .unwrap_or(false)
 }
 
+/// What [`MainSenderCore::send_payload_with`] sent: the datagram's
+/// sequences and length, without its bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MainPacketMeta {
+    pub rtp_sequence: u32,
+    pub gre_sequence: u32,
+    pub retry: bool,
+    /// The datagram's length in bytes.
+    pub len: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MainOutboundPacket {
     pub rtp_sequence: u32,
@@ -359,8 +371,83 @@ impl MainSenderCore {
         ntp_timestamp: u64,
         now: Instant,
     ) -> MainOutboundPacket {
-        let packet = self.prepare_payload(payload, ntp_timestamp, now);
-        self.wrap_rtp(packet.sequence, packet.retry, &packet.bytes)
+        self.send_payload_with(payload, ntp_timestamp, now, |meta, head, body| {
+            let mut bytes = Vec::with_capacity(meta.len);
+            bytes.extend_from_slice(head);
+            bytes.extend_from_slice(body);
+            MainOutboundPacket {
+                rtp_sequence: meta.rtp_sequence,
+                gre_sequence: meta.gre_sequence,
+                retry: false,
+                bytes,
+            }
+        })
+    }
+
+    /// [`Self::send_payload`] without an owned packet: `send` gets the
+    /// datagram as two parts to send back to back (`head` then `body`).
+    /// Unencrypted, `head` is the GRE header on the stack and `body` the RTP
+    /// packet in its send-history slot, so the payload is copied once and
+    /// nothing is allocated once the history is warm. With a PSK, `head` is
+    /// the whole encrypted datagram and `body` is empty.
+    pub fn send_payload_with<R>(
+        &mut self,
+        payload: &[u8],
+        ntp_timestamp: u64,
+        now: Instant,
+        send: impl FnOnce(MainPacketMeta, &[u8], &[u8]) -> R,
+    ) -> R {
+        let gre_sequence = self.next_gre_sequence();
+        let gre_version = self.gre_version;
+        let reduced = ReducedHeader {
+            src_port: self.virt_src_port,
+            dst_port: self.virt_dst_port,
+        };
+        let tx_key = &mut self.tx_key;
+        self.simple
+            .send_payload_with(payload, ntp_timestamp, now, |rtp_sequence, rtp| {
+                if let Some(key) = tx_key {
+                    let bytes = encode_encrypted_reduced_payload(
+                        gre_version,
+                        gre_sequence,
+                        reduced,
+                        rtp,
+                        key,
+                    );
+                    let meta = MainPacketMeta {
+                        rtp_sequence,
+                        gre_sequence,
+                        retry: false,
+                        len: bytes.len(),
+                    };
+                    return send(meta, &bytes, &[]);
+                }
+                let header = reduced_header(gre_version, gre_sequence, reduced);
+                let meta = MainPacketMeta {
+                    rtp_sequence,
+                    gre_sequence,
+                    retry: false,
+                    len: header.as_slice().len() + rtp.len(),
+                };
+                send(meta, header.as_slice(), rtp)
+            })
+    }
+
+    /// [`Self::send_payload_with`] into `out`, which is cleared first: the
+    /// whole datagram in a buffer the caller reuses.
+    pub fn send_payload_into(
+        &mut self,
+        payload: &[u8],
+        ntp_timestamp: u64,
+        now: Instant,
+        out: &mut Vec<u8>,
+    ) -> MainPacketMeta {
+        self.send_payload_with(payload, ntp_timestamp, now, |meta, head, body| {
+            out.clear();
+            out.extend_from_slice(head);
+            out.extend_from_slice(body);
+            meta
+        })
     }
 
     pub fn prepare_payload(
@@ -1314,6 +1401,60 @@ mod tests {
     use crate::packet::rtp::RtpPacket;
     use crate::time::{mpegts_rtp_timestamp, ntp_from_unix_duration};
     use std::time::Duration;
+
+    #[test]
+    fn send_payload_with_sends_the_same_datagram_from_the_history_slot() {
+        let now = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut owned = MainSenderCore::new(0x1122_3344, 64).with_gre_version(2);
+        let mut borrowed = MainSenderCore::new(0x1122_3344, 64).with_gre_version(2);
+        let mut out = Vec::new();
+        for n in 0..100u32 {
+            let payload = vec![n as u8; 1_316];
+            let expected = owned.send_payload(&payload, ntp, now);
+            let meta = if n % 2 == 0 {
+                borrowed.send_payload_with(&payload, ntp, now, |meta, head, body| {
+                    out.clear();
+                    out.extend_from_slice(head);
+                    out.extend_from_slice(body);
+                    // GRE (8), VSF (4), ports (4); the RTP packet apart.
+                    assert_eq!(head.len(), 16);
+                    assert_eq!(body.len(), 12 + 1_316);
+                    meta
+                })
+            } else {
+                borrowed.send_payload_into(&payload, ntp, now, &mut out)
+            };
+            assert_eq!(out, expected.bytes, "packet {n}");
+            assert_eq!(meta.rtp_sequence, expected.rtp_sequence);
+            assert_eq!(meta.gre_sequence, expected.gre_sequence);
+            assert_eq!(meta.len, expected.bytes.len());
+            assert!(!meta.retry);
+        }
+        assert_eq!(borrowed.stats().sent_packets, 100);
+        assert_eq!(borrowed.stats().sent_bytes, owned.stats().sent_bytes);
+    }
+
+    #[test]
+    fn send_payload_with_encrypts_into_one_part() {
+        let now = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut sender =
+            MainSenderCore::new(0x1122_3344, 64).with_tx_key(PskKey::new(256, b"secret").unwrap());
+        let mut receiver = MainReceiverCore::new(0x1122_3344, "rust", NackMode::Range)
+            .with_rx_key(PskKey::receiver(256, b"secret").unwrap());
+        for n in 0..3u8 {
+            let datagram = sender.send_payload_with(&[n; 188], ntp, now, |meta, head, body| {
+                assert!(body.is_empty());
+                assert_eq!(meta.len, head.len());
+                head.to_vec()
+            });
+            assert!(GreHeader::decode(&datagram).unwrap().0.key.is_some());
+            let received = receiver.accept_packet(&datagram).unwrap();
+            assert_eq!(received.sequence, u32::from(n));
+            assert_eq!(received.payload, vec![n; 188]);
+        }
+    }
 
     #[test]
     fn main_profile_wraps_rtp_in_reduced_gre() {

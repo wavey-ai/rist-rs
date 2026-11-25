@@ -184,6 +184,27 @@ pub fn encode_packet(header: RtpHeader, payload: &[u8]) -> Vec<u8> {
     out
 }
 
+/// [`encode_packet`] appended to `out` (no allocation when `out` has room).
+pub fn encode_packet_into(header: RtpHeader, payload: &[u8], out: &mut Vec<u8>) {
+    out.reserve(RTP_HEADER_LEN + payload.len());
+    header.encode(out);
+    out.extend_from_slice(payload);
+}
+
+/// [`encode_packet_with_extension`] appended to `out`.
+pub fn encode_packet_with_extension_into(
+    mut header: RtpHeader,
+    extension: RistRtpExtension,
+    payload: &[u8],
+    out: &mut Vec<u8>,
+) {
+    header.extension = true;
+    out.reserve(RTP_HEADER_LEN + RIST_RTP_EXTENSION_LEN + payload.len());
+    header.encode(out);
+    extension.encode(out);
+    out.extend_from_slice(payload);
+}
+
 pub fn encode_packet_with_extension(
     mut header: RtpHeader,
     extension: RistRtpExtension,
@@ -237,6 +258,20 @@ mod tests {
                 npd_bits: 0x20,
                 sequence_extension: 0
             })
+        );
+    }
+
+    #[test]
+    fn encode_into_matches_the_allocating_encoders() {
+        let header = RtpHeader::new_mpegts(7, 9, 0x1122_3344);
+        let mut out = vec![0xee];
+        encode_packet_into(header, b"payload", &mut out);
+        assert_eq!(out[1..], encode_packet(header, b"payload")[..]);
+        out.clear();
+        encode_packet_with_extension_into(header, RistRtpExtension::new_npd(0x40), b"x", &mut out);
+        assert_eq!(
+            out,
+            encode_packet_with_extension(header, RistRtpExtension::new_npd(0x40), b"x")
         );
     }
 

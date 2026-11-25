@@ -447,6 +447,46 @@ impl SenderHistory {
         });
     }
 
+    /// Stores the packet `encode` writes for `sequence` and returns it.
+    /// The buffer handed to `encode` is empty but keeps the capacity of the
+    /// packet the slot held before, so a warm history allocates nothing per
+    /// packet. `None` (and `encode` is not called) when the history is
+    /// disabled.
+    pub fn insert_with(
+        &mut self,
+        sequence: u32,
+        now: Instant,
+        encode: impl FnOnce(&mut Vec<u8>),
+    ) -> Option<&SavedPacket> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        while self.evicts_young(sequence, now) && self.slots.len() < self.max_packets {
+            self.grow();
+        }
+        let slot = &mut self.slots[sequence as usize & self.mask];
+        let mut buffer = match slot.take() {
+            Some(old) => {
+                let mut buffer = old.payload;
+                buffer.clear();
+                buffer
+            }
+            None => {
+                self.len += 1;
+                Vec::new()
+            }
+        };
+        encode(&mut buffer);
+        Some(slot.insert(SavedPacket {
+            sequence,
+            inserted_at: now,
+            retry_count: 0,
+            last_retry_at: None,
+            payload_len: buffer.len(),
+            payload: buffer,
+        }))
+    }
+
     fn evicts_young(&self, sequence: u32, now: Instant) -> bool {
         !self.retention.is_zero()
             && self.slots[sequence as usize & self.mask]
@@ -1349,6 +1389,39 @@ mod tests {
         history.insert(1, [1], now);
         history.insert(2, [2], now);
         history.insert(3, [3], now);
+        assert!(history.get(1).is_none());
+        assert_eq!(history.get(2).unwrap().payload, vec![2]);
+    }
+
+    #[test]
+    fn sender_history_insert_with_reuses_the_evicted_buffer() {
+        let now = Instant::now();
+        let mut history = SenderHistory::new(2);
+        assert!(SenderHistory::new(0)
+            .insert_with(1, now, |_| panic!("disabled history must not encode"))
+            .is_none());
+        let stored = history
+            .insert_with(1, now, |out| {
+                assert!(out.is_empty());
+                out.extend_from_slice(&[1; 1_400]);
+            })
+            .unwrap();
+        assert_eq!((stored.sequence, stored.payload_len), (1, 1_400));
+        let first = stored.payload.as_ptr();
+        history.insert_with(2, now, |out| out.push(2));
+        assert_eq!(history.len(), 2);
+        // 3 takes 1's slot: same allocation, cleared before encoding.
+        let stored = history
+            .insert_with(3, now, |out| {
+                assert!(out.is_empty());
+                assert!(out.capacity() >= 1_400);
+                out.extend_from_slice(&[3; 1_000]);
+            })
+            .unwrap();
+        assert_eq!(stored.payload.as_ptr(), first);
+        assert_eq!(stored.payload, vec![3; 1_000]);
+        assert_eq!(stored.retry_count, 0);
+        assert_eq!(history.len(), 2);
         assert!(history.get(1).is_none());
         assert_eq!(history.get(2).unwrap().payload, vec![2]);
     }

@@ -35,7 +35,7 @@ pub use endpoint::{
 };
 pub use error::Error;
 pub use main_profile::{
-    MainControlPacket, MainFeedbackOutcome, MainOutboundPacket, MainReceiverCore,
+    MainControlPacket, MainFeedbackOutcome, MainOutboundPacket, MainPacketMeta, MainReceiverCore,
     MainReceiverFeedback, MainSenderCore, MainSenderPeerState, MainSessionConfig, MainSessionPoll,
     MainSessionTimers,
 };
