@@ -1071,24 +1071,20 @@ impl SenderContext<'_> {
     /// - the newest packet was sent more than L + rtt + 5 ms ago (rtt =
     ///   clamp(measured, rtt_min, rtt_max)): the stream stopped.
     ///
-    /// While a stream runs, a request is refused for its age only once
-    /// even its earliest possible detection (the successor's send) is
-    /// more than L + 2 x rtt_max + 5 ms ago, the history's own retention:
-    /// no receiver asks that late for a packet it can still use (rist-rs
-    /// skips NACKs that cannot be answered in time, librist gives up at
-    /// 1.1 x L). A request older than that comes from a receiver that
-    /// misread its sequence numbers; serving it would feed the confusion.
+    /// While a stream runs, a request is never refused for its age: after
+    /// a burst or outage of any length the receiver detects the loss only
+    /// when the first packet after it arrives, and may ask for L after
+    /// that, so no time measured from the lost packet or its successor
+    /// bounds a useful request. The receiver stops asking once a repair
+    /// cannot arrive in time (rist-rs skips such NACKs, librist gives up
+    /// at 1.1 x L), and the history (at most 2^15 packets, all a 16-bit
+    /// NACK can name), retry limits, spacing and retransmit budget bound
+    /// the rest.
     fn repair_still_useful(&self, packet: &SavedPacket, now: Instant, rtt: Duration) -> bool {
         let length = effective_recovery_age(self.recovery);
         let age = now.saturating_duration_since(packet.inserted_at);
         if age <= length + self.recovery.rtt_min.saturating_mul(2) {
             return true;
-        }
-        let rtt_max = self.recovery.rtt_max.max(self.recovery.rtt_min);
-        let since_detectable =
-            now.saturating_duration_since(successor_sent_at(self.history, packet));
-        if since_detectable > length + rtt_max.saturating_mul(2) + REPAIR_AGE_SLACK {
-            return false;
         }
         let newest_sent = self
             .history
@@ -1282,6 +1278,12 @@ const ADVANCE_MARKS: usize = 8;
 /// accepts that the sender's numbering jumped.
 const FAR_RUN_RESYNC: u32 = 32;
 
+/// How far ahead of the highest a retransmission is read without an
+/// outage to explain it: a tail probe after that many packets lost at the
+/// end of a burst. A repair would have to arrive 64512 or more behind the
+/// highest to be misread within it.
+const RETRY_AHEAD_ALLOWANCE: u32 = 1_024;
+
 /// The duplicate ring covers this many times the most sequences the
 /// highest advanced within one recovery window.
 const DUPLICATE_RING_HEADROOM: u32 = 2;
@@ -1336,7 +1338,8 @@ impl SequenceAdvance {
         None
     }
 
-    /// Forgets the marks (a new sender); the rates seen are kept.
+    /// Forgets the marks (a new sender, or a forward jump that is no
+    /// rate); the rates seen are kept.
     fn reset(&mut self) {
         self.marks.clear();
         self.next_mark_at = None;
@@ -1524,6 +1527,9 @@ impl SimpleReceiverCore {
             Some(highest) => {
                 if sequence.wrapping_sub(highest) > MAX_TRACKED_HOLE_DISTANCE / 2 {
                     self.stats.forward_jumps += 1;
+                    // The jump is not a rate: a renumbering sender skips
+                    // tens of thousands in no time. Measure from here.
+                    self.advance.reset();
                 }
                 sequence
             }
@@ -1673,16 +1679,16 @@ impl SimpleReceiverCore {
     ///   order, with no packet read normally in between (a sender that
     ///   renumbered without a pause).
     ///
-    /// A retransmission is never read forward: a repair comes from the
-    /// sender's history, at most 2^15 behind. Nor is an original only
-    /// because it is older than the duplicate ring: a late duplicate repair
-    /// would otherwise open 32767 phantom holes, whose NACKs fetch ancient
-    /// packets whose duplicates open more.
+    /// A retransmission is read ahead of the highest only as far as a
+    /// tail probe can be (see [`Self::extend_retry`]). Nor is an original
+    /// read forward only because it is older than the duplicate ring: a
+    /// late duplicate repair would otherwise open 32767 phantom holes,
+    /// whose NACKs fetch ancient packets whose duplicates open more.
     fn extend_received(&mut self, highest: u32, sequence: u16, retry: bool, now: Instant) -> u32 {
         let near = extend_near(highest, sequence);
         let behind = highest.wrapping_sub(near);
         if retry {
-            return near;
+            return self.extend_retry(highest, near, now);
         }
         if behind == 0 || behind >= 1 << 31 {
             self.far_run = 0;
@@ -1713,6 +1719,31 @@ impl SimpleReceiverCore {
         }
         self.stats.stale_far_behind += 1;
         near
+    }
+
+    /// Extends a retransmission. Repairs answer NACKs of holes behind the
+    /// highest; only a tail probe (the sender's newest packet, resent after
+    /// a pause) can lie ahead, by the packets lost at the end of a burst.
+    /// The nearest reading of a repair that arrives more than 32768 behind
+    /// the highest (time from original to repair x rate > 2^15: late NACKs
+    /// plus RTT, a duplicate copy, repairs queued at the sender) lies
+    /// ahead, and read forward it would open phantom holes and deliver its
+    /// payload under the wrong sequence. So a retry is read ahead only up
+    /// to [`RETRY_AHEAD_ALLOWANCE`], or as far as the time since the last
+    /// arrival explains (as for an original after an outage); otherwise it
+    /// is read behind, where the tracker refuses it, and counted in
+    /// `stale_far_behind`.
+    fn extend_retry(&mut self, highest: u32, near: u32, now: Instant) -> u32 {
+        let ahead = near.wrapping_sub(highest);
+        if ahead == 0
+            || ahead >= 1 << 31
+            || ahead <= RETRY_AHEAD_ALLOWANCE
+            || self.outage_explains(ahead, now)
+        {
+            return near;
+        }
+        self.stats.stale_far_behind += 1;
+        near.wrapping_sub(1 << 16)
     }
 
     /// Whether the time since the last arrival can explain `forward`
@@ -3037,7 +3068,7 @@ mod tests {
     }
 
     #[test]
-    fn sender_refuses_requests_older_than_l_plus_two_rtt_max_while_streaming() {
+    fn sender_serves_a_repair_after_a_long_burst_while_streaming() {
         let t = Instant::now();
         let ntp = ntp_from_unix_duration(Duration::from_secs(1));
         let recovery = RecoveryConfig {
@@ -3054,17 +3085,17 @@ mod tests {
             }
             sender
         };
-        // Packet 10's successor went out at 11 ms; the newest at 399 ms.
-        // L + 2 x rtt_max + 5 ms = 145 ms after the successor is the limit.
-        let mut served = sender();
-        assert_eq!(served.retransmit_at(&[10], t + ms(11 + 145)).len(), 1);
-        let mut refused = sender();
-        assert!(refused.retransmit_at(&[10], t + ms(11 + 146)).is_empty());
-        assert_eq!(refused.stats().retransmit_refused_too_old, 1);
-        // An ancient request is refused although the stream runs.
-        let mut ancient = sender();
-        assert!(ancient.retransmit_at(&[10], t + ms(399)).is_empty());
-        assert_eq!(ancient.stats().retransmit_refused_too_old, 1);
+        // Packets 10 to 300 are lost (a 290 ms burst, far more than
+        // 2 x rtt_max): the receiver sees the hole when 301 arrives and
+        // may ask for L after that. Packet 10's successor went out at
+        // 11 ms, so a bound measured from it (L + 2 x rtt_max + 5 ms =
+        // 156 ms) would refuse these requests although they can still
+        // arrive in time.
+        let mut after_burst = sender();
+        assert_eq!(after_burst.retransmit_at(&[10], t + ms(330)).len(), 1);
+        let mut latest = sender();
+        assert_eq!(latest.retransmit_at(&[10], t + ms(399)).len(), 1);
+        assert_eq!(latest.stats().retransmit_refused_too_old, 0);
     }
 
     #[test]
@@ -3822,8 +3853,10 @@ mod tests {
     fn sequences_extend_relative_to_the_highest_not_the_last_packet() {
         let start = Instant::now();
         let mut receiver = SimpleReceiverCore::new(1, "rust", NackMode::Range);
+        // An even SSRC: these are originals (an odd one marks every packet
+        // as a retransmission).
         let packet =
-            |sequence: u32| encode_packet(RtpHeader::new_mpegts(sequence as u16, 0, 1), b"ts");
+            |sequence: u32| encode_packet(RtpHeader::new_mpegts(sequence as u16, 0, 2), b"ts");
         receiver.accept_packet_at(&packet(8_999), start).unwrap();
         // Lose 9000, then everything up to 40000 arrives.
         for sequence in 9_001..=40_000 {
@@ -4019,6 +4052,113 @@ mod tests {
     }
 
     #[test]
+    fn a_repair_more_than_32768_behind_is_not_read_forward() {
+        // 40000 pkt/s: one second of stream is more than 2^15 packets, so
+        // the nearest reading of a repair for packet 100 lies ahead.
+        let start = Instant::now();
+        let mut receiver = SimpleReceiverCore::new(1, "rust", NackMode::Range);
+        let at = |i: u32| start + Duration::from_secs_f64(f64::from(i) / 40_000.0);
+        let original = |i: u32| encode_packet(RtpHeader::new_mpegts(i as u16, 0, 2), b"o");
+        for i in (0..=40_000_u32).filter(|&i| i != 100) {
+            receiver.accept_packet_at(&original(i), at(i)).unwrap();
+        }
+        let repair = encode_packet(RtpHeader::new_mpegts(100, 0, 2 | 1), b"r");
+        let received = receiver.accept_packet_at(&repair, at(40_000)).unwrap();
+        assert_eq!(received.sequence, 100);
+        assert!(received.duplicate);
+        assert!(received.newly_missing.is_empty());
+        assert_eq!(receiver.highest_sequence, Some(40_000));
+        let stats = receiver.stats();
+        assert_eq!(stats.forward_jumps, 0);
+        assert_eq!(stats.stale_far_behind, 1);
+        // The real 65636 is not taken for a duplicate when it comes.
+        for i in 40_001..=65_636_u32 {
+            let received = receiver.accept_packet_at(&original(i), at(i)).unwrap();
+            assert_eq!(received.sequence, i);
+            assert!(!received.duplicate, "{i}");
+        }
+        assert_eq!(receiver.stats().total_missing_packets, 1);
+    }
+
+    #[test]
+    fn a_tail_probe_ahead_of_the_highest_is_read_forward() {
+        let start = Instant::now();
+        let packet = |sequence: u32, ssrc: u32| {
+            encode_packet(RtpHeader::new_mpegts(sequence as u16, 0, ssrc), b"ts")
+        };
+        let at = |sequence: u32| start + ms(u64::from(sequence));
+        let stream = || {
+            let mut receiver = SimpleReceiverCore::new(1, "rust", NackMode::Range);
+            for sequence in 0..=2_000 {
+                receiver
+                    .accept_packet_at(&packet(sequence, 2), at(sequence))
+                    .unwrap();
+            }
+            receiver
+        };
+        // The last four of a burst lost; the probe resends the newest.
+        let mut receiver = stream();
+        let probe = receiver
+            .accept_packet_at(&packet(2_005, 3), at(2_005) + ms(2))
+            .unwrap();
+        assert_eq!(probe.sequence, 2_005);
+        assert!(!probe.duplicate);
+        assert_eq!(probe.newly_missing, vec![2_001, 2_002, 2_003, 2_004]);
+        // 3000 lost at the tail: the silence explains them.
+        let mut receiver = stream();
+        let probe = receiver
+            .accept_packet_at(&packet(5_000, 3), at(5_000) + ms(2))
+            .unwrap();
+        assert_eq!(probe.sequence, 5_000);
+        assert!(!probe.duplicate);
+        // The same 3000 ahead with no silence: a repair 62536 behind.
+        let mut receiver = stream();
+        let stale = receiver
+            .accept_packet_at(&packet(5_000, 3), at(2_000))
+            .unwrap();
+        assert_eq!(stale.sequence, 5_000_u32.wrapping_sub(1 << 16));
+        assert!(stale.duplicate);
+        assert!(stale.newly_missing.is_empty());
+        assert_eq!(receiver.highest_sequence, Some(2_000));
+        assert_eq!(receiver.stats().stale_far_behind, 1);
+    }
+
+    #[test]
+    fn a_renumbering_jump_does_not_inflate_the_measured_rate() {
+        let start = Instant::now();
+        let mut receiver = SimpleReceiverCore::new(1, "rust", NackMode::Range);
+        let packet =
+            |sequence: u32| encode_packet(RtpHeader::new_mpegts(sequence as u16, 0, 2), b"ts");
+        // 1000 pkt/s for two seconds, then the sender jumps 40000 ahead
+        // and carries on at the same rate for another two.
+        let mut now = start;
+        for sequence in 0..=2_000 {
+            now = start + ms(u64::from(sequence));
+            receiver.accept_packet_at(&packet(sequence), now).unwrap();
+        }
+        for step in 1..=2_000_u32 {
+            now += ms(1);
+            receiver
+                .accept_packet_at(&packet(42_000 + step), now)
+                .unwrap();
+        }
+        assert_eq!(receiver.highest_sequence, Some(44_000));
+        assert_eq!(receiver.stats().forward_jumps, 1);
+        assert!(
+            receiver.advance.max_rate_pps < 1_500.0,
+            "rate {}",
+            receiver.advance.max_rate_pps
+        );
+        // So 0.3 s of silence does not explain 45536 lost: an unmarked
+        // original 20000 behind stays behind.
+        now += ms(300);
+        let stale = receiver.accept_packet_at(&packet(24_000), now).unwrap();
+        assert_eq!(stale.sequence, 24_000);
+        assert_eq!(receiver.highest_sequence, Some(44_000));
+        assert_eq!(receiver.stats().forward_jumps, 1);
+    }
+
+    #[test]
     fn packets_behind_within_the_ring_or_on_a_hole_still_extend_backward() {
         let start = Instant::now();
         let mut receiver = SimpleReceiverCore::new(1, "rust", NackMode::Range);
@@ -4069,7 +4209,7 @@ mod tests {
             .with_recovery_tuning(static_tuning());
         let start = Instant::now();
         for sequence in [0, lost + 1] {
-            let packet = encode_packet(RtpHeader::new_mpegts(sequence, 0, 1), b"ts");
+            let packet = encode_packet(RtpHeader::new_mpegts(sequence, 0, 2), b"ts");
             receiver.accept_packet_at(&packet, start).unwrap();
         }
         assert_eq!(receiver.poll_rtcp_into(start, 0, &mut Vec::new(), 1), 0);
