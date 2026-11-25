@@ -13,7 +13,7 @@ use rist_core::auth::{EapSrpAuthenticatorSession, EapSrpClientSession, EapolFram
 use rist_core::crypto::PskKey;
 use rist_core::packet::gre::{
     BufferNegotiation, GreKeepalive, OwnedBufferNegotiationPacket, OwnedKeepalivePacket,
-    OwnedOobPacket,
+    OwnedOobPacket, ReducedPacket,
 };
 use rist_core::packet::rtp::{encode_packet, RtpHeader, RtpPacket};
 use rist_core::time::ntp_now;
@@ -3958,6 +3958,20 @@ impl MainMioReceiver {
                 })
             }
         };
+        // Data path: a clear reduced data packet is parsed in place, so its
+        // payload is copied once, into the `ReceivedPayload`.
+        if let Ok(packet) = ReducedPacket::decode(datagram) {
+            if !looks_like_rtcp(packet.payload) && receiver_runtime_authenticated(runtime) {
+                let now = Instant::now();
+                let payload = runtime
+                    .core
+                    .accept_reduced_at(packet.reduced, packet.payload, now)
+                    .map_err(core_to_io_error)?;
+                self.last_peer = Some(from);
+                runtime.timers.observe_peer_activity(now);
+                return Ok(Some(MainReceiverEvent::Payload { from, payload }));
+            }
+        }
         let packet = runtime
             .core
             .decode_datagram(datagram)
