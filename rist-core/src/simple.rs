@@ -674,11 +674,27 @@ impl SimpleReceiverCore {
     }
 
     pub fn accept_packet(&mut self, packet: &[u8]) -> Result<ReceivedPayload> {
+        self.accept_packet_at(packet, Instant::now())
+    }
+
+    /// [`Self::accept_packet`] with the caller's clock reading.
+    pub fn accept_packet_at(&mut self, packet: &[u8], now: Instant) -> Result<ReceivedPayload> {
         let packet = RtpPacket::decode(packet)?;
-        self.accept_rtp_packet(packet)
+        self.accept_rtp_packet_at(packet, now)
     }
 
     pub fn accept_rtp_packet(&mut self, packet: RtpPacket<'_>) -> Result<ReceivedPayload> {
+        self.accept_rtp_packet_at(packet, Instant::now())
+    }
+
+    /// [`Self::accept_rtp_packet`] with the caller's clock reading, so a
+    /// transport that already read the clock for the datagram does not read
+    /// it again.
+    pub fn accept_rtp_packet_at(
+        &mut self,
+        packet: RtpPacket<'_>,
+        now: Instant,
+    ) -> Result<ReceivedPayload> {
         if packet.header.payload_type != RTP_PAYLOAD_TYPE_MPEGTS {
             return Err(crate::Error::UnsupportedRtpPayloadType(
                 packet.header.payload_type,
@@ -693,16 +709,21 @@ impl SimpleReceiverCore {
             self.base_sequence = None;
             self.highest_sequence = None;
         }
-        let sequence = self.sequence_extender.extend(packet.header.sequence_number);
+        // Extend relative to the highest sequence seen, not the last packet:
+        // a repair far behind must not shift the cycle of the next packet.
+        let sequence = match self.highest_sequence {
+            Some(highest) => extend_near(highest, packet.header.sequence_number),
+            None => self.sequence_extender.extend(packet.header.sequence_number),
+        };
         self.peer_ssrc = Some(packet.header.ssrc);
         if self.base_sequence.is_none() {
             self.base_sequence = Some(sequence);
         }
-        self.highest_sequence = Some(
-            self.highest_sequence
-                .map_or(sequence, |highest| highest.max(sequence)),
-        );
-        let observation = self.missing_tracker.observe(sequence);
+        self.highest_sequence = Some(match self.highest_sequence {
+            Some(highest) if (sequence.wrapping_sub(highest) as i32) <= 0 => highest,
+            _ => sequence,
+        });
+        let observation = self.missing_tracker.observe_at(sequence, now);
         let payload = if let Some(extension) = packet.extension {
             if extension.has_null_packet_deletion() {
                 // NPD is an optional transform. A malformed/sender-specific
@@ -958,10 +979,11 @@ impl SimpleReceiverCore {
     fn receiver_report(&self, now_ntp: u64) -> ReceiverReport {
         let base_sequence = self.base_sequence.unwrap_or(0);
         let highest_sequence = self.highest_sequence.unwrap_or(0);
-        let expected_packets = highest_sequence
-            .checked_sub(base_sequence)
-            .map(|expected| u64::from(expected) + 1)
-            .unwrap_or(0);
+        let expected_packets = if self.highest_sequence.is_some() {
+            u64::from(highest_sequence.wrapping_sub(base_sequence)) + 1
+        } else {
+            0
+        };
         let received_unique = self
             .stats
             .received_packets
@@ -1561,6 +1583,45 @@ mod tests {
         );
         assert_eq!(receiver.missing_tracker.hole(1).unwrap().nack_count, 1);
         assert_eq!(receiver.stats().nack_entries_sent, 30);
+    }
+
+    #[test]
+    fn sequences_extend_relative_to_the_highest_not_the_last_packet() {
+        let start = Instant::now();
+        let mut receiver = SimpleReceiverCore::new(1, "rust", NackMode::Range);
+        let packet =
+            |sequence: u32| encode_packet(RtpHeader::new_mpegts(sequence as u16, 0, 1), b"ts");
+        receiver.accept_packet_at(&packet(8_999), start).unwrap();
+        // Lose 9000, then everything up to 40000 arrives.
+        for sequence in 9_001..=40_000 {
+            receiver.accept_packet_at(&packet(sequence), start).unwrap();
+        }
+        // The repair of 9000 (31000 behind) arrives, then a packet after a
+        // further burst: 33000 ahead of the repair but near the highest.
+        let repair = receiver.accept_packet_at(&packet(9_000), start).unwrap();
+        assert!(repair.recovered);
+        assert_eq!(repair.sequence, 9_000);
+        let next = receiver.accept_packet_at(&packet(42_000), start).unwrap();
+        assert_eq!(next.sequence, 42_000);
+        assert!(!next.duplicate);
+        assert_eq!(next.newly_missing.len(), 1_999);
+    }
+
+    #[test]
+    fn receiver_report_counts_expected_packets_across_the_u32_rollover() {
+        let start = Instant::now();
+        let mut receiver = SimpleReceiverCore::new(1, "rust", NackMode::Range);
+        receiver.highest_sequence = Some(u32::MAX - 1);
+        receiver.base_sequence = Some(u32::MAX - 1);
+        receiver.sequence_extender.extend(u16::MAX - 1);
+        receiver.missing_tracker.observe_at(u32::MAX - 1, start);
+        receiver.stats.received_packets = 1;
+        let packet = encode_packet(RtpHeader::new_mpegts(2, 0, 1), b"ts");
+        assert_eq!(receiver.accept_packet_at(&packet, start).unwrap().sequence, 2);
+        let report = receiver.receiver_report(0);
+        assert_eq!(report.highest_sequence, 2);
+        // Expected u32::MAX-1 ..= 2 (5 packets), received 2.
+        assert_eq!(report.cumulative_packet_loss, 3);
     }
 
     fn ts_packet(pid: u16, label: &[u8]) -> Vec<u8> {
