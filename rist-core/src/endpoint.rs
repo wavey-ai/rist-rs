@@ -46,6 +46,95 @@ impl Default for RecoveryConfig {
     }
 }
 
+/// When a sender resends the last packet of a burst on its own (B4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TailProbe {
+    /// Never.
+    Off,
+    /// Only while the peer is losing packets: within
+    /// [`RecoveryTuning::tail_probe_loss_window`] of the last NACK received.
+    #[default]
+    Auto,
+    /// After every burst.
+    On,
+}
+
+/// Recovery behaviour beyond what [`RecoveryConfig`] (the librist URL
+/// parameters) describes. Every field keeps the wire format: a librist peer
+/// sees only packets it already understands (echo requests, NACKs,
+/// retransmissions marked with the SSRC retry bit, duplicates). The defaults
+/// are the settings that win under loss with the product configuration;
+/// `RecoveryTuning::librist_like()` turns the extras off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryTuning {
+    /// Receiver: send echo requests (every `RtcpIntervals::echo`, first one
+    /// with the first report) and take RTT samples from echo responses and
+    /// from retry-marked repairs of holes NACKed once (Karn's rule). The
+    /// re-NACK interval follows the measured RTT.
+    pub measure_rtt: bool,
+    /// Receiver: added to every re-NACK interval, so a re-request clears a
+    /// sender's spacing check measured with a slightly larger RTT.
+    pub renack_margin: Duration,
+    /// Receiver: first NACK after `clamp(1.5 x observed reordering + 1 ms,
+    /// first_nack_floor, reorder_buffer)` instead of always `reorder_buffer`.
+    pub adaptive_first_nack: bool,
+    pub first_nack_floor: Duration,
+    /// Receiver: send every NACK attempt a second time a few milliseconds
+    /// later (not counted as an attempt), unless congestion control is off.
+    /// The sender's spacing check discards the copy when the first arrived.
+    pub redundant_nacks: bool,
+    /// Sender: send a repair twice, `duplicate_gap` apart, when the previous
+    /// repair of that sequence was lost or no later attempt could arrive in
+    /// time.
+    pub duplicate_late_repairs: bool,
+    pub duplicate_gap: Duration,
+    /// Sender: resend the last packet of a burst once the sender has been
+    /// idle for a few packet gaps, so a lost frame tail is repaired without
+    /// waiting for the next frame.
+    pub tail_probe: TailProbe,
+    /// Upper bound of tail probes, per mille of the data packets sent.
+    pub tail_probe_max_per_mille: u32,
+    /// [`TailProbe::Auto`]: how long after the last NACK probes stay on.
+    pub tail_probe_loss_window: Duration,
+    /// Sender: keep packets for at least `L + 2 x rtt_max` by growing the
+    /// history (up to `max_history_packets`) instead of evicting by count.
+    pub history_by_time: bool,
+    pub max_history_packets: usize,
+}
+
+impl Default for RecoveryTuning {
+    fn default() -> Self {
+        Self {
+            measure_rtt: true,
+            renack_margin: Duration::from_millis(1),
+            adaptive_first_nack: true,
+            first_nack_floor: Duration::from_millis(2),
+            redundant_nacks: true,
+            duplicate_late_repairs: true,
+            duplicate_gap: Duration::from_millis(1),
+            tail_probe: TailProbe::Auto,
+            tail_probe_max_per_mille: 20,
+            tail_probe_loss_window: Duration::from_secs(10),
+            history_by_time: true,
+            max_history_packets: 1 << 19,
+        }
+    }
+}
+
+impl RecoveryTuning {
+    /// RTT measurement and history by time stay on; the extras (adaptive
+    /// first NACK, NACK copies, duplicate repairs, tail probes) are off.
+    pub fn librist_like() -> Self {
+        Self {
+            adaptive_first_nack: false,
+            redundant_nacks: false,
+            duplicate_late_repairs: false,
+            tail_probe: TailProbe::Off,
+            ..Self::default()
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryMode {
     Disabled,

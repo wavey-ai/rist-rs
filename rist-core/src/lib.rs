@@ -15,6 +15,7 @@ pub mod mpegts;
 pub mod packet;
 pub mod profile;
 pub mod recovery;
+pub mod rtt;
 pub mod sequence;
 pub mod simple;
 pub mod stats;
@@ -29,7 +30,8 @@ pub use bonding::{PeerSelection, WeightedPeerSelector};
 pub use crypto::{AesKeySize, PskKey};
 pub use endpoint::{
     AdvancedUrlConfig, CongestionControlMode, ConnectionConfig, EncryptionConfig, Endpoint,
-    MultiplexMode, PeerConfig, RecoveryConfig, RecoveryMode, TimingMode, VirtualPorts,
+    MultiplexMode, PeerConfig, RecoveryConfig, RecoveryMode, RecoveryTuning, TailProbe, TimingMode,
+    VirtualPorts,
 };
 pub use error::Error;
 pub use main_profile::{
@@ -43,6 +45,7 @@ pub use recovery::{
     HoleInfo, HoleStatus, MissingTracker, NackSchedule, OrderedPayloadBuffer,
     OrderedPayloadBufferError, ReceiverObservation, RecoveredHole, SenderHistory, TrackerCounters,
 };
+pub use rtt::RttEstimator;
 pub use sequence::SequenceExtender;
 pub use simple::{
     OutboundPacket, ReceivedPayload, RtcpIntervals, SimpleReceiverCore, SimpleSenderCore,
