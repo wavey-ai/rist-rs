@@ -35,21 +35,22 @@ pub use endpoint::{
 };
 pub use error::Error;
 pub use main_profile::{
-    MainControlPacket, MainFeedbackOutcome, MainOutboundPacket, MainReceiverCore, MainReceiverFeedback, MainSenderCore,
-    MainSenderPeerState, MainSessionConfig, MainSessionPoll, MainSessionTimers,
+    MainControlPacket, MainFeedbackOutcome, MainOutboundPacket, MainReceiverCore,
+    MainReceiverFeedback, MainSenderCore, MainSenderPeerState, MainSessionConfig, MainSessionPoll,
+    MainSessionTimers,
 };
 pub use mpegts::{expand_null_packets, suppress_null_packets, NullPacketSuppression};
 pub use packet::gre::MainPacket;
 pub use profile::Profile;
 pub use recovery::{
-    HoleInfo, HoleStatus, MissingTracker, NackSchedule, OrderedPayloadBuffer,
+    HoleInfo, HoleStatus, MissingTracker, NackRepeat, NackSchedule, OrderedPayloadBuffer,
     OrderedPayloadBufferError, ReceiverObservation, RecoveredHole, SenderHistory, TrackerCounters,
 };
 pub use rtt::RttEstimator;
 pub use sequence::SequenceExtender;
 pub use simple::{
-    FeedbackOutcome, OutboundPacket, ReceivedPayload, RtcpIntervals, SimpleReceiverCore, SimpleSenderCore,
-    SimpleSenderPeerState,
+    FeedbackOutcome, OutboundPacket, ReceivedPayload, RtcpIntervals, SimpleReceiverCore,
+    SimpleSenderCore, SimpleSenderPeerState,
 };
 pub use stats::{ReceiverStats, SenderStats};
 

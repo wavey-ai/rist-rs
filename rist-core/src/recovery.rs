@@ -338,6 +338,36 @@ impl Default for NackSchedule {
     }
 }
 
+/// When the next NACK of a hole is due after one was sent; see
+/// [`MissingTracker::commit_nacks_with`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NackRepeat {
+    /// Delay from a NACK to the next NACK of the same hole.
+    pub delay: Duration,
+    /// Double the delay with every NACK of a hole: after its n-th NACK the
+    /// next is due `delay x 2^(n-1)` later. Used while the RTT is unknown,
+    /// so a long path is not flooded with re-requests.
+    pub backoff: bool,
+}
+
+impl NackRepeat {
+    pub fn fixed(delay: Duration) -> Self {
+        Self {
+            delay,
+            backoff: false,
+        }
+    }
+
+    /// The delay after the `nack_count`-th NACK of a hole (1 for the first).
+    pub fn after(&self, nack_count: u32) -> Duration {
+        if !self.backoff {
+            return self.delay;
+        }
+        self.delay
+            .saturating_mul(1 << nack_count.saturating_sub(1).min(16))
+    }
+}
+
 /// Lifecycle of one tracked hole.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HoleStatus {
@@ -716,7 +746,12 @@ impl MissingTracker {
     /// Records that NACKs for `sent` went on the wire at `now`; the next NACK
     /// of each is due at `now + repeat_delay`.
     pub fn commit_nacks(&mut self, sent: &[u32], now: Instant, repeat_delay: Duration) {
-        let next_due = now + repeat_delay;
+        self.commit_nacks_with(sent, now, NackRepeat::fixed(repeat_delay));
+    }
+
+    /// [`Self::commit_nacks`] with a per-hole repeat policy (backoff while
+    /// the RTT is unknown).
+    pub fn commit_nacks_with(&mut self, sent: &[u32], now: Instant, repeat: NackRepeat) {
         for &sequence in sent {
             let Some(index) = self.find_hole(sequence) else {
                 continue;
@@ -727,6 +762,7 @@ impl MissingTracker {
             }
             hole.nack_count = hole.nack_count.saturating_add(1);
             hole.last_nack_at = Some(now);
+            let next_due = now + repeat.after(hole.nack_count);
             hole.next_due = next_due;
             hole.status = HoleStatus::Scheduled;
             self.schedule.push(Reverse((next_due, sequence)));
@@ -1137,6 +1173,35 @@ mod tests {
         tracker.take_due_nacks(now, plan, limit, &mut out);
         tracker.check_invariants();
         out
+    }
+
+    #[test]
+    fn backoff_doubles_the_repeat_delay_per_attempt() {
+        let repeat = NackRepeat {
+            delay: ms(5),
+            backoff: true,
+        };
+        assert_eq!(repeat.after(1), ms(5));
+        assert_eq!(repeat.after(2), ms(10));
+        assert_eq!(repeat.after(4), ms(40));
+        assert_eq!(NackRepeat::fixed(ms(5)).after(4), ms(5));
+
+        let t0 = Instant::now();
+        let mut tracker = MissingTracker::with_limits(64, Duration::from_secs(10));
+        tracker.observe_at(0, t0);
+        tracker.observe_at(2, t0);
+        let plan = schedule(0, 20);
+        let mut at = t0;
+        let mut gaps = Vec::new();
+        for _ in 0..4 {
+            assert_eq!(take(&mut tracker, at, &plan, 8), vec![1]);
+            tracker.commit_nacks_with(&[1], at, repeat);
+            tracker.check_invariants();
+            let next = tracker.next_nack_at().unwrap();
+            gaps.push(next - at);
+            at = next;
+        }
+        assert_eq!(gaps, vec![ms(5), ms(10), ms(20), ms(40)]);
     }
 
     #[test]
