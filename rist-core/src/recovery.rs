@@ -452,6 +452,8 @@ pub struct HoleInfo {
 pub struct RecoveredHole {
     pub sequence: u32,
     pub first_missing_at: Instant,
+    /// When the hole's first NACK went out.
+    pub first_nack_at: Option<Instant>,
     pub last_nack_at: Option<Instant>,
     pub nack_count: u32,
     pub recovered_at: Instant,
@@ -463,6 +465,7 @@ struct Hole {
     status: HoleStatus,
     nack_count: u32,
     first_missing_at: Instant,
+    first_nack_at: Option<Instant>,
     last_nack_at: Option<Instant>,
     next_due: Instant,
     /// When the copy of the last NACK is due, if one is pending.
@@ -592,6 +595,7 @@ impl MissingTracker {
                         status: HoleStatus::Fresh,
                         nack_count: 0,
                         first_missing_at: at,
+                        first_nack_at: None,
                         last_nack_at: None,
                         next_due: at,
                         copy_at: None,
@@ -616,6 +620,7 @@ impl MissingTracker {
                     self.last_recovered = Some(RecoveredHole {
                         sequence,
                         first_missing_at: hole.first_missing_at,
+                        first_nack_at: hole.first_nack_at,
                         last_nack_at: hole.last_nack_at,
                         nack_count: hole.nack_count,
                         recovered_at: now,
@@ -845,6 +850,7 @@ impl MissingTracker {
                 continue;
             }
             hole.nack_count = hole.nack_count.saturating_add(1);
+            hole.first_nack_at.get_or_insert(now);
             hole.last_nack_at = Some(now);
             if let Some(gap) = repeat.copy_gap {
                 let copy_at = now + gap;
@@ -1543,6 +1549,7 @@ mod tests {
             Some(RecoveredHole {
                 sequence: 1,
                 first_missing_at: start,
+                first_nack_at: Some(start + ms(15)),
                 last_nack_at: Some(second),
                 nack_count: 2,
                 recovered_at: second + ms(12),

@@ -1385,13 +1385,24 @@ impl SimpleReceiverCore {
                 self.stats.reorder_samples += 1;
             }
         }
-        if retry && self.tuning.measure_rtt && hole.nack_count == 1 {
-            if let Some(nacked_at) = hole.last_nack_at {
-                let sample = now.saturating_duration_since(nacked_at);
-                if !sample.is_zero() {
-                    self.rtt.sample_duration(sample);
-                    self.stats.rtt_samples_karn += 1;
-                }
+        if !retry || !self.tuning.measure_rtt {
+            return;
+        }
+        // Karn: with one NACK the repair answers it. With several and no
+        // RTT yet (the backoff sent more before the first repair came
+        // back), the first repair most likely answers the first NACK: a
+        // bootstrap sample that errs late, so a sender that does not
+        // answer echo requests still ends the backoff after one RTT.
+        let nacked_at = match hole.nack_count {
+            1 => hole.last_nack_at,
+            2.. if !self.rtt.is_measured() => hole.first_nack_at,
+            _ => None,
+        };
+        if let Some(nacked_at) = nacked_at {
+            let sample = now.saturating_duration_since(nacked_at);
+            if !sample.is_zero() {
+                self.rtt.sample_duration(sample);
+                self.stats.rtt_samples_karn += 1;
             }
         }
     }
@@ -2609,6 +2620,28 @@ mod tests {
             lonely.send_payload(&index.to_be_bytes(), base, t0);
         }
         assert_eq!(lonely.retransmit_at(&[1], t0 + ms(17)).len(), 1);
+    }
+
+    #[test]
+    fn first_repair_ends_the_backoff_without_echo() {
+        // A sender that answers no echo request (rist-rs before P8): the
+        // backoff sent three NACKs before the first repair came back.
+        let (mut receiver, t0) = receiver_with_hole(fixed_first_nack(), RecoveryConfig::default());
+        receiver.accept_packet_at(&data(4), t0).unwrap();
+        assert_eq!(nack_times(&mut receiver, t0, 0, 44, 1), vec![15, 22, 35]);
+        assert_eq!(receiver.rtt().srtt_micros(), None);
+        // The repair answering the first NACK arrives 30 ms after it.
+        assert!(
+            receiver
+                .accept_packet_at(&retry_data(1), t0 + ms(45))
+                .unwrap()
+                .recovered
+        );
+        assert_eq!(receiver.rtt().srtt_micros(), Some(30_000));
+        assert_eq!(receiver.stats().rtt_samples_karn, 1);
+        // Hole 3 is now re-requested every 1.1 x 30 + 1 = 34 ms, no more
+        // doubling (its last NACK was at 35 with a 26 ms backoff step).
+        assert_eq!(nack_times(&mut receiver, t0, 45, 130, 3), vec![61, 95, 129]);
     }
 
     #[test]
