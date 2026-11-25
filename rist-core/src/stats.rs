@@ -112,6 +112,10 @@ pub struct ReceiverStats {
     pub rtt_samples_karn: u64,
     /// Echo requests sent.
     pub echo_requests_sent: u64,
+    /// Originals that filled a hole (reordering samples).
+    pub reorder_samples: u64,
+    /// The first-NACK delay at the last poll.
+    pub first_nack_delay_micros: u64,
 }
 
 impl ReceiverStats {
@@ -140,6 +144,8 @@ impl ReceiverStats {
             rtt_samples_echo: 0,
             rtt_samples_karn: 0,
             echo_requests_sent: 0,
+            reorder_samples: 0,
+            first_nack_delay_micros: 0,
         }
     }
 

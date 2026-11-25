@@ -910,6 +910,37 @@ pub struct SimpleReceiverCore {
     next_echo_at: Option<Instant>,
     /// No NACK packet before this instant (the feedback interval).
     next_nack_packet_at: Option<Instant>,
+    /// Largest recent reordering, for the adaptive first-NACK delay.
+    reorder: ReorderEstimate,
+    /// A retry-marked packet was seen: unmarked arrivals are originals.
+    sender_marks_retries: bool,
+}
+
+/// The largest recent displacement of an original packet (hole detection
+/// to arrival), decaying with a fixed half-life.
+#[derive(Debug, Clone, Copy, Default)]
+struct ReorderEstimate {
+    micros: f64,
+    at: Option<Instant>,
+}
+
+const REORDER_HALF_LIFE_SECS: f64 = 10.0;
+
+impl ReorderEstimate {
+    fn at(&self, now: Instant) -> Duration {
+        let Some(at) = self.at else {
+            return Duration::ZERO;
+        };
+        let elapsed = now.saturating_duration_since(at).as_secs_f64();
+        let decayed = self.micros * (-elapsed / REORDER_HALF_LIFE_SECS).exp2();
+        Duration::from_micros(decayed as u64)
+    }
+
+    fn sample(&mut self, displacement: Duration, now: Instant) {
+        let current = self.at(now).as_micros() as f64;
+        self.micros = current.max(displacement.as_micros() as f64);
+        self.at = Some(now);
+    }
 }
 
 impl SimpleReceiverCore {
@@ -936,6 +967,8 @@ impl SimpleReceiverCore {
             rtt: RttEstimator::new(),
             next_echo_at: None,
             next_nack_packet_at: None,
+            reorder: ReorderEstimate::default(),
+            sender_marks_retries: false,
         }
     }
 
@@ -1061,6 +1094,11 @@ impl SimpleReceiverCore {
         if observation.recovered {
             self.on_hole_recovered(retry, now);
         }
+        if !observation.newly_missing.is_empty() {
+            // Keep next_poll_at() exact for the new holes.
+            let delay = self.first_nack_delay(now);
+            self.missing_tracker.set_initial_nack_delay(delay);
+        }
         if self.tuning.measure_rtt && self.next_echo_at.is_none() {
             // The first echo request goes out with the first report.
             self.next_echo_at = Some(now);
@@ -1098,10 +1136,34 @@ impl SimpleReceiverCore {
     /// marked as a retransmission, of a hole NACKed exactly once, gives an
     /// unambiguous NACK-to-repair time. It includes the sender's service
     /// delay, which is what the re-NACK interval has to cover.
+    ///
+    /// An original that fills a hole is a reordering sample for the
+    /// adaptive first-NACK delay: always when the sender marks its
+    /// retransmissions (seen once), otherwise only when no NACK went out
+    /// yet or the arrival came too soon after it to be its repair.
     fn on_hole_recovered(&mut self, retry: bool, now: Instant) {
         let Some(hole) = self.missing_tracker.last_recovered() else {
             return;
         };
+        if retry {
+            self.sender_marks_retries = true;
+        } else {
+            let half_rtt = self
+                .rtt
+                .min_micros()
+                .map_or(self.recovery.rtt_min, Duration::from_micros)
+                / 2;
+            let original = self.sender_marks_retries
+                || hole.nack_count == 0
+                || hole
+                    .last_nack_at
+                    .is_some_and(|nacked| now.saturating_duration_since(nacked) < half_rtt);
+            if original {
+                self.reorder
+                    .sample(now.saturating_duration_since(hole.first_missing_at), now);
+                self.stats.reorder_samples += 1;
+            }
+        }
         if retry && self.tuning.measure_rtt && hole.nack_count == 1 {
             if let Some(nacked_at) = hole.last_nack_at {
                 let sample = now.saturating_duration_since(nacked_at);
@@ -1227,6 +1289,10 @@ impl SimpleReceiverCore {
         let report_due = self.rtcp.poll_receiver_report(now);
         let mut echo = self.echo_due(now);
         let mut produced = 0;
+        let first_nack_delay = self.first_nack_delay(now);
+        self.missing_tracker
+            .set_initial_nack_delay(first_nack_delay);
+        self.stats.first_nack_delay_micros = first_nack_delay.as_micros() as u64;
         if self.nack_packet_due(now) {
             let (count, echo_sent) =
                 self.push_due_nacks(now, now_ntp, max_packets, echo, &mut send);
@@ -1272,6 +1338,25 @@ impl SimpleReceiverCore {
             .min()
     }
 
+    /// The first-NACK delay: `reorder_buffer`, or with
+    /// `adaptive_first_nack` clamp(1.5 x observed reordering + 1 ms,
+    /// first_nack_floor, reorder_buffer), the reordering decaying with a
+    /// 10 s half-life. On a path that does not reorder the first NACK goes
+    /// out within a few milliseconds, which buys an attempt and lands a
+    /// lost frame tail within the frame deadline at short RTTs.
+    pub fn first_nack_delay(&self, now: Instant) -> Duration {
+        let ceiling = self.recovery.reorder_buffer;
+        if !self.tuning.adaptive_first_nack {
+            return ceiling;
+        }
+        let adaptive = self
+            .reorder
+            .at(now)
+            .mul_f64(1.5)
+            .saturating_add(Duration::from_millis(1));
+        adaptive.max(self.tuning.first_nack_floor).min(ceiling)
+    }
+
     fn nack_packet_due(&self, now: Instant) -> bool {
         self.next_nack_packet_at.map_or(true, |at| now >= at)
             && self
@@ -1311,7 +1396,7 @@ impl SimpleReceiverCore {
     ///   so a long path is not flooded when rtt_min is small.
     /// - A hole is no longer requested when less than one measured RTT is
     ///   left before its deadline: the repair could not arrive in time.
-    fn nack_schedule(&self) -> (NackSchedule, NackRepeat) {
+    fn nack_schedule(&self, now: Instant) -> (NackSchedule, NackRepeat) {
         let recovery = &self.recovery;
         let rtt_min = recovery.rtt_min;
         let rtt_max = recovery.rtt_max.max(rtt_min);
@@ -1332,7 +1417,7 @@ impl SimpleReceiverCore {
             Duration::ZERO
         };
         let schedule = NackSchedule {
-            initial_delay: recovery.reorder_buffer,
+            initial_delay: self.first_nack_delay(now),
             repeat_delay: repeat.delay,
             max_retries: recovery.max_retries,
             min_time_left,
@@ -1355,7 +1440,7 @@ impl SimpleReceiverCore {
         echo: bool,
         send: &mut dyn FnMut(&[u8]) -> bool,
     ) -> (usize, bool) {
-        let (schedule, repeat) = self.nack_schedule();
+        let (schedule, repeat) = self.nack_schedule(now);
         let mut due = std::mem::take(&mut self.nack_scratch);
         due.clear();
         // A Range packet can carry up to MAX_NACK_PACKET_REQUESTS contiguous
@@ -2047,6 +2132,96 @@ mod tests {
             kind: EchoKind::Request,
         })));
         assert_eq!(receiver.stats().echo_requests_sent, 1);
+    }
+
+    fn adaptive_tuning() -> RecoveryTuning {
+        RecoveryTuning {
+            adaptive_first_nack: true,
+            ..RecoveryTuning::librist_like()
+        }
+    }
+
+    #[test]
+    fn first_nack_delay_adapts_to_observed_reorder() {
+        let (mut receiver, t0) = receiver_with_hole(adaptive_tuning(), RecoveryConfig::default());
+        // No reordering seen: the floor of 2 ms, not reorder_buffer 15 ms.
+        assert_eq!(receiver.next_poll_at(), Some(t0));
+        assert_eq!(nack_times(&mut receiver, t0, 1, 3, 1), vec![2]);
+        assert_eq!(receiver.stats().first_nack_delay_micros, 2_000);
+        // The sender marks its repairs: every unmarked arrival is an original.
+        assert!(
+            receiver
+                .accept_packet_at(&retry_data(1), t0 + ms(4))
+                .unwrap()
+                .recovered
+        );
+
+        // Packet 4 arrives 6 ms after 5 revealed it missing (and after a
+        // spurious NACK at 2 ms): reordering of 6 ms.
+        let t1 = t0 + ms(10);
+        receiver.accept_packet_at(&data(3), t1).unwrap();
+        receiver.accept_packet_at(&data(5), t1).unwrap();
+        assert_eq!(nack_times(&mut receiver, t0, 11, 13, 4), vec![12]);
+        assert!(
+            receiver
+                .accept_packet_at(&data(4), t1 + ms(6))
+                .unwrap()
+                .recovered
+        );
+        assert_eq!(receiver.stats().reorder_samples, 1);
+        // 1.5 x 6 + 1 = 10 ms.
+        assert_eq!(receiver.first_nack_delay(t1 + ms(6)), ms(10));
+        // It decays with a 10 s half-life: 1.5 x 3 + 1 = 5.5 ms.
+        assert_eq!(
+            receiver.first_nack_delay(t1 + ms(6) + Duration::from_secs(10)),
+            Duration::from_micros(5_500)
+        );
+        // Never above reorder_buffer.
+        receiver.reorder.sample(ms(50), t1 + ms(7));
+        assert_eq!(receiver.first_nack_delay(t1 + ms(7)), ms(15));
+    }
+
+    #[test]
+    fn reorder_ignores_retry_marked_repairs() {
+        let (mut receiver, t0) = receiver_with_hole(adaptive_tuning(), RecoveryConfig::default());
+        assert_eq!(nack_times(&mut receiver, t0, 0, 3, 1), vec![2]);
+        // The repair arrives 30 ms after detection: not reordering.
+        assert!(
+            receiver
+                .accept_packet_at(&retry_data(1), t0 + ms(30))
+                .unwrap()
+                .recovered
+        );
+        assert_eq!(receiver.stats().reorder_samples, 0);
+        assert_eq!(receiver.first_nack_delay(t0 + ms(30)), ms(2));
+    }
+
+    #[test]
+    fn unmarked_late_arrival_after_a_nack_is_ambiguous_until_retries_are_marked() {
+        // A sender that does not mark retries (rist-rs before P7): an
+        // arrival long after our NACK may be the repair, so no sample.
+        let (mut receiver, t0) = receiver_with_hole(adaptive_tuning(), RecoveryConfig::default());
+        assert_eq!(nack_times(&mut receiver, t0, 0, 3, 1), vec![2]);
+        assert!(
+            receiver
+                .accept_packet_at(&data(1), t0 + ms(30))
+                .unwrap()
+                .recovered
+        );
+        assert_eq!(receiver.stats().reorder_samples, 0);
+        // An original before any NACK is always a sample.
+        receiver.accept_packet_at(&data(4), t0 + ms(31)).unwrap();
+        assert!(
+            receiver
+                .accept_packet_at(&data(3), t0 + ms(32))
+                .unwrap()
+                .recovered
+        );
+        assert_eq!(receiver.stats().reorder_samples, 1);
+        assert_eq!(
+            receiver.first_nack_delay(t0 + ms(32)),
+            Duration::from_micros(2_500)
+        );
     }
 
     #[test]
