@@ -937,7 +937,7 @@ impl SenderContext<'_> {
         state.stats.record_feedback();
         let mut echo_requests = Vec::new();
         let sequences =
-            decode_sender_feedback(packet, now_ntp, self.reference, state, &mut echo_requests)?;
+            decode_sender_feedback(packet, now_ntp, self, state, &mut echo_requests)?;
         if !sequences.is_empty() {
             state.last_nack_at = Some(now);
         }
@@ -1059,15 +1059,16 @@ fn sender_retry_spacing(
 
 /// Decodes one feedback compound for a sender: takes RTT samples from echo
 /// responses, collects echo requests and returns the NACKed sequences
-/// extended near `reference`. Decode failures are counted.
+/// extended near the newest sequence sent. Decode failures are counted.
 fn decode_sender_feedback(
     packet: &[u8],
     now_ntp: u64,
-    reference: u32,
+    context: &SenderContext<'_>,
     state: &mut SimpleSenderPeerState,
     echo_requests: &mut Vec<Echo>,
 ) -> Result<Vec<u32>> {
-    let decoded = update_sender_rtcp_state(packet, now_ntp, state, echo_requests)
+    let reference = context.reference;
+    let decoded = update_sender_rtcp_state(packet, now_ntp, context.ssrc, state, echo_requests)
         .and_then(|()| decode_nacks_from_compound(packet));
     match decoded {
         Ok(sequences) => Ok(sequences
@@ -1081,22 +1082,37 @@ fn decode_sender_feedback(
     }
 }
 
+/// Takes RTT samples from echo responses and collects echo requests.
+///
+/// A response counts only when it answers a request of this sender (its
+/// SSRC is `ssrc`, as librist checks against the peer's SSRC) and gives a
+/// plausible RTT: a timestamp not in the future and at most
+/// `MAX_RTT_SAMPLE_MICROS`, the receiver's own filter. A wall-clock step or a
+/// stray response would otherwise feed srtt a sample of zero or of seconds,
+/// and an inflated srtt makes every repair a last chance (B3 duplicates)
+/// until it decays.
 fn update_sender_rtcp_state(
     packet: &[u8],
     now_ntp: u64,
+    ssrc: u32,
     state: &mut SimpleSenderPeerState,
     echo_requests: &mut Vec<Echo>,
 ) -> Result<()> {
     for packet in decode_compound(packet)? {
         match packet {
             RtcpPacket::Echo(Echo {
+                ssrc: echo_ssrc,
                 ntp_timestamp,
                 kind: EchoKind::Response { delay },
-                ..
             }) => {
-                state
-                    .rtt
-                    .sample(calculate_rtt_micros(ntp_timestamp, now_ntp, delay));
+                if echo_ssrc & !1 != ssrc || ntp_timestamp > now_ntp {
+                    continue;
+                }
+                let rtt = calculate_rtt_micros(ntp_timestamp, now_ntp, delay);
+                if rtt > MAX_RTT_SAMPLE_MICROS {
+                    continue;
+                }
+                state.rtt.sample(rtt);
                 state.stats.rtt_micros = state.rtt.srtt_micros();
             }
             RtcpPacket::Echo(
@@ -3604,6 +3620,39 @@ mod tests {
         }
         // 8 ms seeds the estimate; 16 ms moves it by one eighth.
         assert_eq!(sender.stats().rtt_micros, Some(9_000));
+    }
+
+    #[test]
+    fn sender_ignores_implausible_and_foreign_echo_responses() {
+        let base = ntp_from_unix_duration(Duration::from_secs(100));
+        let at = |ms: u64| base + (ms << 32) / 1000;
+        let mut sender = SimpleSenderCore::new(0x1122_3344, 64);
+        let response = |ssrc: u32, sent: u64| {
+            build_echo_response(
+                0x5566_7788,
+                "rx",
+                Echo {
+                    ssrc,
+                    ntp_timestamp: sent,
+                    kind: EchoKind::Request,
+                },
+            )
+        };
+        let feed = |sender: &mut SimpleSenderCore, packet: &[u8], now_ntp: u64| {
+            sender
+                .handle_feedback_outcome_at(packet, now_ntp, Instant::now())
+                .unwrap();
+        };
+        // A request stamped in the future (a wall-clock step back).
+        feed(&mut sender, &response(0x1122_3344, at(5_000)), at(1_000));
+        // A request 11 s old (a step forward, or a stale response).
+        feed(&mut sender, &response(0x1122_3344, at(0)), at(11_000));
+        // A response to someone else's request.
+        feed(&mut sender, &response(0x0bad_0000, at(10_990)), at(11_000));
+        assert_eq!(sender.stats().rtt_micros, None);
+        // A plausible answer to this sender's own request counts.
+        feed(&mut sender, &response(0x1122_3344, at(10_993)), at(11_000));
+        assert_eq!(sender.stats().rtt_micros, Some(7_000));
     }
 
     #[test]
