@@ -1284,25 +1284,38 @@ impl SimpleMioReceiver {
 
     /// Sends every due RTCP packet (all due NACK packets, oldest holes
     /// first, or a periodic receiver report) and returns the bytes sent.
+    ///
+    /// Holes count as NACKed only when their packet was sent. When a send
+    /// fails, the rest of the batch is not sent and its holes stay due for
+    /// the next poll; the bytes already sent are returned, or the error when
+    /// nothing went out.
     pub fn poll_rtcp_and_send(&mut self, now: Instant, now_ntp: u64) -> io::Result<Option<usize>> {
         let Some(peer) = self.last_rtcp_peer else {
             return Ok(None);
         };
-        let mut packets = Vec::new();
-        self.core.poll_rtcp_into(
+        let socket = &mut self.rtcp_socket;
+        let mut sent = 0;
+        let mut error = None;
+        let packets = self.core.poll_rtcp_with(
             now,
             now_ntp,
-            &mut packets,
             rist_core::simple::MAX_NACK_PACKETS_PER_POLL,
+            |packet| match socket.send_packet_to(peer, packet) {
+                Ok(bytes) => {
+                    sent += bytes;
+                    true
+                }
+                Err(err) => {
+                    error = Some(err);
+                    false
+                }
+            },
         );
-        if packets.is_empty() {
-            return Ok(None);
+        match error {
+            Some(error) if packets == 0 => Err(error),
+            _ if packets == 0 => Ok(None),
+            _ => Ok(Some(sent)),
         }
-        let mut sent = 0;
-        for packet in &packets {
-            sent += self.rtcp_socket.send_packet_to(peer, packet)?;
-        }
-        Ok(Some(sent))
     }
 
     pub fn send_feedback(&mut self) -> io::Result<Option<usize>> {
@@ -3329,13 +3342,27 @@ impl MainMioReceiver {
         let Some(runtime) = self.peer_runtime.get_mut(&peer) else {
             return Ok(None);
         };
-        let packets = runtime.core.poll_rtcp_all(now, now_ntp);
-        let mut sent = Vec::with_capacity(packets.len());
-        for (_, packet) in packets {
-            self.socket.send_packet_to(peer, &packet.bytes)?;
-            sent.push(packet);
+        let socket = &mut self.socket;
+        let mut sent = Vec::new();
+        let mut error = None;
+        runtime
+            .core
+            .poll_rtcp_all_with(now, now_ntp, |_flow_id, packet| {
+                match socket.send_packet_to(peer, &packet.bytes) {
+                    Ok(_) => {
+                        sent.push(packet);
+                        true
+                    }
+                    Err(err) => {
+                        error = Some(err);
+                        false
+                    }
+                }
+            });
+        match error {
+            Some(error) if sent.is_empty() => Err(error),
+            _ => Ok(Some(sent)),
         }
-        Ok(Some(sent))
     }
 
     pub fn set_session_config(&mut self, config: MainSessionConfig) {
@@ -3528,16 +3555,29 @@ impl MainMioReceiver {
             return Ok(None);
         };
         self.ensure_peer_authenticated(peer)?;
-        let packets = match self.peer_runtime.get_mut(&peer) {
-            Some(runtime) => runtime.core.poll_rtcp_all(now, now_ntp),
-            None => self.core.poll_rtcp_all(now, now_ntp),
+        let core = match self.peer_runtime.get_mut(&peer) {
+            Some(runtime) => &mut runtime.core,
+            None => &mut self.core,
         };
+        let socket = &mut self.socket;
         let mut first = None;
-        for (_flow_id, packet) in packets {
-            self.socket.send_packet_to(peer, &packet.bytes)?;
-            first.get_or_insert(packet);
+        let mut error = None;
+        core.poll_rtcp_all_with(now, now_ntp, |_flow_id, packet| {
+            match socket.send_packet_to(peer, &packet.bytes) {
+                Ok(_) => {
+                    first.get_or_insert(packet);
+                    true
+                }
+                Err(err) => {
+                    error = Some(err);
+                    false
+                }
+            }
+        });
+        match error {
+            Some(error) if first.is_none() => Err(error),
+            _ => Ok(first),
         }
-        Ok(first)
     }
 
     pub fn try_recv_rtcp_and_respond(
@@ -3793,6 +3833,52 @@ mod tests {
         SRP_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn simple_receiver_counts_only_nacks_that_were_sent() {
+        let mut receiver =
+            SimpleMioReceiver::bind(loopback_any(), 1, "receiver", NackMode::Range).unwrap();
+        let start = Instant::now();
+        for n in 0..=250_u16 {
+            let packet = encode_packet(RtpHeader::new_mpegts(2 * n, 0, 1), b"ts");
+            receiver.core.accept_packet_at(&packet, start).unwrap();
+        }
+        // An IPv6 destination on an IPv4 socket: every send fails.
+        receiver.last_rtcp_peer = Some(SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::LOCALHOST,
+            9,
+            0,
+            0,
+        )));
+        assert_eq!(receiver.poll_rtcp_and_send(start, 0).unwrap(), None);
+        let first = start + Duration::from_millis(20);
+        assert!(receiver.poll_rtcp_and_send(first, 0).is_err());
+        let stats = receiver.stats();
+        assert_eq!(stats.nack_packets, 0);
+        assert_eq!(stats.nack_entries_sent, 0);
+        assert_eq!(stats.feedback_packets, 0);
+        assert_eq!(stats.nack_entries_deferred, 250);
+
+        // Once sends succeed, every hole is requested at the next poll.
+        let peer = StdUdpSocket::bind(loopback_any()).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        receiver.last_rtcp_peer = Some(peer.local_addr().unwrap());
+        let second = first + Duration::from_millis(20);
+        let bytes = receiver.poll_rtcp_and_send(second, 0).unwrap().unwrap();
+        let mut requested = Vec::new();
+        let mut received = 0;
+        let mut buf = [0_u8; 2048];
+        while received < bytes {
+            let len = peer.recv(&mut buf).unwrap();
+            received += len;
+            requested
+                .extend(rist_core::packet::rtcp::decode_nacks_from_compound(&buf[..len]).unwrap());
+        }
+        assert_eq!(requested, (0..250).map(|n| 2 * n + 1).collect::<Vec<_>>());
+        let stats = receiver.stats();
+        assert_eq!(stats.nack_packets, 2);
+        assert_eq!(stats.nack_entries_sent, 250);
     }
 
     fn loopback_any() -> SocketAddr {
