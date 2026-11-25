@@ -25,6 +25,8 @@ pub struct SenderStats {
     pub echo_responses: u64,
     /// Second copies of late repairs sent (also in retransmitted_packets).
     pub duplicate_repairs: u64,
+    /// Tail-loss probes sent (also in retransmitted_packets).
+    pub tail_probes: u64,
 }
 
 impl SenderStats {
@@ -46,6 +48,7 @@ impl SenderStats {
             feedback_decode_errors: 0,
             echo_responses: 0,
             duplicate_repairs: 0,
+            tail_probes: 0,
         }
     }
 

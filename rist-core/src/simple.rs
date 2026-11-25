@@ -18,7 +18,7 @@ use crate::stats::{ReceiverStats, SenderStats};
 use crate::time::{calculate_rtt_micros, mpegts_rtp_timestamp, ntp_now};
 use crate::{
     CongestionControlMode, MissingTracker, RecoveryConfig, RecoveryMode, RecoveryTuning, Result,
-    SequenceExtender,
+    SequenceExtender, TailProbe,
 };
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -72,6 +72,8 @@ pub struct SimpleSenderPeerState {
     /// Second copies of repairs, due at the instant given (FIFO: the
     /// duplicate gap is fixed).
     duplicates: VecDeque<(Instant, u32)>,
+    /// When this peer last asked for a retransmission.
+    last_nack_at: Option<Instant>,
     stats: SenderStats,
 }
 
@@ -106,6 +108,7 @@ impl SimpleSenderPeerState {
             retry_window_bytes: 0,
             rtt: RttEstimator::new(),
             duplicates: VecDeque::new(),
+            last_nack_at: None,
             stats: SenderStats::new(flow_id),
         }
     }
@@ -285,6 +288,43 @@ pub struct SimpleSenderCore {
     congestion_control: CongestionControlMode,
     tuning: RecoveryTuning,
     recovery_state: SimpleSenderPeerState,
+    tail: TailProbeState,
+}
+
+/// What the tail-loss probe (B4) knows about the data sent.
+#[derive(Debug, Clone, Copy, Default)]
+struct TailProbeState {
+    last_sent_at: Option<Instant>,
+    last_sequence: u32,
+    probed: bool,
+    /// Smoothed gap between data packets (1/16), in microseconds.
+    gap_micros: f64,
+    /// Probe allowance: tail_probe_max_per_mille per data packet, capped.
+    tokens: f64,
+}
+
+/// The probe allowance saved up at most (probes in a row).
+const TAIL_PROBE_MAX_TOKENS: f64 = 4.0;
+const TAIL_PROBE_MIN_IDLE: Duration = Duration::from_millis(2);
+
+impl TailProbeState {
+    fn on_send(&mut self, sequence: u32, now: Instant, per_mille: u32) {
+        if let Some(last) = self.last_sent_at {
+            let gap = now.saturating_duration_since(last).as_micros() as f64;
+            self.gap_micros += (gap - self.gap_micros) / 16.0;
+        }
+        self.last_sent_at = Some(now);
+        self.last_sequence = sequence;
+        self.probed = false;
+        self.tokens = (self.tokens + f64::from(per_mille) / 1_000.0).min(TAIL_PROBE_MAX_TOKENS);
+    }
+
+    /// The idle time after which the last packet is probed: a few usual
+    /// packet gaps, at least 2 ms. A sender that never pauses (CBR) never
+    /// reaches it.
+    fn idle(&self) -> Duration {
+        Duration::from_micros((4.0 * self.gap_micros) as u64).max(TAIL_PROBE_MIN_IDLE)
+    }
 }
 
 impl SimpleSenderCore {
@@ -301,6 +341,7 @@ impl SimpleSenderCore {
             congestion_control: CongestionControlMode::default(),
             tuning: RecoveryTuning::default(),
             recovery_state: SimpleSenderPeerState::new(ssrc, history_packets),
+            tail: TailProbeState::default(),
         }
         .with_history_retention()
     }
@@ -422,6 +463,8 @@ impl SimpleSenderCore {
         let bytes = self.encode_payload(header, payload);
         self.history.insert(sequence, bytes.clone(), now);
         self.stats.record_send(bytes.len());
+        self.tail
+            .on_send(sequence, now, self.tuning.tail_probe_max_per_mille);
         OutboundPacket {
             sequence,
             retry: false,
@@ -445,7 +488,68 @@ impl SimpleSenderCore {
     pub fn poll_repairs_at(&mut self, now: Instant) -> Vec<OutboundPacket> {
         let mut out = Vec::new();
         due_duplicates(&self.history, now, &mut self.recovery_state, &mut out);
+        if self.tail_probe_at().is_some_and(|at| at <= now) {
+            self.send_tail_probe(now, &mut out);
+        }
         out
+    }
+
+    /// When the tail-loss probe (B4) of the last data packet is due, if one
+    /// is armed: `RecoveryTuning::tail_probe` On, or Auto within
+    /// `tail_probe_loss_window` of the last NACK; not probed yet; and the
+    /// probe allowance (`tail_probe_max_per_mille` of the data packets)
+    /// has room. Single-peer senders only.
+    fn tail_probe_at(&self) -> Option<Instant> {
+        let last_sent = self.tail.last_sent_at?;
+        if self.tail.probed || self.tail.tokens < 1.0 {
+            return None;
+        }
+        match self.tuning.tail_probe {
+            TailProbe::Off => return None,
+            TailProbe::On => {}
+            TailProbe::Auto => {
+                let nacked = self.recovery_state.last_nack_at?;
+                if last_sent.saturating_duration_since(nacked) > self.tuning.tail_probe_loss_window
+                {
+                    return None;
+                }
+            }
+        }
+        Some(last_sent + self.tail.idle())
+    }
+
+    /// Resends the last data packet once, marked as a retransmission: a
+    /// receiver that lost it repairs it now instead of when the next burst
+    /// reveals the gap; one that lost more sees the hole at once; one that
+    /// has it drops a duplicate.
+    fn send_tail_probe(&mut self, now: Instant, out: &mut Vec<OutboundPacket>) {
+        self.tail.probed = true;
+        let Some(packet) = self.history.get(self.tail.last_sequence) else {
+            return;
+        };
+        let state = &mut self.recovery_state;
+        if now.saturating_duration_since(state.retry_window_started) >= Duration::from_secs(1) {
+            state.retry_window_started = now;
+            state.retry_window_bytes = 0;
+        }
+        let maximum_bytes = u64::from(self.recovery.max_bitrate)
+            .saturating_mul(1_000)
+            .saturating_div(8);
+        let bytes = state
+            .retry_window_bytes
+            .saturating_add(packet.payload_len as u64);
+        if maximum_bytes > 0 && bytes > maximum_bytes {
+            return;
+        }
+        state.retry_window_bytes = bytes;
+        self.tail.tokens -= 1.0;
+        state.stats.record_retransmit(packet.payload_len);
+        state.stats.tail_probes += 1;
+        out.push(OutboundPacket {
+            sequence: packet.sequence,
+            retry: true,
+            bytes: retry_marked(&packet.payload),
+        });
     }
 
     /// [`Self::poll_repairs_at`] for one peer of a multi-peer sender.
@@ -461,7 +565,10 @@ impl SimpleSenderCore {
 
     /// When [`Self::poll_repairs_at`] next has something to send.
     pub fn next_repair_at(&self) -> Option<Instant> {
-        self.recovery_state.next_repair_at()
+        [self.recovery_state.next_repair_at(), self.tail_probe_at()]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     /// When the next SR or echo request of [`Self::poll_rtcp`] is due
@@ -826,6 +933,9 @@ impl SenderContext<'_> {
         let mut echo_requests = Vec::new();
         let sequences =
             decode_sender_feedback(packet, now_ntp, self.reference, state, &mut echo_requests)?;
+        if !sequences.is_empty() {
+            state.last_nack_at = Some(now);
+        }
         let responses = echo_requests
             .into_iter()
             .map(|request| build_echo_response(self.ssrc, self.cname, request))
@@ -2829,6 +2939,105 @@ mod tests {
         off.retransmit_at(&[0], t);
         off.retransmit_at(&[0], t + ms(10));
         assert_eq!(off.next_repair_at(), None);
+    }
+
+    fn nack_compound(sequences: &[u32]) -> Vec<u8> {
+        let mut out = Vec::new();
+        encode_empty_receiver_report(FLOW, &mut out);
+        encode_nack(NackMode::Range, FLOW, sequences, &mut out);
+        out
+    }
+
+    fn send_burst(sender: &mut SimpleSenderCore, count: u32, at: Instant) {
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        for _ in 0..count {
+            sender.send_payload(b"frame part", ntp, at);
+        }
+    }
+
+    #[test]
+    fn tail_probe_fires_once_after_idle() {
+        let t = Instant::now();
+        let mut sender = SimpleSenderCore::new(FLOW, 1_024);
+        send_burst(&mut sender, 100, t);
+        // Auto: nothing until the peer has asked for a retransmission.
+        assert_eq!(sender.next_repair_at(), None);
+        sender
+            .handle_feedback_outcome_at(&nack_compound(&[0]), 0, t)
+            .unwrap();
+        // The last packet, 2 ms after the burst ended.
+        assert_eq!(sender.next_repair_at(), Some(t + ms(2)));
+        assert!(sender.poll_repairs_at(t + ms(1)).is_empty());
+        let probe = sender.poll_repairs_at(t + ms(2));
+        assert_eq!(probe.len(), 1);
+        assert_eq!(probe[0].sequence, 99);
+        assert!(probe[0].retry);
+        assert_eq!(
+            RtpPacket::decode(&probe[0].bytes).unwrap().header.ssrc,
+            FLOW | 1
+        );
+        // Once per burst.
+        assert_eq!(sender.next_repair_at(), None);
+        assert!(sender.poll_repairs_at(t + ms(5)).is_empty());
+        // The next burst re-arms it.
+        send_burst(&mut sender, 100, t + ms(40));
+        assert_eq!(sender.next_repair_at(), Some(t + ms(42)));
+        assert_eq!(sender.stats().tail_probes, 1);
+
+        // On: no NACK needed. Off: never.
+        for (mode, expected) in [(TailProbe::On, 1), (TailProbe::Off, 0)] {
+            let mut sender =
+                SimpleSenderCore::new(FLOW, 1_024).with_recovery_tuning(RecoveryTuning {
+                    tail_probe: mode,
+                    ..RecoveryTuning::default()
+                });
+            send_burst(&mut sender, 100, t);
+            assert_eq!(
+                sender.poll_repairs_at(t + ms(2)).len(),
+                expected,
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tail_probe_respects_budget() {
+        let t = Instant::now();
+        let mut sender = SimpleSenderCore::new(FLOW, 1_024).with_recovery_tuning(RecoveryTuning {
+            tail_probe: TailProbe::On,
+            ..RecoveryTuning::default()
+        });
+        // 50 bursts of 10 packets, 40 ms apart: 2 % of 500 packets is 10.
+        let mut probes = 0;
+        for burst in 0..50 {
+            let at = t + ms(40 * burst);
+            send_burst(&mut sender, 10, at);
+            probes += sender.poll_repairs_at(at + ms(20)).len();
+        }
+        assert_eq!(probes, 10);
+        assert_eq!(sender.stats().tail_probes, 10);
+    }
+
+    #[test]
+    fn tail_probe_never_fires_for_a_sender_that_does_not_pause() {
+        let t = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut sender = SimpleSenderCore::new(FLOW, 1_024).with_recovery_tuning(RecoveryTuning {
+            tail_probe: TailProbe::On,
+            ..RecoveryTuning::default()
+        });
+        // CBR at one packet per 2.2 ms (5 Mbit/s): the probe waits 4 gaps.
+        let mut probes = 0;
+        for index in 0..1_000_u64 {
+            let at = t + Duration::from_micros(index * 2_200);
+            probes += sender.poll_repairs_at(at).len();
+            sender.send_payload(b"cbr", ntp, at);
+        }
+        assert_eq!(probes, 0);
+        // Armed about 4 x 2.2 ms after the last packet.
+        let last = t + Duration::from_micros(999 * 2_200);
+        let due = sender.next_repair_at().unwrap();
+        assert!(due > last + Duration::from_micros(8_700) && due <= last + ms(9));
     }
 
     #[test]
