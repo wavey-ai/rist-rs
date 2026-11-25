@@ -15,11 +15,43 @@ use crate::packet::rtcp::NackMode;
 use crate::packet::rtp::RtpPacket;
 use crate::simple::{
     OutboundPacket, ReceivedPayload, SimpleReceiverCore, SimpleSenderCore, SimpleSenderPeerState,
+    MAX_NACK_PACKETS_PER_POLL,
 };
 use crate::stats::{ReceiverStats, SenderStats};
 use crate::Result;
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::time::{Duration, Instant};
+
+/// Hasher for the per-peer flow maps, keyed by flow id (the RTP SSRC with
+/// the retry bit cleared). The maps hold at most `max_flows` entries, so
+/// SipHash's flooding resistance buys nothing; this is one multiply.
+#[derive(Debug, Clone, Copy, Default)]
+struct FlowIdHasher(u64);
+
+impl Hasher for FlowIdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.write_u64(self.0.rotate_left(8) ^ u64::from(byte));
+        }
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.write_u64(u64::from(value));
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        let mixed = (self.0 ^ value).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        self.0 = mixed ^ (mixed >> 32);
+    }
+}
+
+type FlowMap<V> = HashMap<u32, V, BuildHasherDefault<FlowIdHasher>>;
 
 pub const DEFAULT_VIRT_SRC_PORT: u16 = 1971;
 pub const DEFAULT_VIRT_DST_PORT: u16 = 1968;
@@ -644,22 +676,25 @@ pub struct MainReceiverCore {
     primary_flow_id: u32,
     cname: String,
     nack_mode: NackMode,
-    flows: HashMap<u32, SimpleReceiverCore>,
+    flows: FlowMap<SimpleReceiverCore>,
+    /// Flow ids in ascending order (flows are never removed).
+    flow_order: Vec<u32>,
     max_flows: usize,
     recovery: RecoveryConfig,
     congestion_control: CongestionControlMode,
     gre_version: u8,
     next_gre_sequence: u32,
     last_reduced: Option<ReducedHeader>,
-    flow_reduced: HashMap<u32, ReducedHeader>,
+    flow_reduced: FlowMap<ReducedHeader>,
     tx_key: Option<PskKey>,
     rx_key: Option<PskKey>,
+    rtcp_scratch: Vec<Vec<u8>>,
 }
 
 impl MainReceiverCore {
     pub fn new(flow_id: u32, cname: impl Into<String>, nack_mode: NackMode) -> Self {
         let cname = cname.into();
-        let mut flows = HashMap::new();
+        let mut flows = FlowMap::default();
         flows.insert(
             flow_id,
             SimpleReceiverCore::new(flow_id, cname.clone(), nack_mode),
@@ -669,15 +704,17 @@ impl MainReceiverCore {
             cname,
             nack_mode,
             flows,
+            flow_order: vec![flow_id],
             max_flows: DEFAULT_MAIN_FLOWS_PER_PEER,
             recovery: RecoveryConfig::default(),
             congestion_control: CongestionControlMode::default(),
             gre_version: 1,
             next_gre_sequence: 0,
             last_reduced: None,
-            flow_reduced: HashMap::new(),
+            flow_reduced: FlowMap::default(),
             tx_key: None,
             rx_key: None,
+            rtcp_scratch: Vec::new(),
         }
     }
 
@@ -750,12 +787,22 @@ impl MainReceiverCore {
         reduced: ReducedHeader,
         payload: &[u8],
     ) -> Result<ReceivedPayload> {
+        self.accept_reduced_at(reduced, payload, Instant::now())
+    }
+
+    /// [`Self::accept_reduced`] with the caller's clock reading.
+    pub fn accept_reduced_at(
+        &mut self,
+        reduced: ReducedHeader,
+        payload: &[u8],
+        now: Instant,
+    ) -> Result<ReceivedPayload> {
         self.last_reduced = Some(reduced);
         let mut packet = RtpPacket::decode(payload)?;
         let flow_id = packet.header.ssrc & !1;
         packet.header.ssrc = flow_id;
         self.flow_reduced.insert(flow_id, reduced);
-        self.flow_mut(flow_id)?.accept_rtp_packet(packet)
+        self.flow_mut(flow_id)?.accept_rtp_packet_at(packet, now)
     }
 
     pub fn build_feedback(&mut self) -> MainReceiverFeedback {
@@ -781,26 +828,22 @@ impl MainReceiverCore {
         now: Instant,
         now_ntp: u64,
     ) -> Vec<(u32, MainReceiverFeedback)> {
-        let flow_ids = self.flow_ids();
         let mut due = Vec::new();
-        for flow_id in flow_ids {
-            if let Some(packet) = self
-                .flows
+        let mut packets = std::mem::take(&mut self.rtcp_scratch);
+        for index in 0..self.flow_order.len() {
+            let flow_id = self.flow_order[index];
+            packets.clear();
+            self.flows
                 .get_mut(&flow_id)
                 .expect("listed Main receiver flow must exist")
-                .poll_rtcp(now, now_ntp)
-            {
-                due.push((flow_id, packet));
+                .poll_rtcp_into(now, now_ntp, &mut packets, MAX_NACK_PACKETS_PER_POLL);
+            for packet in packets.drain(..) {
+                let feedback = self.wrap_feedback_payload_for_flow(flow_id, &packet);
+                due.push((flow_id, feedback));
             }
         }
-        due.into_iter()
-            .map(|(flow_id, packet)| {
-                (
-                    flow_id,
-                    self.wrap_feedback_payload_for_flow(flow_id, &packet),
-                )
-            })
-            .collect()
+        self.rtcp_scratch = packets;
+        due
     }
 
     pub fn handle_rtcp(
@@ -989,9 +1032,7 @@ impl MainReceiverCore {
     }
 
     pub fn flow_ids(&self) -> Vec<u32> {
-        let mut flow_ids = self.flows.keys().copied().collect::<Vec<_>>();
-        flow_ids.sort_unstable();
-        flow_ids
+        self.flow_order.clone()
     }
 
     pub fn stats_for_flow(&self, flow_id: u32) -> Option<ReceiverStats> {
@@ -1011,22 +1052,23 @@ impl MainReceiverCore {
     }
 
     fn flow_mut(&mut self, flow_id: u32) -> Result<&mut SimpleReceiverCore> {
-        if !self.flows.contains_key(&flow_id) {
-            if self.flows.len() >= self.max_flows {
-                return Err(crate::Error::MainFlowCapacityExceeded {
-                    maximum: self.max_flows,
-                });
+        let flows = self.flows.len();
+        match self.flows.entry(flow_id) {
+            Entry::Occupied(entry) => Ok(entry.into_mut()),
+            Entry::Vacant(entry) => {
+                if flows >= self.max_flows {
+                    return Err(crate::Error::MainFlowCapacityExceeded {
+                        maximum: self.max_flows,
+                    });
+                }
+                let position = self.flow_order.partition_point(|id| *id < flow_id);
+                self.flow_order.insert(position, flow_id);
+                Ok(entry.insert(
+                    SimpleReceiverCore::new(flow_id, self.cname.clone(), self.nack_mode)
+                        .with_recovery_config(self.recovery.clone(), self.congestion_control),
+                ))
             }
-            self.flows.insert(
-                flow_id,
-                SimpleReceiverCore::new(flow_id, self.cname.clone(), self.nack_mode)
-                    .with_recovery_config(self.recovery.clone(), self.congestion_control),
-            );
         }
-        Ok(self
-            .flows
-            .get_mut(&flow_id)
-            .expect("RIST Main receiver flow must exist"))
     }
 
     fn decode_reduced<'a>(&mut self, packet: &'a [u8]) -> Result<DecodedReduced<'a>> {
@@ -1213,6 +1255,44 @@ mod tests {
             receiver.stats().recovered_packets,
             lost_sequences.len() as u64
         );
+    }
+
+    #[test]
+    fn main_poll_rtcp_all_sends_every_due_nack_packet_per_flow_in_flow_order() {
+        let start = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut receiver = MainReceiverCore::new(0x10, "rust", NackMode::Range);
+        let mut senders = [0x30_u32, 0x10, 0x20]
+            .map(|ssrc| (ssrc, MainSenderCore::new(ssrc, 4096)));
+        for (_, sender) in &mut senders {
+            for index in 0..=1_000_u32 {
+                let packet = sender.send_payload(&index.to_be_bytes(), ntp, start);
+                if index % 2 == 0 {
+                    receiver.accept_packet(&packet.bytes).unwrap();
+                }
+            }
+        }
+        assert_eq!(receiver.flow_ids(), vec![0x10, 0x20, 0x30]);
+        let now = Instant::now();
+        assert!(receiver.poll_rtcp_all(now, ntp).is_empty());
+        let due = receiver.poll_rtcp_all(now + Duration::from_millis(20), ntp);
+        // 500 isolated holes per flow: 3 packets of at most 200 records each.
+        let flows = due.iter().map(|(flow_id, _)| *flow_id).collect::<Vec<_>>();
+        assert_eq!(flows, vec![0x10, 0x10, 0x10, 0x20, 0x20, 0x20, 0x30, 0x30, 0x30]);
+        for (ssrc, sender) in &mut senders {
+            let mut retries = 0;
+            let mut first = None;
+            for (_, feedback) in due.iter().filter(|(flow_id, _)| flow_id == ssrc) {
+                let packets = sender.handle_feedback(&feedback.bytes).unwrap();
+                first.get_or_insert(packets[0].rtp_sequence);
+                retries += packets.len();
+            }
+            assert_eq!(retries, 500, "flow {ssrc:#x}");
+            assert_eq!(first, Some(1), "oldest hole first");
+            let stats = receiver.stats_for_flow(*ssrc).unwrap();
+            assert_eq!(stats.nack_packets, 3);
+            assert_eq!(stats.nack_entries_sent, 500);
+        }
     }
 
     #[test]
