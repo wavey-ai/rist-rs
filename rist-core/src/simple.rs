@@ -9,17 +9,24 @@ use crate::packet::rtp::{
     encode_packet, encode_packet_with_extension, RistRtpExtension, RtpHeader, RtpPacket,
     RTP_PAYLOAD_TYPE_MPEGTS,
 };
-use crate::recovery::{NackSchedule, SenderHistory, MAX_TRACKED_HOLE_DISTANCE};
+use crate::recovery::{NackRepeat, NackSchedule, SenderHistory, MAX_TRACKED_HOLE_DISTANCE};
 use crate::rtt::RttEstimator;
 use crate::sequence::extend_near;
 use crate::stats::{ReceiverStats, SenderStats};
 use crate::time::{calculate_rtt_micros, mpegts_rtp_timestamp, ntp_now};
 use crate::{
-    CongestionControlMode, MissingTracker, RecoveryConfig, RecoveryMode, Result, SequenceExtender,
+    CongestionControlMode, MissingTracker, RecoveryConfig, RecoveryMode, RecoveryTuning, Result,
+    SequenceExtender,
 };
 use std::time::{Duration, Instant};
 
-pub const DEFAULT_RTCP_FEEDBACK_INTERVAL: Duration = Duration::from_millis(20);
+/// Receivers: the minimum gap between two NACK sends of one flow. A NACK
+/// goes out at the first poll at which a hole is due (the caller's poll
+/// cadence, 1 ms in the bench), not on a fixed grid; this only bounds the
+/// NACK packet rate, as librist's 1 ms NACK loop does.
+pub const DEFAULT_RTCP_FEEDBACK_INTERVAL: Duration = Duration::from_millis(1);
+/// An echo response implying a longer round trip is ignored.
+const MAX_RTT_SAMPLE_MICROS: u64 = 10_000_000;
 pub const DEFAULT_RTCP_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 /// Echo requests every 100 ms, as librist (`RIST_PING_INTERVAL`), so both
 /// ends keep a current RTT.
@@ -175,7 +182,6 @@ impl Default for RtcpIntervals {
 #[derive(Debug, Clone, Copy)]
 struct RtcpScheduler {
     intervals: RtcpIntervals,
-    next_feedback: Option<Instant>,
     next_report: Option<Instant>,
     next_echo: Option<Instant>,
 }
@@ -184,7 +190,6 @@ impl RtcpScheduler {
     fn new(intervals: RtcpIntervals) -> Self {
         Self {
             intervals,
-            next_feedback: None,
             next_report: None,
             next_echo: None,
         }
@@ -194,22 +199,16 @@ impl RtcpScheduler {
         RtcpDue {
             report: poll_due(&mut self.next_report, now, self.intervals.report),
             echo: poll_due(&mut self.next_echo, now, self.intervals.echo),
-            feedback: false,
         }
     }
 
-    fn poll_receiver(&mut self, now: Instant) -> RtcpDue {
-        RtcpDue {
-            feedback: poll_due(&mut self.next_feedback, now, self.intervals.feedback),
-            report: poll_due(&mut self.next_report, now, self.intervals.report),
-            echo: false,
-        }
+    fn poll_receiver_report(&mut self, now: Instant) -> bool {
+        poll_due(&mut self.next_report, now, self.intervals.report)
     }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 struct RtcpDue {
-    feedback: bool,
     report: bool,
     echo: bool,
 }
@@ -755,10 +754,12 @@ fn update_sender_rtcp_state(
                     .sample(calculate_rtt_micros(ntp_timestamp, now_ntp, delay));
                 state.stats.rtt_micros = state.rtt.srtt_micros();
             }
-            RtcpPacket::Echo(request @ Echo {
-                kind: EchoKind::Request,
-                ..
-            }) => echo_requests.push(request),
+            RtcpPacket::Echo(
+                request @ Echo {
+                    kind: EchoKind::Request,
+                    ..
+                },
+            ) => echo_requests.push(request),
             _ => {}
         }
     }
@@ -784,6 +785,12 @@ pub struct SimpleReceiverCore {
     return_window_bytes: u64,
     nack_scratch: Vec<u32>,
     nack_packet_scratch: Vec<u8>,
+    tuning: RecoveryTuning,
+    rtt: RttEstimator,
+    /// Next echo request; set at the first data packet.
+    next_echo_at: Option<Instant>,
+    /// No NACK packet before this instant (the feedback interval).
+    next_nack_packet_at: Option<Instant>,
 }
 
 impl SimpleReceiverCore {
@@ -806,12 +813,34 @@ impl SimpleReceiverCore {
             return_window_bytes: 0,
             nack_scratch: Vec::new(),
             nack_packet_scratch: Vec::new(),
+            tuning: RecoveryTuning::default(),
+            rtt: RttEstimator::new(),
+            next_echo_at: None,
+            next_nack_packet_at: None,
         }
     }
 
     pub fn with_rtcp_intervals(mut self, intervals: RtcpIntervals) -> Self {
         self.rtcp = RtcpScheduler::new(intervals);
         self
+    }
+
+    pub fn with_recovery_tuning(mut self, tuning: RecoveryTuning) -> Self {
+        self.set_recovery_tuning(tuning);
+        self
+    }
+
+    pub fn set_recovery_tuning(&mut self, tuning: RecoveryTuning) {
+        self.tuning = tuning;
+    }
+
+    pub fn recovery_tuning(&self) -> RecoveryTuning {
+        self.tuning
+    }
+
+    /// The RTT this receiver measured (echo and Karn samples).
+    pub fn rtt(&self) -> RttEstimator {
+        self.rtt
     }
 
     pub fn with_recovery_config(
@@ -910,6 +939,13 @@ impl SimpleReceiverCore {
         if retry {
             self.stats.retry_packets_received += 1;
         }
+        if observation.recovered {
+            self.on_hole_recovered(retry, now);
+        }
+        if self.tuning.measure_rtt && self.next_echo_at.is_none() {
+            // The first echo request goes out with the first report.
+            self.next_echo_at = Some(now);
+        }
         let payload = if let Some(extension) = packet.extension {
             if extension.has_null_packet_deletion() {
                 // NPD is an optional transform. A malformed/sender-specific
@@ -937,6 +973,25 @@ impl SimpleReceiverCore {
             newly_missing: observation.newly_missing,
             payload,
         })
+    }
+
+    /// Takes a Karn sample from the hole just recovered: only a repair
+    /// marked as a retransmission, of a hole NACKed exactly once, gives an
+    /// unambiguous NACK-to-repair time. It includes the sender's service
+    /// delay, which is what the re-NACK interval has to cover.
+    fn on_hole_recovered(&mut self, retry: bool, now: Instant) {
+        let Some(hole) = self.missing_tracker.last_recovered() else {
+            return;
+        };
+        if retry && self.tuning.measure_rtt && hole.nack_count == 1 {
+            if let Some(nacked_at) = hole.last_nack_at {
+                let sample = now.saturating_duration_since(nacked_at);
+                if !sample.is_zero() {
+                    self.rtt.sample_duration(sample);
+                    self.stats.rtt_samples_karn += 1;
+                }
+            }
+        }
     }
 
     /// Extends a received 16-bit sequence relative to the highest sequence
@@ -1050,54 +1105,138 @@ impl SimpleReceiverCore {
             refused = refused || !send(packet);
             !refused
         };
-        let due = self.rtcp.poll_receiver(now);
+        let report_due = self.rtcp.poll_receiver_report(now);
+        let mut echo = self.echo_due(now);
         let mut produced = 0;
-        if due.feedback
-            && self
-                .missing_tracker
-                .next_nack_at()
-                .is_some_and(|at| at <= now)
-        {
-            produced = self.push_due_nacks(now, now_ntp, max_packets, &mut send);
+        if self.nack_packet_due(now) {
+            let (count, echo_sent) =
+                self.push_due_nacks(now, now_ntp, max_packets, echo, &mut send);
+            produced = count;
+            if produced > 0 {
+                self.next_nack_packet_at = Some(now + self.rtcp.intervals.feedback);
+            }
+            if echo_sent {
+                self.echo_sent(now);
+                echo = false;
+            }
         }
-        if due.report && produced == 0 {
-            let report = self.build_receiver_report(now_ntp);
+        if produced == 0 && (report_due || echo) {
+            let mut report = Vec::with_capacity(96);
+            self.encode_receiver_report(now_ntp, &mut report);
+            if echo {
+                self.encode_echo_request(now_ntp, &mut report);
+            }
             if send(&report) {
                 self.stats.record_feedback();
                 produced = 1;
+                if echo {
+                    self.echo_sent(now);
+                }
             }
         }
         produced
     }
 
-    fn nack_repeat_delay(&self) -> Duration {
-        let rtt_min = self.recovery.rtt_min;
-        let repeat = match self.congestion_control {
-            CongestionControlMode::Off => Duration::ZERO,
-            CongestionControlMode::Normal => rtt_min,
-            CongestionControlMode::Aggressive => rtt_min.saturating_mul(2),
+    /// The earliest instant at which [`Self::poll_rtcp_with`] can have
+    /// something to send: a due NACK (not before the feedback interval since
+    /// the last NACK packet), an echo request or a periodic report. `None`
+    /// when nothing is scheduled. It can be early, never late. O(1).
+    pub fn next_poll_at(&self) -> Option<Instant> {
+        let nack = self
+            .missing_tracker
+            .next_nack_at()
+            .map(|at| self.next_nack_packet_at.map_or(at, |gap| at.max(gap)));
+        let echo = self.next_echo_at.filter(|_| self.tuning.measure_rtt);
+        [nack, echo, self.rtcp.next_report]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
+    fn nack_packet_due(&self, now: Instant) -> bool {
+        self.next_nack_packet_at.map_or(true, |at| now >= at)
+            && self
+                .missing_tracker
+                .next_nack_at()
+                .is_some_and(|at| at <= now)
+    }
+
+    fn echo_due(&self, now: Instant) -> bool {
+        self.tuning.measure_rtt && self.next_echo_at.is_some_and(|at| now >= at)
+    }
+
+    fn echo_sent(&mut self, now: Instant) {
+        self.next_echo_at = Some(now + self.rtcp.intervals.echo);
+        self.stats.echo_requests_sent += 1;
+    }
+
+    fn encode_echo_request(&self, now_ntp: u64, out: &mut Vec<u8>) {
+        encode_echo(
+            Echo {
+                ssrc: self.flow_id,
+                ntp_timestamp: now_ntp,
+                kind: EchoKind::Request,
+            },
+            out,
+        );
+    }
+
+    /// The NACK timing for this poll.
+    ///
+    /// - First NACK after `reorder_buffer`.
+    /// - Re-NACK after 1.1 x rtt_c + `renack_margin` (2.2 x in aggressive
+    ///   mode, as the sender doubles its spacing), with
+    ///   rtt_c = clamp(max(srtt, last), rtt_min, rtt_max), as librist
+    ///   (`lr/rist-common.c:1045-1063`) but with the receiver's own RTT.
+    /// - Until the first RTT sample the repeat delay doubles per attempt,
+    ///   so a long path is not flooded when rtt_min is small.
+    /// - A hole is no longer requested when less than one measured RTT is
+    ///   left before its deadline: the repair could not arrive in time.
+    fn nack_schedule(&self) -> (NackSchedule, NackRepeat) {
+        let recovery = &self.recovery;
+        let rtt_min = recovery.rtt_min;
+        let rtt_max = recovery.rtt_max.max(rtt_min);
+        let measuring = self.tuning.measure_rtt;
+        let measured = measuring.then(|| self.rtt.for_renack()).flatten();
+        let rtt = measured.unwrap_or(rtt_min).clamp(rtt_min, rtt_max);
+        let multiplier = match self.congestion_control {
+            CongestionControlMode::Aggressive => 2.2,
+            CongestionControlMode::Off | CongestionControlMode::Normal => 1.1,
         };
-        repeat.max(rtt_min).min(self.recovery.rtt_max.max(rtt_min))
+        let repeat = NackRepeat {
+            delay: rtt.mul_f64(multiplier) + self.tuning.renack_margin,
+            backoff: measuring && measured.is_none(),
+        };
+        let min_time_left = if measuring {
+            self.rtt.for_spacing().unwrap_or(Duration::ZERO)
+        } else {
+            Duration::ZERO
+        };
+        let schedule = NackSchedule {
+            initial_delay: recovery.reorder_buffer,
+            repeat_delay: repeat.delay,
+            max_retries: recovery.max_retries,
+            min_time_left,
+        };
+        (schedule, repeat)
     }
 
     /// Takes the due holes once, sized by what `max_packets` packets can
     /// carry, and encodes them into packets oldest first. Holes committed
     /// here are never taken again in the same poll, even with a zero repeat
     /// delay; holes that do not fit stay due from `now`.
+    ///
+    /// With `echo`, the first packet also carries an echo request; returns
+    /// the packets sent and whether that first packet went out.
     fn push_due_nacks(
         &mut self,
         now: Instant,
         now_ntp: u64,
         max_packets: usize,
+        echo: bool,
         send: &mut dyn FnMut(&[u8]) -> bool,
-    ) -> usize {
-        let repeat = self.nack_repeat_delay();
-        let schedule = NackSchedule {
-            initial_delay: self.recovery.reorder_buffer,
-            repeat_delay: repeat,
-            max_retries: self.recovery.max_retries,
-            min_time_left: Duration::ZERO,
-        };
+    ) -> (usize, bool) {
+        let (schedule, repeat) = self.nack_schedule();
         let mut due = std::mem::take(&mut self.nack_scratch);
         due.clear();
         // A Range packet can carry up to MAX_NACK_PACKET_REQUESTS contiguous
@@ -1110,6 +1249,7 @@ impl SimpleReceiverCore {
             .take_due_nacks(now, &schedule, limit, &mut due);
         let mut produced = 0;
         let mut sent = 0;
+        let mut echo_sent = false;
         let mut retry_at = now;
         if !due.is_empty() {
             let mut packet = std::mem::take(&mut self.nack_packet_scratch);
@@ -1125,6 +1265,10 @@ impl SimpleReceiverCore {
                     MAX_NACK_RECORDS_PER_PACKET,
                     &mut packet,
                 );
+                let with_echo = echo && produced == 0;
+                if with_echo {
+                    self.encode_echo_request(now_ntp, &mut packet);
+                }
                 if !self.allow_return_bytes(now, packet.len()) {
                     retry_at = self.return_window_started + Duration::from_secs(1);
                     break;
@@ -1135,8 +1279,9 @@ impl SimpleReceiverCore {
                     break;
                 }
                 self.missing_tracker
-                    .commit_nacks(&due[sent..sent + count], now, repeat);
+                    .commit_nacks_with(&due[sent..sent + count], now, repeat);
                 self.stats.record_nack_packet(count);
+                echo_sent |= with_echo;
                 produced += 1;
                 sent += count;
             }
@@ -1148,7 +1293,7 @@ impl SimpleReceiverCore {
         }
         due.clear();
         self.nack_scratch = due;
-        produced
+        (produced, echo_sent)
     }
 
     fn allow_return_bytes(&mut self, now: Instant, bytes: usize) -> bool {
@@ -1176,6 +1321,8 @@ impl SimpleReceiverCore {
     pub fn stats(&self) -> ReceiverStats {
         let mut stats = self.stats;
         stats.apply_tracker_counters(self.missing_tracker.counters());
+        stats.rtt_micros = self.rtt.srtt_micros();
+        stats.rtt_min_micros = self.rtt.min_micros();
         stats
     }
 
@@ -1206,6 +1353,17 @@ impl SimpleReceiverCore {
                         &mut response,
                     );
                     responses.push(response);
+                }
+                RtcpPacket::Echo(Echo {
+                    ntp_timestamp,
+                    kind: EchoKind::Response { delay },
+                    ..
+                }) if self.tuning.measure_rtt && ntp_timestamp <= now_ntp => {
+                    let rtt = calculate_rtt_micros(ntp_timestamp, now_ntp, delay);
+                    if rtt <= MAX_RTT_SAMPLE_MICROS {
+                        self.rtt.sample(rtt);
+                        self.stats.rtt_samples_echo += 1;
+                    }
                 }
                 _ => {}
             }
@@ -1541,35 +1699,273 @@ mod tests {
         );
     }
 
-    #[test]
-    fn receiver_polls_scheduled_feedback_when_missing() {
-        let start = Instant::now();
-        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
-        let intervals = RtcpIntervals {
-            feedback: Duration::from_millis(10),
-            report: Duration::from_secs(1),
-            echo: Duration::from_secs(1),
-        };
-        let mut sender = SimpleSenderCore::new(0x1122_3344, 64);
-        let mut receiver = SimpleReceiverCore::new(0x1122_3344, "rust", NackMode::Range)
-            .with_rtcp_intervals(intervals);
+    const FLOW: u32 = 0x1122_3344;
 
-        assert_eq!(receiver.poll_rtcp(start, ntp), None);
-        let first = sender.send_payload(b"first", ntp, start);
-        let _lost = sender.send_payload(b"lost", ntp, start);
-        let third = sender.send_payload(b"third", ntp, start);
-        receiver.accept_packet(&first.bytes).unwrap();
-        receiver.accept_packet(&third.bytes).unwrap();
+    fn ms(value: u64) -> Duration {
+        Duration::from_millis(value)
+    }
 
-        assert_eq!(
-            receiver.poll_rtcp(start + Duration::from_millis(10), ntp),
-            None
+    fn data(sequence: u32) -> Vec<u8> {
+        encode_packet(RtpHeader::new_mpegts(sequence as u16, 0, FLOW), b"ts")
+    }
+
+    fn retry_data(sequence: u32) -> Vec<u8> {
+        encode_packet(RtpHeader::new_mpegts(sequence as u16, 0, FLOW | 1), b"ts")
+    }
+
+    /// A receiver with `tuning` that saw 0 and 2 (hole 1) at `t0`.
+    fn receiver_with_hole(
+        tuning: RecoveryTuning,
+        recovery: RecoveryConfig,
+    ) -> (SimpleReceiverCore, Instant) {
+        let t0 = Instant::now();
+        let mut receiver = SimpleReceiverCore::new(FLOW, "rust", NackMode::Range)
+            .with_recovery_config(recovery, CongestionControlMode::Normal)
+            .with_recovery_tuning(tuning);
+        receiver.accept_packet_at(&data(0), t0).unwrap();
+        receiver.accept_packet_at(&data(2), t0).unwrap();
+        (receiver, t0)
+    }
+
+    /// Polls every millisecond from `from` to `to` (inclusive) and returns
+    /// the millisecond offsets from `t0` at which a NACK for `sequence` went
+    /// out.
+    fn nack_times(
+        receiver: &mut SimpleReceiverCore,
+        t0: Instant,
+        from: u64,
+        to: u64,
+        sequence: u32,
+    ) -> Vec<u64> {
+        let mut times = Vec::new();
+        for offset in from..=to {
+            let mut packets = Vec::new();
+            receiver.poll_rtcp_into(t0 + ms(offset), 0, &mut packets, 64);
+            if packets.iter().any(|packet| {
+                decode_nacks_from_compound(packet)
+                    .unwrap()
+                    .contains(&sequence)
+            }) {
+                times.push(offset);
+            }
+        }
+        times
+    }
+
+    fn echo_response(request_ntp: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        encode_empty_receiver_report(FLOW, &mut out);
+        encode_echo(
+            Echo {
+                ssrc: FLOW,
+                ntp_timestamp: request_ntp,
+                kind: EchoKind::Response { delay: 0 },
+            },
+            &mut out,
         );
-        let packet = receiver
-            .poll_rtcp(start + Duration::from_millis(20), ntp)
+        out
+    }
+
+    /// Feeds one echo RTT sample of `rtt` to `receiver`.
+    fn learn_rtt(receiver: &mut SimpleReceiverCore, rtt: Duration) {
+        let sent = ntp_from_unix_duration(Duration::from_secs(100));
+        let back = ntp_from_unix_duration(Duration::from_secs(100) + rtt);
+        receiver.handle_rtcp_at(&echo_response(sent), back).unwrap();
+    }
+
+    fn fixed_first_nack() -> RecoveryTuning {
+        RecoveryTuning::librist_like()
+    }
+
+    #[test]
+    fn nack_due_at_1ms_poll_not_20ms_grid() {
+        let (mut receiver, t0) = receiver_with_hole(fixed_first_nack(), RecoveryConfig::default());
+        // reorder_buffer 15 ms: the first poll at or after t0 + 15 ms sends it.
+        assert_eq!(nack_times(&mut receiver, t0, 0, 15, 1), vec![15]);
+        assert_eq!(receiver.missing_tracker.hole(1).unwrap().nack_count, 1);
+    }
+
+    #[test]
+    fn renack_uses_measured_rtt() {
+        let (mut receiver, t0) = receiver_with_hole(fixed_first_nack(), RecoveryConfig::default());
+        learn_rtt(&mut receiver, ms(30));
+        assert_eq!(receiver.stats().rtt_micros, Some(30_000));
+        // 1.1 x 30 ms + 1 ms margin = 34 ms between attempts, not rtt_min 5.
+        assert_eq!(
+            nack_times(&mut receiver, t0, 0, 120, 1),
+            vec![15, 49, 83, 117]
+        );
+    }
+
+    #[test]
+    fn renack_clamps_the_measured_rtt_to_rtt_min_and_rtt_max() {
+        let recovery = RecoveryConfig {
+            rtt_max: ms(20),
+            ..RecoveryConfig::default()
+        };
+        let (mut receiver, t0) = receiver_with_hole(fixed_first_nack(), recovery);
+        learn_rtt(&mut receiver, ms(1));
+        // clamp(1, 5, 20) = 5: 5.5 + 1 = 6.5 ms between attempts.
+        assert_eq!(nack_times(&mut receiver, t0, 0, 30, 1), vec![15, 22, 29]);
+        learn_rtt(&mut receiver, ms(400));
+        // max(srtt, last) = 400, clamped to rtt_max 20: 23 ms.
+        assert_eq!(nack_times(&mut receiver, t0, 31, 60, 1), vec![36, 59]);
+    }
+
+    #[test]
+    fn unmeasured_rtt_backs_off() {
+        let (mut receiver, t0) = receiver_with_hole(fixed_first_nack(), RecoveryConfig::default());
+        // No RTT sample: 6.5 ms, then 13, 26, 52 ms after each attempt.
+        assert_eq!(
+            nack_times(&mut receiver, t0, 0, 200, 1),
+            vec![15, 22, 35, 61, 113]
+        );
+        assert!(receiver.stats().echo_requests_sent > 0);
+        assert_eq!(receiver.stats().rtt_micros, None);
+    }
+
+    #[test]
+    fn without_rtt_measurement_renacks_follow_rtt_min_without_backoff() {
+        let tuning = RecoveryTuning {
+            measure_rtt: false,
+            ..fixed_first_nack()
+        };
+        let (mut receiver, t0) = receiver_with_hole(tuning, RecoveryConfig::default());
+        learn_rtt(&mut receiver, ms(30));
+        assert_eq!(receiver.stats().rtt_micros, None, "echo ignored");
+        assert_eq!(nack_times(&mut receiver, t0, 0, 30, 1), vec![15, 22, 29]);
+        assert_eq!(receiver.stats().echo_requests_sent, 0);
+    }
+
+    #[test]
+    fn no_nack_after_deadline() {
+        let recovery = RecoveryConfig {
+            length_min: ms(100),
+            length_max: ms(100),
+            ..RecoveryConfig::default()
+        };
+        let (mut receiver, t0) = receiver_with_hole(fixed_first_nack(), recovery);
+        learn_rtt(&mut receiver, ms(30));
+        // 15 and 49 can bring a repair back before 100 ms; at 83 only 17 ms
+        // are left, less than one RTT, so the hole is given up.
+        assert_eq!(nack_times(&mut receiver, t0, 0, 99, 1), vec![15, 49]);
+        assert_eq!(receiver.stats().nack_too_late, 1);
+    }
+
+    #[test]
+    fn nack_packets_respect_the_feedback_gap() {
+        let t0 = Instant::now();
+        let mut receiver = SimpleReceiverCore::new(FLOW, "rust", NackMode::Range)
+            .with_recovery_tuning(fixed_first_nack());
+        receiver.accept_packet_at(&data(0), t0).unwrap();
+        receiver.accept_packet_at(&data(2), t0).unwrap();
+        receiver
+            .accept_packet_at(&data(4), t0 + Duration::from_micros(500))
             .unwrap();
+        let mut sent = Vec::new();
+        for offset_us in (15_000..=16_000).step_by(500) {
+            let mut packets = Vec::new();
+            receiver.poll_rtcp_into(t0 + Duration::from_micros(offset_us), 0, &mut packets, 64);
+            for packet in packets {
+                for sequence in decode_nacks_from_compound(&packet).unwrap() {
+                    sent.push((offset_us, sequence));
+                }
+            }
+        }
+        // Hole 3 is due at 15.5 ms but waits for the 1 ms gap.
+        assert_eq!(sent, vec![(15_000, 1), (16_000, 3)]);
+    }
+
+    #[test]
+    fn receiver_sends_echo_and_learns_rtt() {
+        let t0 = Instant::now();
+        let base = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut sender = SimpleSenderCore::new(FLOW, 64);
+        let mut receiver = SimpleReceiverCore::new(FLOW, "rust", NackMode::Range);
+        assert_eq!(receiver.next_poll_at(), None, "nothing before data");
+        let packet = sender.send_payload(b"x", base, t0);
+        receiver.accept_packet_at(&packet.bytes, t0).unwrap();
+        // The first echo request goes out with the first report, at once.
+        assert_eq!(receiver.next_poll_at(), Some(t0));
+        let request = receiver.poll_rtcp(t0, base).unwrap();
+        assert!(decode_compound(&request)
+            .unwrap()
+            .contains(&RtcpPacket::Echo(Echo {
+                ssrc: FLOW,
+                ntp_timestamp: base,
+                kind: EchoKind::Request,
+            })));
+        let response = sender
+            .handle_feedback_outcome_at(&request, base, t0)
+            .unwrap()
+            .responses
+            .remove(0);
+        let back = ntp_from_unix_duration(Duration::from_secs(1) + ms(30));
+        receiver.handle_rtcp_at(&response, back).unwrap();
+        let stats = receiver.stats();
+        assert_eq!(stats.rtt_micros, Some(30_000));
+        assert_eq!(stats.rtt_min_micros, Some(30_000));
+        assert_eq!(stats.rtt_samples_echo, 1);
+        assert_eq!(stats.echo_requests_sent, 1);
+        // The next one is due one echo interval later.
+        assert_eq!(receiver.poll_rtcp(t0 + ms(99), base), None);
+        assert_eq!(
+            receiver.next_poll_at(),
+            Some(t0 + DEFAULT_RTCP_ECHO_INTERVAL)
+        );
+    }
+
+    #[test]
+    fn echo_request_rides_on_a_due_nack() {
+        let (mut receiver, t0) = receiver_with_hole(fixed_first_nack(), RecoveryConfig::default());
+        receiver.next_echo_at = Some(t0 + ms(15));
+        let packet = receiver.poll_rtcp(t0 + ms(15), 7).unwrap();
+        let decoded = decode_compound(&packet).unwrap();
         assert_eq!(decode_nacks_from_compound(&packet).unwrap(), vec![1]);
-        assert_eq!(receiver.stats().feedback_packets, 1);
+        assert!(decoded.contains(&RtcpPacket::Echo(Echo {
+            ssrc: FLOW,
+            ntp_timestamp: 7,
+            kind: EchoKind::Request,
+        })));
+        assert_eq!(receiver.stats().echo_requests_sent, 1);
+    }
+
+    #[test]
+    fn karn_sample_only_first_attempt_retry_flag() {
+        let (mut receiver, t0) = receiver_with_hole(fixed_first_nack(), RecoveryConfig::default());
+        receiver.accept_packet_at(&data(4), t0).unwrap();
+        receiver.accept_packet_at(&data(6), t0).unwrap();
+        // Holes 1, 3 and 5 are NACKed once at 15 ms.
+        let mut packets = Vec::new();
+        receiver.poll_rtcp_into(t0 + ms(15), 0, &mut packets, 64);
+        // A retry-marked repair of hole 1, 7 ms after its single NACK.
+        assert!(
+            receiver
+                .accept_packet_at(&retry_data(1), t0 + ms(22))
+                .unwrap()
+                .recovered
+        );
+        assert_eq!(receiver.stats().rtt_samples_karn, 1);
+        assert_eq!(receiver.rtt().last_micros(), Some(7_000));
+        // An unmarked arrival of hole 3: an original, not a sample.
+        assert!(
+            receiver
+                .accept_packet_at(&data(3), t0 + ms(23))
+                .unwrap()
+                .recovered
+        );
+        assert_eq!(receiver.stats().rtt_samples_karn, 1);
+        // Hole 5 NACKed a second time: its repair is ambiguous.
+        receiver.poll_rtcp_into(t0 + ms(40), 0, &mut packets, 64);
+        assert_eq!(receiver.missing_tracker.hole(5).unwrap().nack_count, 2);
+        assert!(
+            receiver
+                .accept_packet_at(&retry_data(5), t0 + ms(45))
+                .unwrap()
+                .recovered
+        );
+        assert_eq!(receiver.stats().rtt_samples_karn, 1);
+        assert_eq!(receiver.stats().retry_packets_received, 2);
     }
 
     #[test]
@@ -1736,17 +2132,29 @@ mod tests {
         assert_eq!(recovery_window_packets(&huge), 32_768);
     }
 
+    /// The caller's poll period in the packing tests (above the 15 ms
+    /// reorder buffer, so every poll finds the holes due).
+    const TICK: Duration = Duration::from_millis(20);
+
+    /// No echo requests, no RTT measurement, no extras: re-NACKs at
+    /// 1.1 x rtt_min + 1 ms. For tests about packing, not timing.
+    fn static_tuning() -> RecoveryTuning {
+        RecoveryTuning {
+            measure_rtt: false,
+            ..RecoveryTuning::librist_like()
+        }
+    }
+
     fn lossy_receiver(recovery: RecoveryConfig, holes: u32) -> (SimpleReceiverCore, Instant) {
         let mut receiver = SimpleReceiverCore::new(0x1122_3344, "rust", NackMode::Range)
-            .with_recovery_config(recovery, CongestionControlMode::Normal);
+            .with_recovery_config(recovery, CongestionControlMode::Normal)
+            .with_recovery_tuning(static_tuning());
+        let start = Instant::now();
         for n in 0..=holes {
             let packet =
                 encode_packet(RtpHeader::new_mpegts((2 * n) as u16, 0, 0x1122_3344), b"ts");
-            receiver.accept_packet(&packet).unwrap();
+            receiver.accept_packet_at(&packet, start).unwrap();
         }
-        let start = Instant::now();
-        // The first poll only arms the RTCP schedule.
-        assert_eq!(receiver.poll_rtcp_into(start, 0, &mut Vec::new(), 64), 0);
         (receiver, start)
     }
 
@@ -1754,7 +2162,7 @@ mod tests {
     fn many_holes_produce_several_mtu_sized_nack_packets_oldest_first() {
         let (mut receiver, start) = lossy_receiver(RecoveryConfig::default(), 5_000);
         assert_eq!(receiver.missing_sequences().len(), 5_000);
-        let now = start + DEFAULT_RTCP_FEEDBACK_INTERVAL;
+        let now = start + TICK;
         let mut packets = Vec::new();
         assert_eq!(receiver.poll_rtcp_into(now, 0, &mut packets, 64), 25);
         let mut requested = Vec::new();
@@ -1778,21 +2186,14 @@ mod tests {
     #[test]
     fn legacy_poll_rtcp_sends_one_packet_and_keeps_the_rest_due() {
         let (mut receiver, start) = lossy_receiver(RecoveryConfig::default(), 500);
-        let first = receiver
-            .poll_rtcp(start + DEFAULT_RTCP_FEEDBACK_INTERVAL, 0)
-            .unwrap();
+        let first = receiver.poll_rtcp(start + TICK, 0).unwrap();
         let requested = decode_nacks_from_compound(&first).unwrap();
         assert_eq!(requested, (0..200).map(|n| 2 * n + 1).collect::<Vec<_>>());
         assert_eq!(receiver.missing_tracker.hole(401).unwrap().nack_count, 0);
         // The next poll serves the repeat of the oldest holes first, then
         // the holes never requested.
         let mut packets = Vec::new();
-        receiver.poll_rtcp_into(
-            start + 2 * DEFAULT_RTCP_FEEDBACK_INTERVAL,
-            0,
-            &mut packets,
-            64,
-        );
+        receiver.poll_rtcp_into(start + 2 * TICK, 0, &mut packets, 64);
         let requested = packets
             .iter()
             .flat_map(|packet| decode_nacks_from_compound(packet).unwrap())
@@ -1815,7 +2216,7 @@ mod tests {
         let (mut receiver, start) = lossy_receiver(recovery, 30);
         let window = receiver.return_window_started;
         let mut packets = Vec::new();
-        let now = start + DEFAULT_RTCP_FEEDBACK_INTERVAL;
+        let now = start + TICK;
         assert_eq!(receiver.poll_rtcp_into(now, 0, &mut packets, 64), 0);
         let stats = receiver.stats();
         assert_eq!(stats.nack_packets, 0);
@@ -1826,7 +2227,7 @@ mod tests {
         assert_eq!(hole.next_nack_at, Some(window + Duration::from_secs(1)));
 
         receiver.recovery.return_max_bitrate = 100_000;
-        let later = window + Duration::from_secs(1) + DEFAULT_RTCP_FEEDBACK_INTERVAL;
+        let later = window + Duration::from_secs(1) + TICK;
         assert_eq!(receiver.poll_rtcp_into(later, 0, &mut packets, 64), 1);
         assert_eq!(
             decode_nacks_from_compound(&packets[0]).unwrap(),
@@ -1921,7 +2322,7 @@ mod tests {
         let (mut receiver, start) = lossy_receiver(recovery, 1);
         assert_eq!(receiver.missing_sequences(), vec![1]);
         for tick in 1..=3_u32 {
-            let now = start + DEFAULT_RTCP_FEEDBACK_INTERVAL * tick;
+            let now = start + TICK * tick;
             let mut packets = Vec::new();
             assert_eq!(receiver.poll_rtcp_into(now, 0, &mut packets, 64), 1);
             assert_eq!(decode_nacks_from_compound(&packets[0]).unwrap(), vec![1]);
@@ -1934,7 +2335,8 @@ mod tests {
     }
 
     fn contiguous_loss_receiver(lost: u16) -> (SimpleReceiverCore, Instant) {
-        let mut receiver = SimpleReceiverCore::new(1, "rust", NackMode::Range);
+        let mut receiver = SimpleReceiverCore::new(1, "rust", NackMode::Range)
+            .with_recovery_tuning(static_tuning());
         let start = Instant::now();
         for sequence in [0, lost + 1] {
             let packet = encode_packet(RtpHeader::new_mpegts(sequence, 0, 1), b"ts");
@@ -1947,9 +2349,7 @@ mod tests {
     #[test]
     fn one_packet_poll_carries_a_whole_contiguous_burst_in_ranges() {
         let (mut receiver, start) = contiguous_loss_receiver(1_000);
-        let packet = receiver
-            .poll_rtcp(start + DEFAULT_RTCP_FEEDBACK_INTERVAL, 0)
-            .unwrap();
+        let packet = receiver.poll_rtcp(start + TICK, 0).unwrap();
         assert_eq!(
             decode_nacks_from_compound(&packet).unwrap(),
             (1..=1_000).collect::<Vec<_>>()
@@ -1963,9 +2363,7 @@ mod tests {
     #[test]
     fn one_packet_poll_stops_at_the_per_packet_sequence_cap() {
         let (mut receiver, start) = contiguous_loss_receiver(5_000);
-        let packet = receiver
-            .poll_rtcp(start + DEFAULT_RTCP_FEEDBACK_INTERVAL, 0)
-            .unwrap();
+        let packet = receiver.poll_rtcp(start + TICK, 0).unwrap();
         let requested = decode_nacks_from_compound(&packet).unwrap();
         assert_eq!(requested.len(), MAX_NACK_PACKET_REQUESTS);
         assert_eq!(requested[0], 1);
@@ -1979,7 +2377,7 @@ mod tests {
     #[test]
     fn a_refused_send_commits_only_the_packets_that_went_out() {
         let (mut receiver, start) = lossy_receiver(RecoveryConfig::default(), 1_000);
-        let now = start + DEFAULT_RTCP_FEEDBACK_INTERVAL;
+        let now = start + TICK;
         let mut calls = 0;
         let mut accepted = Vec::new();
         let produced = receiver.poll_rtcp_with(now, 0, 64, |packet| {
@@ -2014,7 +2412,7 @@ mod tests {
 
         // The next poll requests the refused holes (and repeats the sent ones).
         let mut packets = Vec::new();
-        receiver.poll_rtcp_into(now + DEFAULT_RTCP_FEEDBACK_INTERVAL, 0, &mut packets, 64);
+        receiver.poll_rtcp_into(now + TICK, 0, &mut packets, 64);
         let requested = packets
             .iter()
             .flat_map(|packet| decode_nacks_from_compound(packet).unwrap())

@@ -19,11 +19,10 @@ use rist_core::packet::rtp::{encode_packet, RtpHeader, RtpPacket};
 use rist_core::time::ntp_now;
 use rist_core::{
     packet::rtcp::NackMode, CongestionControlMode, FeedbackOutcome, MainControlPacket,
-    MainOutboundPacket,
-    MainPacket, MainReceiverCore, MainReceiverFeedback, MainSenderCore, MainSenderPeerState,
-    MainSessionConfig, MainSessionPoll, MainSessionTimers, OutboundPacket, PeerSelection,
-    ReceivedPayload, ReceiverStats, RecoveryConfig, SenderStats, SimpleReceiverCore,
-    SimpleSenderCore, SrpCredentialStore, WeightedPeerSelector,
+    MainOutboundPacket, MainPacket, MainReceiverCore, MainReceiverFeedback, MainSenderCore,
+    MainSenderPeerState, MainSessionConfig, MainSessionPoll, MainSessionTimers, OutboundPacket,
+    PeerSelection, ReceivedPayload, ReceiverStats, RecoveryConfig, RecoveryTuning, SenderStats,
+    SimpleReceiverCore, SimpleSenderCore, SrpCredentialStore, WeightedPeerSelector,
 };
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use std::collections::{HashMap, VecDeque};
@@ -1287,6 +1286,19 @@ impl SimpleMioReceiver {
         self.core.set_recovery_config(recovery, congestion_control);
     }
 
+    pub fn set_recovery_tuning(&mut self, tuning: RecoveryTuning) {
+        self.core.set_recovery_tuning(tuning);
+    }
+
+    /// When [`Self::poll_rtcp_and_send`] next has something to send (a due
+    /// NACK, echo request or report), so a caller can sleep until then
+    /// instead of polling on a fixed period. `None`: nothing scheduled (or
+    /// no RTCP peer known yet); wait for data. It can be early, never late.
+    pub fn next_timeout(&self) -> Option<Instant> {
+        self.last_rtcp_peer?;
+        self.core.next_poll_at()
+    }
+
     pub fn feedback_packet(&mut self) -> Vec<u8> {
         self.core.build_feedback_and_record()
     }
@@ -2051,7 +2063,12 @@ impl MainMioSender {
                 let now = Instant::now();
                 let outcome = self
                     .core
-                    .handle_reduced_feedback_outcome(packet.reduced, &packet.payload, ntp_now(), now)
+                    .handle_reduced_feedback_outcome(
+                        packet.reduced,
+                        &packet.payload,
+                        ntp_now(),
+                        now,
+                    )
                     .map_err(core_to_io_error)?;
                 self.select_unsecured_listener_peer(from);
                 for response in &outcome.responses {
@@ -3223,6 +3240,67 @@ impl MainMioReceiver {
         }
     }
 
+    pub fn set_recovery_tuning(&mut self, tuning: RecoveryTuning) {
+        self.core.set_recovery_tuning(tuning);
+        for runtime in self.peer_runtime.values_mut() {
+            runtime.core.set_recovery_tuning(tuning);
+        }
+    }
+
+    /// The earliest instant at which [`Self::poll_all_rtcp_and_send`] (or,
+    /// for the last peer, [`Self::poll_rtcp_and_send`]) or a peer's
+    /// keepalive has something to send. `None`: nothing scheduled; wait for
+    /// data. It can be early, never late.
+    pub fn next_timeout(&self) -> Option<Instant> {
+        if self.peer_runtime.is_empty() {
+            return [self.core.next_poll_at(), self.timers.next_keepalive_at()]
+                .into_iter()
+                .flatten()
+                .min();
+        }
+        self.peer_runtime
+            .values()
+            .flat_map(|runtime| {
+                [
+                    runtime.core.next_poll_at(),
+                    runtime.timers.next_keepalive_at(),
+                ]
+            })
+            .flatten()
+            .min()
+    }
+
+    /// [`Self::poll_rtcp_and_send`] for every authenticated peer, not only
+    /// the last one heard from, so two contributors on one port both get
+    /// NACKs. Returns the number of RTCP packets sent. On a send error the
+    /// rest of that peer's batch stays due; the error is returned when
+    /// nothing went out.
+    pub fn poll_all_rtcp_and_send(&mut self, now: Instant, now_ntp: u64) -> io::Result<usize> {
+        let socket = &mut self.socket;
+        let mut sent = 0;
+        let mut error = None;
+        for (&peer, runtime) in self.peer_runtime.iter_mut() {
+            if !receiver_runtime_authenticated(runtime) {
+                continue;
+            }
+            sent += runtime
+                .core
+                .poll_rtcp_all_with(now, now_ntp, |_flow_id, packet| {
+                    match socket.send_packet_to(peer, &packet.bytes) {
+                        Ok(_) => true,
+                        Err(err) => {
+                            error = Some(err);
+                            false
+                        }
+                    }
+                });
+        }
+        match error {
+            Some(error) if sent == 0 => Err(error),
+            _ => Ok(sent),
+        }
+    }
+
     pub fn set_tx_key(&mut self, key: PskKey) {
         self.core.set_tx_key(key.clone());
         for runtime in self.peer_runtime.values_mut() {
@@ -3874,10 +3952,19 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// No echo requests, no extras: polls carry only NACKs and reports.
+    fn static_tuning() -> RecoveryTuning {
+        RecoveryTuning {
+            measure_rtt: false,
+            ..RecoveryTuning::librist_like()
+        }
+    }
+
     #[test]
     fn simple_receiver_counts_only_nacks_that_were_sent() {
         let mut receiver =
             SimpleMioReceiver::bind(loopback_any(), 1, "receiver", NackMode::Range).unwrap();
+        receiver.set_recovery_tuning(static_tuning());
         let start = Instant::now();
         for n in 0..=250_u16 {
             let packet = encode_packet(RtpHeader::new_mpegts(2 * n, 0, 1), b"ts");
@@ -4262,6 +4349,8 @@ mod tests {
         let now = Instant::now();
         let mut receiver =
             MainMioReceiver::bind(loopback_any(), flow_a, "rust", NackMode::Range).unwrap();
+        // About NACK isolation: no echo requests in the polls.
+        receiver.set_recovery_tuning(static_tuning());
         let receiver_addr = receiver.local_addr().unwrap();
         let peer_a = StdUdpSocket::bind(loopback_any()).unwrap();
         let peer_b = StdUdpSocket::bind(loopback_any()).unwrap();
@@ -4950,6 +5039,7 @@ mod tests {
         let ntp = ntp_from_unix_duration(Duration::from_secs(1));
         let mut receiver =
             SimpleMioReceiver::bind(loopback_any(), flow_id, "rust", NackMode::Range).unwrap();
+        receiver.set_recovery_tuning(static_tuning());
         let receiver_addr = receiver.local_addr().unwrap();
         let mut sender =
             SimpleMioSender::connect(loopback_any(), receiver_addr, flow_id, 2048).unwrap();
@@ -5205,6 +5295,62 @@ mod tests {
         let recovered = recv_main_payload_eventually(&mut receiver, &mut rx_buf);
         assert!(recovered.recovered);
         assert_eq!(recovered.payload, b"lost");
+    }
+
+    #[test]
+    fn main_profile_receiver_measures_rtt_through_sender_echo_responses() {
+        let flow_id = 0x1122_3344;
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut receiver =
+            MainMioReceiver::bind(loopback_any(), flow_id, "rust", NackMode::Range).unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+        let mut sender =
+            MainMioSender::connect(loopback_any(), receiver_addr, flow_id, 64).unwrap();
+        assert_eq!(receiver.next_timeout(), None, "idle before any data");
+
+        let first = sender.build_payload(b"first", ntp, Instant::now());
+        sender.send_outbound(&first).unwrap();
+        let mut rx_buf = [0u8; 1500];
+        recv_main_payload_eventually(&mut receiver, &mut rx_buf);
+        // The first echo request is due at once.
+        assert!(receiver.next_timeout().unwrap() <= Instant::now());
+        assert_eq!(
+            receiver
+                .poll_all_rtcp_and_send(Instant::now(), ntp_now())
+                .unwrap(),
+            1
+        );
+
+        // The sender answers inside its feedback handling.
+        let mut tx_buf = [0u8; 1500];
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while sender.stats().echo_responses == 0 {
+            sender.try_recv_event(&mut tx_buf).unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the echo request"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            receiver.try_recv_event(&mut rx_buf).unwrap();
+            let stats = receiver
+                .peer_flow_stats(sender.local_addr().unwrap(), flow_id)
+                .unwrap();
+            if stats.rtt_samples_echo == 1 {
+                assert!(stats.rtt_micros.unwrap() < 1_000_000);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the echo response"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        // Idle: nothing due before the next echo request (100 ms).
+        let next = receiver.next_timeout().unwrap();
+        assert!(next > Instant::now() + Duration::from_millis(50));
     }
 
     #[test]

@@ -62,13 +62,17 @@ impl RttEstimator {
     /// max(smoothed, last): how long a receiver waits before re-requesting.
     pub fn for_renack(&self) -> Option<Duration> {
         let srtt = self.srtt_us?;
-        Some(Duration::from_micros(srtt.max(self.last_us.unwrap_or(srtt))))
+        Some(Duration::from_micros(
+            srtt.max(self.last_us.unwrap_or(srtt)),
+        ))
     }
 
     /// min(smoothed, last): the basis of a sender's repair spacing.
     pub fn for_spacing(&self) -> Option<Duration> {
         let srtt = self.srtt_us?;
-        Some(Duration::from_micros(srtt.min(self.last_us.unwrap_or(srtt))))
+        Some(Duration::from_micros(
+            srtt.min(self.last_us.unwrap_or(srtt)),
+        ))
     }
 }
 

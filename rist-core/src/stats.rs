@@ -104,6 +104,14 @@ pub struct ReceiverStats {
     pub nack_too_late: u64,
     /// Data packets that carried the SSRC retry bit (retransmissions).
     pub retry_packets_received: u64,
+    /// Smallest RTT sample (`rtt_micros` is the smoothed value).
+    pub rtt_min_micros: Option<u64>,
+    /// RTT samples from echo responses.
+    pub rtt_samples_echo: u64,
+    /// RTT samples from retry-marked repairs of holes NACKed once.
+    pub rtt_samples_karn: u64,
+    /// Echo requests sent.
+    pub echo_requests_sent: u64,
 }
 
 impl ReceiverStats {
@@ -128,6 +136,10 @@ impl ReceiverStats {
             retries_exhausted: 0,
             nack_too_late: 0,
             retry_packets_received: 0,
+            rtt_min_micros: None,
+            rtt_samples_echo: 0,
+            rtt_samples_karn: 0,
+            echo_requests_sent: 0,
         }
     }
 

@@ -1,6 +1,6 @@
 use crate::auth::EapolFrame;
 use crate::crypto::PskKey;
-use crate::endpoint::{CongestionControlMode, RecoveryConfig};
+use crate::endpoint::{CongestionControlMode, RecoveryConfig, RecoveryTuning};
 use crate::packet::gre::{
     decode_eapol_payload, decode_encrypted_buffer_negotiation_packet,
     decode_encrypted_keepalive_packet, decode_encrypted_reduced_packet, decode_main_packet,
@@ -125,6 +125,12 @@ impl MainSessionTimers {
 
     pub fn last_peer_activity(&self) -> Option<Instant> {
         self.last_peer_activity
+    }
+
+    /// When [`Self::poll`] next reports a keepalive as due (`None` before
+    /// the first poll arms the timer).
+    pub fn next_keepalive_at(&self) -> Option<Instant> {
+        self.next_keepalive
     }
 
     pub fn is_timed_out(&self, now: Instant) -> bool {
@@ -436,9 +442,12 @@ impl MainSenderCore {
         now_ntp: u64,
         now: Instant,
     ) -> Result<MainFeedbackOutcome> {
-        let outcome =
-            self.simple
-                .handle_feedback_outcome_for_peer_at(&mut state.simple, payload, now_ntp, now)?;
+        let outcome = self.simple.handle_feedback_outcome_for_peer_at(
+            &mut state.simple,
+            payload,
+            now_ntp,
+            now,
+        )?;
         let responses = outcome
             .responses
             .iter()
@@ -737,6 +746,7 @@ pub struct MainReceiverCore {
     max_flows: usize,
     recovery: RecoveryConfig,
     congestion_control: CongestionControlMode,
+    tuning: RecoveryTuning,
     gre_version: u8,
     next_gre_sequence: u32,
     last_reduced: Option<ReducedHeader>,
@@ -762,6 +772,7 @@ impl MainReceiverCore {
             max_flows: DEFAULT_MAIN_FLOWS_PER_PEER,
             recovery: RecoveryConfig::default(),
             congestion_control: CongestionControlMode::default(),
+            tuning: RecoveryTuning::default(),
             gre_version: 1,
             next_gre_sequence: 0,
             last_reduced: None,
@@ -786,6 +797,31 @@ impl MainReceiverCore {
         }
         self.recovery = recovery;
         self.congestion_control = congestion_control;
+    }
+
+    pub fn with_recovery_tuning(mut self, tuning: RecoveryTuning) -> Self {
+        self.set_recovery_tuning(tuning);
+        self
+    }
+
+    /// Applies `tuning` to every flow, present and future.
+    pub fn set_recovery_tuning(&mut self, tuning: RecoveryTuning) {
+        for flow in self.flows.values_mut() {
+            flow.set_recovery_tuning(tuning);
+        }
+        self.tuning = tuning;
+    }
+
+    pub fn recovery_tuning(&self) -> RecoveryTuning {
+        self.tuning
+    }
+
+    /// The earliest [`SimpleReceiverCore::next_poll_at`] of all flows.
+    pub fn next_poll_at(&self) -> Option<Instant> {
+        self.flows
+            .values()
+            .filter_map(SimpleReceiverCore::next_poll_at)
+            .min()
     }
 
     pub fn with_tx_key(mut self, key: PskKey) -> Self {
@@ -820,6 +856,7 @@ impl MainReceiverCore {
         let mut session = Self::new(self.primary_flow_id, self.cname.clone(), self.nack_mode)
             .with_gre_version(self.gre_version);
         session.set_recovery_config(self.recovery.clone(), self.congestion_control);
+        session.set_recovery_tuning(self.tuning);
         session.max_flows = self.max_flows;
         if let Some(key) = &self.tx_key {
             session.set_tx_key(key.clone());
@@ -1134,7 +1171,8 @@ impl MainReceiverCore {
                 self.flow_order.insert(position, flow_id);
                 Ok(entry.insert(
                     SimpleReceiverCore::new(flow_id, self.cname.clone(), self.nack_mode)
-                        .with_recovery_config(self.recovery.clone(), self.congestion_control),
+                        .with_recovery_config(self.recovery.clone(), self.congestion_control)
+                        .with_recovery_tuning(self.tuning),
                 ))
             }
         }
@@ -1364,7 +1402,11 @@ mod tests {
     fn main_poll_rtcp_all_sends_every_due_nack_packet_per_flow_in_flow_order() {
         let start = Instant::now();
         let ntp = ntp_from_unix_duration(Duration::from_secs(1));
-        let mut receiver = MainReceiverCore::new(0x10, "rust", NackMode::Range);
+        let mut receiver = MainReceiverCore::new(0x10, "rust", NackMode::Range)
+            .with_recovery_tuning(RecoveryTuning {
+                measure_rtt: false,
+                ..RecoveryTuning::librist_like()
+            });
         let mut senders =
             [0x30_u32, 0x10, 0x20].map(|ssrc| (ssrc, MainSenderCore::new(ssrc, 4096)));
         for (_, sender) in &mut senders {
@@ -1376,9 +1418,10 @@ mod tests {
             }
         }
         assert_eq!(receiver.flow_ids(), vec![0x10, 0x20, 0x30]);
-        let now = Instant::now();
+        // Every hole was detected after `start`: none is due yet.
+        let now = start;
         assert!(receiver.poll_rtcp_all(now, ntp).is_empty());
-        let due = receiver.poll_rtcp_all(now + Duration::from_millis(20), ntp);
+        let due = receiver.poll_rtcp_all(Instant::now() + Duration::from_millis(20), ntp);
         // 500 isolated holes per flow: 3 packets of at most 200 records each.
         let flows = due.iter().map(|(flow_id, _)| *flow_id).collect::<Vec<_>>();
         assert_eq!(
@@ -1405,7 +1448,11 @@ mod tests {
     fn main_poll_rtcp_all_with_stops_at_a_refused_send_and_keeps_holes_due() {
         let start = Instant::now();
         let ntp = ntp_from_unix_duration(Duration::from_secs(1));
-        let mut receiver = MainReceiverCore::new(0x10, "rust", NackMode::Range);
+        let mut receiver = MainReceiverCore::new(0x10, "rust", NackMode::Range)
+            .with_recovery_tuning(RecoveryTuning {
+                measure_rtt: false,
+                ..RecoveryTuning::librist_like()
+            });
         for ssrc in [0x10_u32, 0x20] {
             let mut sender = MainSenderCore::new(ssrc, 4096);
             for index in 0..=1_000_u32 {
@@ -1415,9 +1462,9 @@ mod tests {
                 }
             }
         }
-        let now = Instant::now();
+        let now = start;
         assert!(receiver.poll_rtcp_all(now, ntp).is_empty());
-        let first_poll = now + Duration::from_millis(20);
+        let first_poll = Instant::now() + Duration::from_millis(20);
         // Accept the first packet of flow 0x10, refuse the second.
         let mut offered = Vec::new();
         let accepted = receiver.poll_rtcp_all_with(first_poll, ntp, |flow_id, _| {
