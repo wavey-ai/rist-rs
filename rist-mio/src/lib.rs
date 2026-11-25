@@ -19,10 +19,10 @@ use rist_core::packet::rtp::{encode_packet, RtpHeader, RtpPacket};
 use rist_core::time::ntp_now;
 use rist_core::{
     packet::rtcp::NackMode, CongestionControlMode, FeedbackOutcome, MainControlPacket,
-    MainOutboundPacket, MainPacket, MainReceiverCore, MainReceiverFeedback, MainSenderCore,
-    MainSenderPeerState, MainSessionConfig, MainSessionPoll, MainSessionTimers, OutboundPacket,
-    PeerSelection, ReceivedPayload, ReceiverStats, RecoveryConfig, RecoveryTuning, SenderStats,
-    SimpleReceiverCore, SimpleSenderCore, SrpCredentialStore, WeightedPeerSelector,
+    MainOutboundPacket, MainPacket, MainPacketMeta, MainReceiverCore, MainReceiverFeedback,
+    MainSenderCore, MainSenderPeerState, MainSessionConfig, MainSessionPoll, MainSessionTimers,
+    OutboundPacket, PeerSelection, ReceivedPayload, ReceiverStats, RecoveryConfig, RecoveryTuning,
+    SenderStats, SimpleReceiverCore, SimpleSenderCore, SrpCredentialStore, WeightedPeerSelector,
 };
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use std::collections::{HashMap, VecDeque};
@@ -229,6 +229,70 @@ impl RtpUdpSocket {
             .map_err(normalize_udp_send_error)
     }
 
+    /// The peer this socket is connected to, if it was made with
+    /// [`Self::connect`].
+    pub fn connected_peer(&self) -> Option<SocketAddr> {
+        self.peer
+    }
+
+    /// Sends `head` and `body` as one datagram without joining them first
+    /// (one `sendmsg` with two parts on Unix). `peer` `None` sends to the
+    /// connected peer. A connected socket reports an ICMP unreachable from
+    /// an earlier datagram as `ConnectionRefused` on a later call; that
+    /// datagram was not refused, so the send is tried once more.
+    pub fn send_parts_to(
+        &mut self,
+        peer: Option<SocketAddr>,
+        head: &[u8],
+        body: &[u8],
+    ) -> io::Result<usize> {
+        match self.send_parts_once(peer, head, body) {
+            Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+                self.send_parts_once(peer, head, body)
+            }
+            result => result,
+        }
+        .map_err(normalize_udp_send_error)
+    }
+
+    #[cfg(unix)]
+    fn send_parts_once(
+        &mut self,
+        peer: Option<SocketAddr>,
+        head: &[u8],
+        body: &[u8],
+    ) -> io::Result<usize> {
+        use nix::sys::socket::{sendmsg, MsgFlags, SockaddrStorage};
+        use std::io::IoSlice;
+        use std::os::fd::AsRawFd;
+        let parts = [IoSlice::new(head), IoSlice::new(body)];
+        let address = peer.map(SockaddrStorage::from);
+        sendmsg(
+            self.socket.as_raw_fd(),
+            &parts,
+            &[],
+            MsgFlags::empty(),
+            address.as_ref(),
+        )
+        .map_err(nix_to_io)
+    }
+
+    #[cfg(not(unix))]
+    fn send_parts_once(
+        &mut self,
+        peer: Option<SocketAddr>,
+        head: &[u8],
+        body: &[u8],
+    ) -> io::Result<usize> {
+        let mut datagram = Vec::with_capacity(head.len() + body.len());
+        datagram.extend_from_slice(head);
+        datagram.extend_from_slice(body);
+        match peer {
+            Some(peer) => self.socket.send_to(&datagram, peer),
+            None => self.socket.send(&datagram),
+        }
+    }
+
     pub fn set_multicast_loop_v4(&self, on: bool) -> io::Result<()> {
         self.socket.set_multicast_loop_v4(on)
     }
@@ -419,6 +483,20 @@ impl RtpUdpSocket {
         &mut self,
         buf: &'a mut [u8],
     ) -> io::Result<Option<(SocketAddr, &'a [u8])>> {
+        let received = match self.recv_datagram_len(buf) {
+            // A connected socket reports an ICMP unreachable for an earlier
+            // send on the next call; it says nothing about what is queued.
+            Err(error)
+                if self.peer.is_some() && error.kind() == io::ErrorKind::ConnectionRefused =>
+            {
+                self.recv_datagram_len(buf)
+            }
+            result => result,
+        }?;
+        Ok(received.map(|(from, len)| (from, &buf[..len])))
+    }
+
+    fn recv_datagram_len(&mut self, buf: &mut [u8]) -> io::Result<Option<(SocketAddr, usize)>> {
         if buf.len() >= SAFE_RECEIVE_CAPACITY {
             return match self.socket.recv_from(buf) {
                 Ok((len, from)) if len > MAX_RIST_DATAGRAM_SIZE => Err(io::Error::new(
@@ -428,7 +506,7 @@ impl RtpUdpSocket {
                         observed_size: Some(len),
                     },
                 )),
-                Ok((len, from)) => Ok(Some((from, &buf[..len]))),
+                Ok((len, from)) => Ok(Some((from, len))),
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(None),
                 #[cfg(windows)]
                 Err(err) if err.raw_os_error() == Some(10040) => Err(io::Error::new(
@@ -460,7 +538,7 @@ impl RtpUdpSocket {
             )),
             Ok((len, from)) => {
                 buf[..len].copy_from_slice(&self.receive_scratch[..len]);
-                Ok(Some((from, &buf[..len])))
+                Ok(Some((from, len)))
             }
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(None),
             #[cfg(windows)]
@@ -784,6 +862,92 @@ fn bind_reuse_udp(local: SocketAddr) -> io::Result<UdpSocket> {
     socket.set_nonblocking(true)?;
     let socket: StdUdpSocket = socket.into();
     Ok(UdpSocket::from_std(socket))
+}
+
+/// Sends a datagram at once when nothing is queued ahead of it (FIFO), or
+/// queues it, joined into a reused buffer, when the socket would block. A
+/// datagram to the socket's connected peer goes without an address. A
+/// connected peer that is not listening drops it, as the path would.
+fn send_or_queue(
+    socket: &mut RtpUdpSocket,
+    pending: &mut VecDeque<PendingDatagram>,
+    spare: &mut Vec<Vec<u8>>,
+    peer: SocketAddr,
+    head: &[u8],
+    body: &[u8],
+) -> io::Result<()> {
+    if pending.is_empty() {
+        match send_parts(socket, peer, head, body) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error),
+        }
+    }
+    if pending.len() >= PENDING_SEND_CAPACITY {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "RIST pending-send queue is full",
+        ));
+    }
+    queue_datagram(pending, spare, peer, head, body);
+    Ok(())
+}
+
+fn send_parts(
+    socket: &mut RtpUdpSocket,
+    peer: SocketAddr,
+    head: &[u8],
+    body: &[u8],
+) -> io::Result<()> {
+    let connected = socket.connected_peer() == Some(peer);
+    let target = if connected { None } else { Some(peer) };
+    match socket.send_parts_to(target, head, body) {
+        Ok(len) if len == head.len() + body.len() => Ok(()),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "UDP send accepted a partial datagram",
+        )),
+        Err(error) if connected && error.kind() == io::ErrorKind::ConnectionRefused => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn queue_datagram(
+    pending: &mut VecDeque<PendingDatagram>,
+    spare: &mut Vec<Vec<u8>>,
+    peer: SocketAddr,
+    head: &[u8],
+    body: &[u8],
+) {
+    let mut bytes = spare.pop().unwrap_or_default();
+    bytes.clear();
+    bytes.extend_from_slice(head);
+    bytes.extend_from_slice(body);
+    pending.push_back(PendingDatagram { bytes, peer });
+}
+
+/// Sends queued datagrams in FIFO order until the socket would block; the
+/// buffers sent are kept for reuse.
+fn flush_queue(
+    socket: &mut RtpUdpSocket,
+    pending: &mut VecDeque<PendingDatagram>,
+    spare: &mut Vec<Vec<u8>>,
+) -> io::Result<usize> {
+    let mut sent = 0;
+    while let Some(packet) = pending.front() {
+        match send_parts(socket, packet.peer, &packet.bytes, &[]) {
+            Ok(()) => {
+                let packet = pending.pop_front().expect("front was checked");
+                if spare.len() < PENDING_SEND_CAPACITY {
+                    spare.push(packet.bytes);
+                }
+                sent += 1;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(sent)
 }
 
 pub struct SimpleMioSender {
@@ -1573,7 +1737,47 @@ pub struct MainMioSender {
     listening: bool,
     last_reauthentication: Option<Instant>,
     pending: VecDeque<PendingDatagram>,
+    /// Buffers of sent queued datagrams, reused by the next ones queued.
+    spare: Vec<Vec<u8>>,
+    /// When the SR/echo or keepalive timer is next due: `send_payload`
+    /// serves them itself once this has passed (`None`: not armed yet).
+    next_timer_at: Option<Instant>,
+    keepalive_mac: [u8; 6],
 }
+
+/// Readiness of a Main sender is its socket's: feedback to read (with
+/// `Interest::READABLE`). Sleep until [`MainMioSender::next_timeout`] (or
+/// the `service` result) and call [`MainMioSender::service`] on wakeup.
+impl Source for MainMioSender {
+    fn register(
+        &mut self,
+        registry: &Registry,
+        token: Token,
+        interests: Interest,
+    ) -> io::Result<()> {
+        self.socket.register(registry, token, interests)
+    }
+
+    fn reregister(
+        &mut self,
+        registry: &Registry,
+        token: Token,
+        interests: Interest,
+    ) -> io::Result<()> {
+        self.socket.reregister(registry, token, interests)
+    }
+
+    fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
+        self.socket.deregister(registry)
+    }
+}
+
+/// The most feedback datagrams one [`MainMioSender::service`] call reads.
+const SERVICE_READ_LIMIT: usize = 512;
+
+/// How soon `service` asks to be called again while datagrams wait in the
+/// send queue.
+const PENDING_RETRY: std::time::Duration = std::time::Duration::from_millis(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MainMioSessionPoll {
@@ -1851,33 +2055,50 @@ impl MainMioSender {
         history_packets: usize,
     ) -> io::Result<Self> {
         ensure_same_address_family(local, peer)?;
-        Ok(Self {
-            socket: RtpUdpSocket::bind(local, flow_id)?,
-            core: MainSenderCore::new(flow_id, history_packets),
-            timers: MainSessionTimers::new(),
-            srp: None,
-            srp_authenticator: None,
-            srp_candidates: HashMap::new(),
-            peer: Some(peer),
-            listening: false,
-            last_reauthentication: None,
-            pending: VecDeque::with_capacity(PENDING_SEND_CAPACITY),
-        })
+        // Connected: the kernel keeps the route and the address, so each
+        // send skips the route lookup, and only the peer's datagrams are
+        // read (others were ignored anyway).
+        let socket = RtpUdpSocket::connect(local, peer, flow_id)?;
+        Ok(Self::with_socket(
+            socket,
+            flow_id,
+            history_packets,
+            Some(peer),
+        ))
     }
 
     pub fn listen(local: SocketAddr, flow_id: u32, history_packets: usize) -> io::Result<Self> {
-        Ok(Self {
-            socket: RtpUdpSocket::bind(local, flow_id)?,
+        let socket = RtpUdpSocket::bind(local, flow_id)?;
+        Ok(Self::with_socket(socket, flow_id, history_packets, None))
+    }
+
+    fn with_socket(
+        socket: RtpUdpSocket,
+        flow_id: u32,
+        history_packets: usize,
+        peer: Option<SocketAddr>,
+    ) -> Self {
+        Self {
+            socket,
             core: MainSenderCore::new(flow_id, history_packets),
             timers: MainSessionTimers::new(),
             srp: None,
             srp_authenticator: None,
             srp_candidates: HashMap::new(),
-            peer: None,
-            listening: true,
+            peer,
+            listening: peer.is_none(),
             last_reauthentication: None,
             pending: VecDeque::with_capacity(PENDING_SEND_CAPACITY),
-        })
+            spare: Vec::new(),
+            next_timer_at: None,
+            keepalive_mac: [0; 6],
+        }
+    }
+
+    /// The MAC-like id the keepalives that [`Self::send_payload`] and
+    /// [`Self::service`] send carry (zeros by default).
+    pub fn set_keepalive_mac(&mut self, mac: [u8; 6]) {
+        self.keepalive_mac = mac;
     }
 
     pub fn build_payload(
@@ -2043,23 +2264,173 @@ impl MainMioSender {
 
     pub fn send_outbound(&mut self, packet: &MainOutboundPacket) -> io::Result<usize> {
         self.ensure_srp_authenticated()?;
-        self.enqueue_packet(&packet.bytes)?;
+        let peer = self.peer.ok_or_else(no_remote_peer_error)?;
         self.flush_pending()?;
+        self.send_or_queue(peer, &packet.bytes, &[])?;
         Ok(packet.bytes.len())
     }
 
+    /// Sends one payload and returns the datagram sent. Also serves the
+    /// SR/echo and keepalive timers when they are due, so a caller that
+    /// only sends still sends reports and echo requests (the receiver
+    /// needs them for its RTT). Use [`Self::send_payload_meta`] when the
+    /// bytes are not needed: it allocates nothing.
     pub fn send_payload(
         &mut self,
         payload: &[u8],
         ntp_timestamp: u64,
         now: Instant,
     ) -> io::Result<MainOutboundPacket> {
-        self.ensure_peer_available()?;
+        let mut bytes = Vec::new();
+        let meta = self.send_payload_parts(payload, ntp_timestamp, now, |head, body| {
+            bytes.reserve_exact(head.len() + body.len());
+            bytes.extend_from_slice(head);
+            bytes.extend_from_slice(body);
+        })?;
+        Ok(MainOutboundPacket {
+            rtp_sequence: meta.rtp_sequence,
+            gre_sequence: meta.gre_sequence,
+            retry: false,
+            bytes,
+        })
+    }
+
+    /// [`Self::send_payload`] without the bytes: the RTP packet is encoded
+    /// into its history slot and sent from there with its GRE header in one
+    /// `sendmsg`. One copy of the payload, no allocation once warm.
+    pub fn send_payload_meta(
+        &mut self,
+        payload: &[u8],
+        ntp_timestamp: u64,
+        now: Instant,
+    ) -> io::Result<MainPacketMeta> {
+        self.send_payload_parts(payload, ntp_timestamp, now, |_, _| {})
+    }
+
+    fn send_payload_parts(
+        &mut self,
+        payload: &[u8],
+        ntp_timestamp: u64,
+        now: Instant,
+        observe: impl FnOnce(&[u8], &[u8]),
+    ) -> io::Result<MainPacketMeta> {
+        let peer = self.peer.ok_or_else(no_remote_peer_error)?;
         self.ensure_srp_authenticated()?;
+        // A full queue refuses before the sequence and history commit.
         self.ensure_pending_capacity()?;
-        let packet = self.build_payload(payload, ntp_timestamp, now);
-        self.send_outbound(&packet)?;
-        Ok(packet)
+        if !self.pending.is_empty() {
+            self.flush_pending()?;
+        }
+        let Self {
+            core,
+            socket,
+            pending,
+            spare,
+            ..
+        } = self;
+        let meta = core.send_payload_with(payload, ntp_timestamp, now, |meta, head, body| {
+            observe(head, body);
+            send_or_queue(socket, pending, spare, peer, head, body).map(|()| meta)
+        })?;
+        self.drive_timers(now, ntp_timestamp);
+        Ok(meta)
+    }
+
+    /// Sends the SR/echo request and keepalive when due (two `Instant`
+    /// comparisons when nothing is). Errors are left for [`Self::service`]
+    /// or the next poll: the data packet already went out.
+    fn drive_timers(&mut self, now: Instant, ntp_timestamp: u64) {
+        if self.next_timer_at.is_some_and(|at| now < at) {
+            return;
+        }
+        if let Some(packet) = self.core.poll_rtcp(now, ntp_timestamp) {
+            let _ = self.send_control(&packet.bytes);
+        }
+        if self.timers.poll(now).keepalive_due {
+            let packet = self
+                .core
+                .build_keepalive(GreKeepalive::librist_default(self.keepalive_mac));
+            let _ = self.send_control(&packet.bytes);
+        }
+        self.next_timer_at = Some(
+            [self.core.next_rtcp_at(), self.timers.next_keepalive_at()]
+                .into_iter()
+                .flatten()
+                .min()
+                .unwrap_or(now + std::time::Duration::from_millis(100)),
+        );
+    }
+
+    fn send_control(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let peer = self.peer.ok_or_else(no_remote_peer_error)?;
+        self.send_or_queue(peer, bytes, &[])
+    }
+
+    /// Everything a sender owes besides its data, for a caller that sleeps
+    /// between events: flushes the send queue, reads and serves feedback
+    /// until the socket is drained (at most 512 datagrams; NACKs are
+    /// repaired, echo requests answered), sends the SR/echo request and the
+    /// keepalive when due (and starts SRP re-authentication after a
+    /// timeout), and sends due repairs. Returns when to call it again
+    /// (`None`: only when the socket is readable). Malformed datagrams are
+    /// skipped. Without a peer (listening) only the reads happen.
+    pub fn service(
+        &mut self,
+        now: Instant,
+        ntp_timestamp: u64,
+        buf: &mut [u8],
+    ) -> io::Result<Option<Instant>> {
+        self.flush_pending()?;
+        for _ in 0..SERVICE_READ_LIMIT {
+            if self.pending.len() >= PENDING_SEND_CAPACITY {
+                break;
+            }
+            match self.try_recv_event(buf) {
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(error) if error.kind() == io::ErrorKind::InvalidData => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error),
+            }
+        }
+        if self.peer.is_some() && self.srp_authenticated() {
+            match self.poll_rtcp_and_send(now, ntp_timestamp) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if self.peer.is_some() {
+            let keepalive = GreKeepalive::librist_default(self.keepalive_mac);
+            match self.poll_session_and_send_keepalive(now, keepalive) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
+            self.poll_repairs_and_send(now)?;
+        }
+        self.next_timer_at = [self.core.next_rtcp_at(), self.timers.next_keepalive_at()]
+            .into_iter()
+            .flatten()
+            .min();
+        let next = self.next_timeout();
+        if self.pending.is_empty() {
+            Ok(next)
+        } else {
+            let retry = now + PENDING_RETRY;
+            Ok(Some(next.map_or(retry, |next| next.min(retry))))
+        }
+    }
+
+    fn send_or_queue(&mut self, peer: SocketAddr, head: &[u8], body: &[u8]) -> io::Result<()> {
+        send_or_queue(
+            &mut self.socket,
+            &mut self.pending,
+            &mut self.spare,
+            peer,
+            head,
+            body,
+        )
     }
 
     pub fn poll_rtcp_and_send(
@@ -2332,24 +2703,7 @@ impl MainMioSender {
     }
 
     pub fn flush_pending(&mut self) -> io::Result<usize> {
-        let mut sent = 0;
-        while let Some(packet) = self.pending.front() {
-            match self.socket.send_packet_to(packet.peer, &packet.bytes) {
-                Ok(len) if len == packet.bytes.len() => {
-                    self.pending.pop_front();
-                    sent += 1;
-                }
-                Ok(_) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "UDP send accepted a partial datagram",
-                    ))
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(sent)
+        flush_queue(&mut self.socket, &mut self.pending, &mut self.spare)
     }
 
     pub fn pending_send_len(&self) -> usize {
@@ -2374,10 +2728,7 @@ impl MainMioSender {
 
     fn enqueue_packet_to(&mut self, peer: SocketAddr, packet: &[u8]) -> io::Result<()> {
         self.ensure_pending_capacity()?;
-        self.pending.push_back(PendingDatagram {
-            bytes: packet.to_vec(),
-            peer,
-        });
+        queue_datagram(&mut self.pending, &mut self.spare, peer, packet, &[]);
         Ok(())
     }
 
@@ -4472,6 +4823,205 @@ mod tests {
         assert_eq!(receiver.peer_addr(), None);
     }
 
+    /// What a raw sink saw from a Main sender: data packets, SR, echo
+    /// requests and keepalives.
+    #[derive(Debug, Default)]
+    struct SinkCounts {
+        data: u64,
+        sender_reports: u64,
+        echo_requests: u64,
+        keepalives: u64,
+    }
+
+    fn drain_sink(sink: &StdUdpSocket, counts: &mut SinkCounts) {
+        let mut buf = [0u8; 2_048];
+        while let Ok((len, _)) = sink.recv_from(&mut buf) {
+            let datagram = &buf[..len];
+            let Ok(reduced) = ReducedPacket::decode(datagram) else {
+                if rist_core::packet::gre::KeepalivePacket::decode(datagram).is_ok() {
+                    counts.keepalives += 1;
+                }
+                continue;
+            };
+            if !looks_like_rtcp(reduced.payload) {
+                counts.data += 1;
+                continue;
+            }
+            for packet in rist_core::packet::rtcp::decode_compound(reduced.payload).unwrap() {
+                match packet {
+                    rist_core::packet::rtcp::RtcpPacket::SenderReport(_) => {
+                        counts.sender_reports += 1
+                    }
+                    rist_core::packet::rtcp::RtcpPacket::Echo(echo)
+                        if echo.kind == rist_core::packet::rtcp::EchoKind::Request =>
+                    {
+                        counts.echo_requests += 1
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn raw_sink() -> StdUdpSocket {
+        let sink = StdUdpSocket::bind(loopback_any()).unwrap();
+        sink.set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        sink
+    }
+
+    /// A sender that is only ever handed data (the product's pattern) still
+    /// sends its SR, echo request and keepalive once they are due.
+    #[test]
+    fn main_sender_that_only_sends_still_reports_echoes_and_keeps_alive() {
+        let sink = raw_sink();
+        let mut sender =
+            MainMioSender::connect(loopback_any(), sink.local_addr().unwrap(), 0x1122_3344, 64)
+                .unwrap();
+        let ntp = ntp_now();
+        let start = Instant::now();
+        // The first send arms the timers; nothing else goes out. Echo
+        // requests go every 100 ms (as librist), SR and keepalive every
+        // second.
+        sender.send_payload_meta(b"zero", ntp, start).unwrap();
+        sender
+            .send_payload_meta(b"one", ntp, start + Duration::from_millis(500))
+            .unwrap();
+        let mut counts = SinkCounts::default();
+        thread::sleep(Duration::from_millis(20));
+        sink.set_nonblocking(true).unwrap();
+        drain_sink(&sink, &mut counts);
+        assert_eq!(
+            (
+                counts.data,
+                counts.sender_reports,
+                counts.echo_requests,
+                counts.keepalives
+            ),
+            (2, 0, 1, 0),
+            "{counts:?}"
+        );
+        // A second later all three are due at the next send.
+        sender
+            .send_payload(b"two", ntp, start + Duration::from_millis(1_001))
+            .unwrap();
+        sender
+            .send_payload_meta(b"three", ntp, start + Duration::from_millis(1_002))
+            .unwrap();
+        thread::sleep(Duration::from_millis(20));
+        drain_sink(&sink, &mut counts);
+        assert_eq!(counts.data, 4, "{counts:?}");
+        assert_eq!(counts.sender_reports, 1, "{counts:?}");
+        assert_eq!(counts.echo_requests, 2, "{counts:?}");
+        assert_eq!(counts.keepalives, 1, "{counts:?}");
+        assert_eq!(sender.stats().sent_packets, 4);
+    }
+
+    /// An idle sender driven by `service` wakes about ten times a second
+    /// (echo request every 100 ms; SR and keepalive every second), not every
+    /// few hundred microseconds, and sends what is due at each wakeup.
+    #[test]
+    fn main_sender_service_sleeps_until_its_next_deadline() {
+        let sink = raw_sink();
+        sink.set_nonblocking(true).unwrap();
+        let mut sender =
+            MainMioSender::connect(loopback_any(), sink.local_addr().unwrap(), 0x1122_3344, 64)
+                .unwrap();
+        let mut buf = vec![0u8; SAFE_RECEIVE_CAPACITY];
+        let start = Instant::now();
+        let mut now = start;
+        let mut wakeups = 0;
+        while now < start + Duration::from_secs(10) {
+            let next = sender
+                .service(now, ntp_now(), &mut buf)
+                .unwrap()
+                .expect("timers are armed");
+            assert!(next > now, "deadline {next:?} not after {now:?}");
+            assert!(next <= now + Duration::from_millis(100));
+            wakeups += 1;
+            now = next;
+        }
+        let mut counts = SinkCounts::default();
+        thread::sleep(Duration::from_millis(20));
+        drain_sink(&sink, &mut counts);
+        assert!((100..=101).contains(&wakeups), "{wakeups} wakeups in 10 s");
+        assert!((9..=10).contains(&counts.sender_reports), "{counts:?}");
+        assert!((99..=100).contains(&counts.echo_requests), "{counts:?}");
+        assert!((9..=10).contains(&counts.keepalives), "{counts:?}");
+        assert_eq!(counts.data, 0);
+    }
+
+    /// Connected Main sender: a peer that is not listening (ICMP port
+    /// unreachable) does not fail later sends or reads.
+    #[test]
+    fn connected_main_sender_ignores_a_refusing_peer() {
+        let closed = StdUdpSocket::bind(loopback_any()).unwrap();
+        let closed_addr = closed.local_addr().unwrap();
+        drop(closed);
+        let mut sender = MainMioSender::connect(loopback_any(), closed_addr, 2, 64).unwrap();
+        assert_eq!(sender.socket.connected_peer(), Some(closed_addr));
+        let mut buf = vec![0u8; SAFE_RECEIVE_CAPACITY];
+        for n in 0..20u32 {
+            sender
+                .send_payload_meta(b"nobody", 0, Instant::now())
+                .unwrap();
+            thread::sleep(Duration::from_millis(1));
+            assert!(sender.try_recv_event(&mut buf).unwrap().is_none(), "{n}");
+        }
+        assert_eq!(sender.stats().sent_packets, 20);
+        assert_eq!(sender.pending_send_len(), 0);
+    }
+
+    /// End to end through mio: a registered sender wakes on the receiver's
+    /// NACK and `service` repairs the lost packet; between events it sleeps
+    /// until `service`'s deadline.
+    #[test]
+    fn registered_main_sender_wakes_for_a_nack_and_repairs() {
+        let flow_id = 0x1122_3344;
+        let mut receiver =
+            MainMioReceiver::bind(loopback_any(), flow_id, "rust", NackMode::Range).unwrap();
+        receiver.set_recovery_tuning(static_tuning());
+        let mut sender =
+            MainMioSender::connect(loopback_any(), receiver.local_addr().unwrap(), flow_id, 64)
+                .unwrap();
+        sender.set_recovery_tuning(static_tuning());
+        let mut poll = mio::Poll::new().unwrap();
+        let mut events = mio::Events::with_capacity(8);
+        poll.registry()
+            .register(&mut sender, Token(1), Interest::READABLE)
+            .unwrap();
+        let ntp = ntp_now();
+        let start = Instant::now();
+        sender.send_payload_meta(b"zero", ntp, start).unwrap();
+        sender.build_payload(b"lost", ntp, start);
+        sender.send_payload_meta(b"two", ntp, start).unwrap();
+
+        let mut buf = vec![0u8; SAFE_RECEIVE_CAPACITY];
+        let mut sender_buf = vec![0u8; SAFE_RECEIVE_CAPACITY];
+        let mut received = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while received.len() < 3 {
+            while let Some((_from, payload)) = receiver.try_recv_payload(&mut buf).unwrap() {
+                received.push((payload.sequence, payload.recovered));
+            }
+            receiver
+                .poll_rtcp_and_send(Instant::now(), ntp_now())
+                .unwrap();
+            let next = sender
+                .service(Instant::now(), ntp_now(), &mut sender_buf)
+                .unwrap();
+            let timeout = next
+                .map(|at| at.saturating_duration_since(Instant::now()))
+                .unwrap_or(Duration::from_secs(1))
+                .min(Duration::from_millis(5));
+            poll.poll(&mut events, Some(timeout)).unwrap();
+            assert!(Instant::now() < deadline, "received {received:?}");
+        }
+        assert_eq!(received, vec![(0, false), (2, false), (1, true)]);
+        assert_eq!(sender.stats().retransmitted_packets, 1);
+        poll.registry().deregister(&mut sender).unwrap();
+    }
+
     fn loopback_any() -> SocketAddr {
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
     }
@@ -5948,7 +6498,14 @@ mod tests {
             while received_packets < PACKETS {
                 match receiver.recv_from(&mut buf) {
                     Ok((len, _)) => {
-                        let reduced = ReducedPacket::decode(&buf[..len]).unwrap();
+                        // A sender that only sends still sends its
+                        // keepalives and SR/echo requests: skip them.
+                        let Ok(reduced) = ReducedPacket::decode(&buf[..len]) else {
+                            continue;
+                        };
+                        if looks_like_rtcp(reduced.payload) {
+                            continue;
+                        }
                         let rtp = RtpPacket::decode(reduced.payload).unwrap();
                         assert_eq!(u64::from(rtp.header.sequence_number), received_packets);
                         received_packets += 1;
