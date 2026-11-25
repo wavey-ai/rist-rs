@@ -15,3 +15,4 @@ serde_json = "1"
 
 [dev-dependencies]
 rist-mio = { version = "0.1.0", path = "../rist-mio" }
+mio = { version = "1", features = ["net", "os-poll"] }
