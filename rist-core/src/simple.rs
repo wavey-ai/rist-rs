@@ -581,7 +581,7 @@ impl SimpleReceiverCore {
             cname: cname.into(),
             nack_mode,
             sequence_extender: SequenceExtender::new(),
-            missing_tracker: MissingTracker::new(),
+            missing_tracker: default_receiver_tracker(),
             peer_ssrc: None,
             base_sequence: None,
             highest_sequence: None,
@@ -614,9 +614,12 @@ impl SimpleReceiverCore {
         recovery: RecoveryConfig,
         congestion_control: CongestionControlMode,
     ) {
-        let window = recovery_window_packets(&recovery);
-        self.missing_tracker =
-            MissingTracker::with_limits(window, effective_recovery_age(&recovery));
+        self.missing_tracker.reconfigure(
+            recovery_window_packets(&recovery),
+            effective_recovery_age(&recovery),
+        );
+        self.missing_tracker
+            .set_initial_nack_delay(recovery.reorder_buffer);
         self.recovery = recovery;
         self.congestion_control = congestion_control;
         self.return_window_started = Instant::now();
@@ -846,19 +849,35 @@ impl SimpleReceiverCore {
     }
 }
 
+/// Smallest payload assumed when sizing the receiver's duplicate-detection
+/// ring: seven 188-byte MPEG-TS packets, the usual RIST datagram.
+const RECEIVER_WINDOW_PAYLOAD_FLOOR: u128 = 7 * 188;
+const MIN_RECEIVER_WINDOW_PACKETS: u128 = 1_024;
+const MAX_RECEIVER_RING_PACKETS: u128 = 32_768;
+
 fn recovery_window_packets(config: &RecoveryConfig) -> usize {
-    // max_bitrate is expressed in kbit/s. Use a conservative 64-byte packet
-    // floor so even very small datagrams cannot make the sequence window grow
-    // beyond this fixed allocation.
+    // max_bitrate is expressed in kbit/s. The ring only tells duplicates from
+    // late packets; holes are tracked separately up to the 16-bit NACK
+    // horizon whatever its size, so it no longer drives CPU or hole safety.
     let bits = u128::from(config.max_bitrate)
         .saturating_mul(1_000)
         .saturating_mul(effective_recovery_age(config).as_millis());
     let packets = bits
         .saturating_div(8)
-        .saturating_div(64)
+        .saturating_div(RECEIVER_WINDOW_PAYLOAD_FLOOR)
         .saturating_div(1_000)
-        .clamp(64, 1 << 20);
-    usize::try_from(packets).unwrap_or(1 << 20)
+        .clamp(MIN_RECEIVER_WINDOW_PACKETS, MAX_RECEIVER_RING_PACKETS);
+    usize::try_from(packets).unwrap_or(MAX_RECEIVER_RING_PACKETS as usize)
+}
+
+fn default_receiver_tracker() -> MissingTracker {
+    let recovery = RecoveryConfig::default();
+    let mut tracker = MissingTracker::with_limits(
+        recovery_window_packets(&recovery),
+        effective_recovery_age(&recovery),
+    );
+    tracker.set_initial_nack_delay(recovery.reorder_buffer);
+    tracker
 }
 
 fn effective_recovery_age(config: &RecoveryConfig) -> Duration {
@@ -1253,6 +1272,31 @@ mod tests {
         assert!(!received.duplicate);
         assert!(received.newly_missing.is_empty());
         assert!(receiver.missing_sequences().is_empty());
+    }
+
+    #[test]
+    fn receiver_ring_uses_a_ts_payload_floor_and_allocates_lazily() {
+        let product = RecoveryConfig::default();
+        // 100 Mbit/s for 1 s of 1316-byte payloads is 9498 packets.
+        assert_eq!(recovery_window_packets(&product), 9_498);
+        let receiver = SimpleReceiverCore::new(1, "rust", NackMode::Range)
+            .with_recovery_config(product.clone(), CongestionControlMode::Normal);
+        assert_eq!(receiver.missing_tracker.capacity(), 16_384);
+
+        let tiny = RecoveryConfig {
+            max_bitrate: 1_000,
+            length_min: Duration::from_millis(50),
+            length_max: Duration::from_millis(50),
+            ..RecoveryConfig::default()
+        };
+        assert_eq!(recovery_window_packets(&tiny), 1_024);
+        let huge = RecoveryConfig {
+            max_bitrate: u32::MAX,
+            length_min: Duration::from_secs(30),
+            length_max: Duration::from_secs(30),
+            ..RecoveryConfig::default()
+        };
+        assert_eq!(recovery_window_packets(&huge), 32_768);
     }
 
     fn ts_packet(pid: u16, label: &[u8]) -> Vec<u8> {
