@@ -29,7 +29,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket as StdUdpSocket};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const PENDING_SEND_CAPACITY: usize = 256;
 pub const TARGET_SOCKET_BUFFER_SIZE: usize = 8 * 1024 * 1024;
@@ -3524,6 +3524,62 @@ impl MainMioReceiver {
         }
     }
 
+    /// [`Self::poll_all_rtcp_and_send`] under the name the product uses:
+    /// due NACKs and reports for every peer, not only the last one heard.
+    pub fn poll_rtcp_and_send_all(&mut self, now: Instant, now_ntp: u64) -> io::Result<usize> {
+        self.poll_all_rtcp_and_send(now, now_ntp)
+    }
+
+    /// Sends a keepalive to every authenticated peer whose keepalive timer
+    /// is due (each peer keeps its own schedule). Returns the keepalives
+    /// sent. On a send error the other peers are still served; the error is
+    /// returned when nothing went out.
+    pub fn poll_keepalive_all(
+        &mut self,
+        now: Instant,
+        keepalive: GreKeepalive<'_>,
+    ) -> io::Result<usize> {
+        let socket = &mut self.socket;
+        let mut sent = 0;
+        let mut error = None;
+        for (&peer, runtime) in self.peer_runtime.iter_mut() {
+            if !receiver_runtime_authenticated(runtime) || !runtime.timers.poll(now).keepalive_due {
+                continue;
+            }
+            let packet = runtime.core.build_keepalive(keepalive);
+            match socket.send_packet_to(peer, &packet.bytes) {
+                Ok(_) => sent += 1,
+                Err(err) => error = Some(err),
+            }
+        }
+        match error {
+            Some(error) if sent == 0 => Err(error),
+            _ => Ok(sent),
+        }
+    }
+
+    /// Forgets every peer that has sent nothing accepted for `idle` (or
+    /// nothing at all since its first datagram was refused), with its flows,
+    /// NACK state and authentication. Returns the peers removed. The peer
+    /// capacity ([`Self::max_peers`]) is then free for new senders.
+    pub fn evict_idle_peers(&mut self, now: Instant, idle: Duration) -> usize {
+        let before = self.peer_runtime.len();
+        self.peer_runtime.retain(|_, runtime| {
+            runtime
+                .timers
+                .last_peer_activity()
+                .is_some_and(|last| now.saturating_duration_since(last) < idle)
+        });
+        if self
+            .last_peer
+            .is_some_and(|peer| !self.peer_runtime.contains_key(&peer))
+            && self.configured_peer.is_none()
+        {
+            self.last_peer = None;
+        }
+        before - self.peer_runtime.len()
+    }
+
     pub fn set_tx_key(&mut self, key: PskKey) {
         self.core.set_tx_key(key.clone());
         for runtime in self.peer_runtime.values_mut() {
@@ -4330,6 +4386,90 @@ mod tests {
         );
         assert_eq!(receiver.try_recv_event(&mut buf).unwrap(), None);
         poll.registry().deregister(&mut receiver).unwrap();
+    }
+
+    /// Two contributors on one Main port: each gets its keepalive on its
+    /// own schedule, both are NACKed, and both are evicted once idle.
+    #[test]
+    fn main_receiver_serves_and_evicts_every_peer() {
+        let flow_id = 0x1122_3344;
+        let mut receiver =
+            MainMioReceiver::bind(loopback_any(), flow_id, "rust", NackMode::Range).unwrap();
+        receiver.set_recovery_tuning(static_tuning());
+        let receiver_addr = receiver.local_addr().unwrap();
+        let mut senders = [
+            MainMioSender::connect(loopback_any(), receiver_addr, flow_id, 64).unwrap(),
+            MainMioSender::connect(loopback_any(), receiver_addr, flow_id, 64).unwrap(),
+        ];
+        let ntp = ntp_now();
+        let start = Instant::now();
+        for sender in &mut senders {
+            sender.send_payload(b"zero", ntp, start).unwrap();
+            sender.build_payload(b"lost", ntp, start);
+            sender.send_payload(b"two", ntp, start).unwrap();
+        }
+        let mut buf = [0_u8; 2048];
+        let mut payloads = 0;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while payloads < 4 {
+            while receiver.try_recv_payload(&mut buf).unwrap().is_some() {
+                payloads += 1;
+            }
+            assert!(Instant::now() < deadline, "payloads: {payloads}");
+        }
+        assert_eq!(receiver.peer_count(), 2);
+        let now = Instant::now();
+
+        // One NACK per peer once the hole is due.
+        let nack_at = now + Duration::from_millis(100);
+        assert_eq!(receiver.poll_rtcp_and_send_all(nack_at, ntp).unwrap(), 2);
+        for sender in &mut senders {
+            let retries = loop {
+                match sender.try_recv_feedback_and_retransmit(&mut buf).unwrap() {
+                    Some(retries) => break retries,
+                    None => {
+                        assert!(Instant::now() < deadline, "no NACK");
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            };
+            assert_eq!(retries.len(), 1);
+            assert_eq!(retries[0].rtp_sequence, 1);
+        }
+
+        // The first poll arms each peer's timer; a keepalive interval later
+        // both are due.
+        let keepalive = GreKeepalive::librist_default([0; 6]);
+        assert_eq!(receiver.poll_keepalive_all(now, keepalive).unwrap(), 0);
+        let later = now + MainSessionConfig::default().keepalive_interval;
+        assert_eq!(receiver.poll_keepalive_all(later, keepalive).unwrap(), 2);
+        assert_eq!(receiver.poll_keepalive_all(later, keepalive).unwrap(), 0);
+        for sender in &mut senders {
+            let event = loop {
+                match sender.try_recv_event(&mut buf).unwrap() {
+                    Some(event) => break event,
+                    None => {
+                        assert!(Instant::now() < deadline, "no keepalive");
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            };
+            assert!(
+                matches!(event, MainSenderEvent::Keepalive { .. }),
+                "{event:?}"
+            );
+        }
+
+        assert_eq!(
+            receiver.evict_idle_peers(now + Duration::from_millis(500), Duration::from_secs(1)),
+            0
+        );
+        assert_eq!(
+            receiver.evict_idle_peers(now + Duration::from_secs(2), Duration::from_secs(1)),
+            2
+        );
+        assert_eq!(receiver.peer_count(), 0);
+        assert_eq!(receiver.peer_addr(), None);
     }
 
     fn loopback_any() -> SocketAddr {
