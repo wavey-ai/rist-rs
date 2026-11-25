@@ -4171,6 +4171,13 @@ impl MainMioReceiver {
     /// nothing at all since its first datagram was refused), with its flows,
     /// NACK state and authentication. Returns the peers removed. The peer
     /// capacity ([`Self::max_peers`]) is then free for new senders.
+    ///
+    /// A sender that comes back after eviction starts a fresh session: its
+    /// sequences are extended from scratch, so they can be far behind what
+    /// was delivered before. Reset an ordered buffer fed from this
+    /// receiver ([`rist_core::OrderedPayloadBuffer::reset`]) when this
+    /// returns non-zero; one made with `with_deadline` also resyncs by
+    /// itself.
     pub fn evict_idle_peers(&mut self, now: Instant, idle: Duration) -> usize {
         let before = self.peer_runtime.len();
         self.peer_runtime.retain(|_, runtime| {

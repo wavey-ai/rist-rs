@@ -49,6 +49,18 @@ pub struct SenderHistory {
 /// A packet behind the release point (a repair that arrives after its gap
 /// was skipped, or a copy of a packet already released) is dropped and
 /// counted as late; it is never held.
+///
+/// A stream that jumps backwards for good (a sender restart, or a receiver
+/// peer re-created after idle eviction, which restarts sequence extension)
+/// would otherwise be late forever. After [`RESYNC_LATE_RUN`] consecutive
+/// pushes that are each more than [`RESYNC_HORIZON`] (or the bound, if
+/// larger) behind and step forward from one another, a
+/// [`OverflowPolicy::SkipOldestGap`] buffer releases what it holds and
+/// restarts at the incoming sequence (counted in
+/// [`OrderedStats::resyncs`]); a [`OverflowPolicy::FailClosed`] buffer
+/// returns [`OrderedPayloadBufferError`] for each such push until
+/// [`OrderedPayloadBuffer::reset`]. A late repair is never that far behind
+/// and arrives among in-order packets, which end the run.
 #[derive(Debug, Clone)]
 pub struct OrderedPayloadBuffer {
     /// The next extended sequence to release.
@@ -62,7 +74,19 @@ pub struct OrderedPayloadBuffer {
     reorder_delay: Duration,
     overflow: OverflowPolicy,
     stats: OrderedStats,
+    /// Consecutive pushes far behind the release point, and the last of
+    /// them (see [`RESYNC_LATE_RUN`]).
+    late_run: u32,
+    late_run_last: u32,
 }
+
+/// Consecutive far-behind pushes after which an [`OrderedPayloadBuffer`]
+/// takes the stream as restarted.
+pub const RESYNC_LATE_RUN: u32 = 8;
+
+/// How far behind the release point a push must be to count toward a
+/// resync: half the 16-bit horizon a NACK can reach back.
+pub const RESYNC_HORIZON: u32 = 1 << 15;
 
 #[derive(Debug, Clone)]
 struct PendingPayload {
@@ -113,6 +137,9 @@ pub struct OrderedStats {
     pub duplicates: u64,
     /// The most payloads held at once.
     pub held_max: u64,
+    /// Times the buffer restarted at a stream that jumped backwards for
+    /// good (see [`OrderedPayloadBuffer`]).
+    pub resyncs: u64,
 }
 
 impl OrderedPayloadBuffer {
@@ -158,7 +185,19 @@ impl OrderedPayloadBuffer {
             reorder_delay,
             overflow,
             stats: OrderedStats::default(),
+            late_run: 0,
+            late_run_last: 0,
         }
+    }
+
+    /// Forgets the release point and everything held (dropped, not
+    /// released); the next push starts the stream again. Counters are kept.
+    /// Call it when the stream is known to restart, for example when the
+    /// receiver re-creates an evicted peer.
+    pub fn reset(&mut self) {
+        self.next = None;
+        self.pending.clear();
+        self.late_run = 0;
     }
 
     /// Inserts one arrival and returns every newly contiguous payload in wire
@@ -198,11 +237,33 @@ impl OrderedPayloadBuffer {
             return Ok(OrderedPush::Duplicate);
         }
         let sequence = payload.sequence;
-        let next = *self.next.get_or_insert(u64::from(sequence) + (1u64 << 32));
-        let distance = sequence.wrapping_sub(next as u32);
+        let mut next = *self.next.get_or_insert(u64::from(sequence) + (1u64 << 32));
+        let mut distance = sequence.wrapping_sub(next as u32);
         if distance >= 1 << 31 {
-            self.stats.late_dropped += 1;
-            return Ok(OrderedPush::Late);
+            if !self.far_behind_run(sequence, distance.wrapping_neg()) {
+                self.stats.late_dropped += 1;
+                return Ok(OrderedPush::Late);
+            }
+            match self.overflow {
+                OverflowPolicy::FailClosed => {
+                    self.stats.late_dropped += 1;
+                    return Err(OrderedPayloadBufferError {
+                        next_sequence: next as u32,
+                        received_sequence: sequence,
+                        max_pending_packets: self.max_pending_packets,
+                    });
+                }
+                OverflowPolicy::SkipOldestGap => {
+                    self.flush_all_into(out);
+                    next = u64::from(sequence) + (1u64 << 32);
+                    self.next = Some(next);
+                    distance = 0;
+                    self.late_run = 0;
+                    self.stats.resyncs += 1;
+                }
+            }
+        } else {
+            self.late_run = 0;
         }
         if distance == 0 && self.pending.is_empty() {
             out.push(payload);
@@ -256,6 +317,25 @@ impl OrderedPayloadBuffer {
         } else {
             OrderedPush::Held
         })
+    }
+
+    /// Counts a push `behind` sequences behind the release point toward a
+    /// resync; true once the run is long enough. A push within the horizon,
+    /// or one that does not step forward from the last of the run, starts
+    /// it again.
+    fn far_behind_run(&mut self, sequence: u32, behind: u32) -> bool {
+        let horizon = RESYNC_HORIZON.max(self.max_pending_packets.min(1 << 30) as u32);
+        if behind <= horizon {
+            self.late_run = 0;
+            return false;
+        }
+        let step = sequence.wrapping_sub(self.late_run_last);
+        if self.late_run == 0 || step == 0 || step > horizon {
+            self.late_run = 0;
+        }
+        self.late_run += 1;
+        self.late_run_last = sequence;
+        self.late_run >= RESYNC_LATE_RUN
     }
 
     /// Skips every gap whose first held successor has waited the reorder
@@ -1590,6 +1670,129 @@ mod tests {
             .is_empty());
         assert_eq!(buffer.late_dropped(), 2);
         assert_eq!(buffer.pending_len(), 0);
+    }
+
+    /// A stream that restarts far behind the release point (a sender
+    /// restart, or a receiver peer re-created after eviction) is taken up
+    /// again after a run of far-behind pushes, with what was held released.
+    #[test]
+    fn ordered_deadline_buffer_resyncs_to_a_stream_that_jumped_back() {
+        let start = Instant::now();
+        let mut buffer = OrderedPayloadBuffer::with_deadline(64, Duration::from_millis(10));
+        let mut out = Vec::new();
+        buffer.push_into(payload(100_000, 0), start, &mut out).unwrap();
+        // 100_002 is held behind the gap at 100_001.
+        assert_eq!(
+            buffer.push_into(payload(100_002, 0), start, &mut out),
+            Ok(OrderedPush::Held)
+        );
+        out.clear();
+        let restart = 5u32;
+        for sequence in restart..restart + RESYNC_LATE_RUN - 1 {
+            assert_eq!(
+                buffer.push_into(payload(sequence, 0), start, &mut out),
+                Ok(OrderedPush::Late),
+                "{sequence}"
+            );
+        }
+        assert!(out.is_empty());
+        let resync = restart + RESYNC_LATE_RUN - 1;
+        assert_eq!(
+            buffer.push_into(payload(resync, 0), start, &mut out),
+            Ok(OrderedPush::Released)
+        );
+        assert_eq!(sequences(&out), vec![100_002, resync]);
+        assert_eq!(buffer.next_sequence(), Some(resync + 1));
+        assert_eq!(buffer.pending_len(), 0);
+        let stats = buffer.stats();
+        assert_eq!(stats.resyncs, 1);
+        assert_eq!(stats.late_dropped, u64::from(RESYNC_LATE_RUN - 1));
+        assert_eq!(stats.gaps_skipped, 1);
+        // The restarted stream carries on in order.
+        out.clear();
+        buffer
+            .push_into(payload(resync + 1, 0), start, &mut out)
+            .unwrap();
+        assert_eq!(sequences(&out), vec![resync + 1]);
+    }
+
+    /// Late repairs among in-order packets, a near-behind run, or far-behind
+    /// pushes that do not move forward never resync.
+    #[test]
+    fn ordered_late_repairs_do_not_resync() {
+        let start = Instant::now();
+        let mut buffer = OrderedPayloadBuffer::with_deadline(64, Duration::from_millis(10));
+        let mut out = Vec::new();
+        let mut next = 200_000u32;
+        buffer.push_into(payload(next, 0), start, &mut out).unwrap();
+        // Far-behind arrivals interleaved with the live stream.
+        for n in 0..4 * RESYNC_LATE_RUN {
+            next += 1;
+            buffer.push_into(payload(next, 0), start, &mut out).unwrap();
+            assert_eq!(
+                buffer.push_into(payload(1_000 + n, 0), start, &mut out),
+                Ok(OrderedPush::Late)
+            );
+        }
+        // A long run only just behind the release point (late repairs).
+        let behind = next - 1_000;
+        for sequence in behind..behind + 4 * RESYNC_LATE_RUN {
+            assert_eq!(
+                buffer.push_into(payload(sequence, 0), start, &mut out),
+                Ok(OrderedPush::Late)
+            );
+        }
+        // Far behind, but the same sequence over and over.
+        for _ in 0..4 * RESYNC_LATE_RUN {
+            assert_eq!(
+                buffer.push_into(payload(7, 0), start, &mut out),
+                Ok(OrderedPush::Late)
+            );
+        }
+        assert_eq!(buffer.stats().resyncs, 0);
+        assert_eq!(buffer.next_sequence(), Some(next + 1));
+    }
+
+    /// A fail-closed buffer reports the jump instead of dropping silently,
+    /// and `reset` starts it again.
+    #[test]
+    fn ordered_fail_closed_buffer_reports_a_backward_jump_until_reset() {
+        let start = Instant::now();
+        let mut buffer = OrderedPayloadBuffer::new(64);
+        buffer.push_at(payload(100_000, 0), start).unwrap();
+        for sequence in 0..RESYNC_LATE_RUN - 1 {
+            assert!(buffer.push_at(payload(sequence, 0), start).unwrap().is_empty());
+        }
+        let error = buffer
+            .push_at(payload(RESYNC_LATE_RUN - 1, 0), start)
+            .unwrap_err();
+        assert_eq!(error.next_sequence, 100_001);
+        assert_eq!(error.received_sequence, RESYNC_LATE_RUN - 1);
+        assert!(buffer.push_at(payload(RESYNC_LATE_RUN, 0), start).is_err());
+        assert_eq!(buffer.stats().resyncs, 0);
+
+        buffer.reset();
+        assert_eq!(buffer.next_sequence(), None);
+        assert_eq!(
+            sequences(&buffer.push_at(payload(9, 0), start).unwrap()),
+            vec![9]
+        );
+        assert_eq!(buffer.next_sequence(), Some(10));
+    }
+
+    #[test]
+    fn ordered_reset_drops_what_is_held() {
+        let start = Instant::now();
+        let mut buffer = OrderedPayloadBuffer::with_deadline(8, Duration::from_millis(10));
+        buffer.push_at(payload(1, 0), start).unwrap();
+        assert!(buffer.push_at(payload(3, 0), start).unwrap().is_empty());
+        buffer.reset();
+        assert_eq!(buffer.pending_len(), 0);
+        assert!(buffer.flush_all().is_empty());
+        assert_eq!(
+            sequences(&buffer.push_at(payload(50, 0), start).unwrap()),
+            vec![50]
+        );
     }
 
     #[test]
