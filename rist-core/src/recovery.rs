@@ -40,12 +40,28 @@ pub struct SenderHistory {
 /// hold later packets behind a sequence gap; otherwise a retransmission is
 /// appended after the data that followed it and corrupts the reconstructed
 /// stream.
+///
+/// Sequences are extended to 64 bits relative to the release point, so the
+/// buffer is a `BTreeMap` walk (O(log n) per packet) and crosses the u32
+/// rollover like any other sequence. An in-order packet with nothing held
+/// takes a fast path that touches no map.
+///
+/// A packet behind the release point (a repair that arrives after its gap
+/// was skipped, or a copy of a packet already released) is dropped and
+/// counted as late; it is never held.
 #[derive(Debug, Clone)]
 pub struct OrderedPayloadBuffer {
-    next_sequence: Option<u32>,
-    pending: BTreeMap<u32, PendingPayload>,
+    /// The next extended sequence to release.
+    next: Option<u64>,
+    /// Held payloads by extended sequence; every key is above `next`.
+    /// Arrivals are non-decreasing in key: a payload inserted before a held
+    /// one takes the earlier arrival, so the first entry's arrival is when
+    /// the gap at `next` was first seen.
+    pending: BTreeMap<u64, PendingPayload>,
     max_pending_packets: usize,
     reorder_delay: Duration,
+    overflow: OverflowPolicy,
+    stats: OrderedStats,
 }
 
 #[derive(Debug, Clone)]
@@ -54,26 +70,104 @@ struct PendingPayload {
     payload: ReceivedPayload,
 }
 
+/// What an [`OrderedPayloadBuffer`] does when more than its bound is held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverflowPolicy {
+    /// Refuse the packet with [`OrderedPayloadBufferError`] (after first
+    /// releasing any gap whose deadline has passed). The behaviour of
+    /// [`OrderedPayloadBuffer::new`] and
+    /// [`OrderedPayloadBuffer::with_reorder_delay`].
+    FailClosed,
+    /// Skip the oldest gap (counted in [`OrderedStats`]) until the bound
+    /// holds again, so a push never fails. The behaviour of
+    /// [`OrderedPayloadBuffer::with_deadline`].
+    SkipOldestGap,
+}
+
+/// What happened to one pushed payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderedPush {
+    /// The payload, or a gap's deadline, released at least one payload.
+    Released,
+    /// Held behind a gap; nothing was released.
+    Held,
+    /// Already held, or flagged as a duplicate by the receiver: dropped.
+    Duplicate,
+    /// Behind the release point: dropped and counted in
+    /// [`OrderedStats::late_dropped`].
+    Late,
+}
+
+/// Counters of an [`OrderedPayloadBuffer`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OrderedStats {
+    /// Payloads released in order.
+    pub released: u64,
+    /// Gaps given up (at their deadline, at the bound, or by `flush_all`).
+    pub gaps_skipped: u64,
+    /// Sequences inside the skipped gaps.
+    pub packets_skipped: u64,
+    /// Payloads that arrived behind the release point and were dropped.
+    pub late_dropped: u64,
+    /// Payloads dropped as duplicates.
+    pub duplicates: u64,
+    /// The most payloads held at once.
+    pub held_max: u64,
+}
+
 impl OrderedPayloadBuffer {
+    /// Holds gaps without a deadline and fails closed past
+    /// `max_pending_packets` held payloads.
     pub fn new(max_pending_packets: usize) -> Self {
         Self::with_reorder_delay(max_pending_packets, Duration::MAX)
     }
 
+    /// Skips a gap once the first payload after it has waited
+    /// `reorder_delay`, and fails closed past `max_pending_packets` held
+    /// payloads when no gap is due.
     pub fn with_reorder_delay(max_pending_packets: usize, reorder_delay: Duration) -> Self {
+        Self::with_policy(
+            max_pending_packets,
+            reorder_delay,
+            OverflowPolicy::FailClosed,
+        )
+    }
+
+    /// Skips a gap once the first payload after it has waited
+    /// `reorder_delay`, and skips the oldest gap instead of failing when
+    /// more than `max_pending_packets` are held: pushes never fail. Use it
+    /// for a byte stream that should carry on past an unrecoverable loss
+    /// (an MPEG-TS demuxer sees a continuity-counter jump, as with librist).
+    pub fn with_deadline(max_pending_packets: usize, reorder_delay: Duration) -> Self {
+        Self::with_policy(
+            max_pending_packets,
+            reorder_delay,
+            OverflowPolicy::SkipOldestGap,
+        )
+    }
+
+    pub fn with_policy(
+        max_pending_packets: usize,
+        reorder_delay: Duration,
+        overflow: OverflowPolicy,
+    ) -> Self {
         Self {
-            next_sequence: None,
+            next: None,
             pending: BTreeMap::new(),
             max_pending_packets: max_pending_packets.max(1),
             reorder_delay,
+            overflow,
+            stats: OrderedStats::default(),
         }
     }
 
     /// Inserts one arrival and returns every newly contiguous payload in wire
     /// order. Already delivered and bonded-path duplicate packets are ignored.
     ///
-    /// The buffer fails closed when a gap grows beyond its configured bound.
-    /// Continuing by concatenating bytes across an unresolved gap would turn
-    /// packet loss into silent stream corruption.
+    /// With [`OverflowPolicy::FailClosed`] the buffer fails closed when a gap
+    /// grows beyond its configured bound. Continuing by concatenating bytes
+    /// across an unresolved gap would turn packet loss into silent stream
+    /// corruption.
     pub fn push(
         &mut self,
         payload: ReceivedPayload,
@@ -86,72 +180,160 @@ impl OrderedPayloadBuffer {
         payload: ReceivedPayload,
         now: Instant,
     ) -> Result<Vec<ReceivedPayload>, OrderedPayloadBufferError> {
-        if payload.duplicate {
-            return Ok(Vec::new());
-        }
-
-        let sequence = payload.sequence;
-        let next_sequence = *self.next_sequence.get_or_insert(sequence);
-        if self.pending.contains_key(&sequence) {
-            return Ok(Vec::new());
-        }
-
-        self.pending.insert(
-            sequence,
-            PendingPayload {
-                arrival: now,
-                payload,
-            },
-        );
-
-        let mut ready = self.drain_contiguous(next_sequence);
-
-        if self.pending.len() > self.max_pending_packets {
-            self.pending.remove(&sequence);
-            return Err(OrderedPayloadBufferError {
-                next_sequence: self.next_sequence.unwrap_or(next_sequence),
-                received_sequence: sequence,
-                max_pending_packets: self.max_pending_packets,
-            });
-        }
-
-        if ready.is_empty() {
-            ready.extend(self.release_expired(now));
-        }
+        let mut ready = Vec::new();
+        self.push_into(payload, now, &mut ready)?;
         Ok(ready)
     }
 
-    /// Releases the earliest packet after its reorder deadline and then drains
-    /// all contiguous successors. This turns an unrecoverable gap into an
-    /// explicit deadline decision rather than an indefinitely growing buffer.
-    pub fn release_expired(&mut self, now: Instant) -> Vec<ReceivedPayload> {
-        let Some(next) = self.next_sequence else {
-            return Vec::new();
-        };
-        let Some((&sequence, pending)) = self
-            .pending
-            .iter()
-            .filter(|(sequence, _)| sequence.wrapping_sub(next) < (1 << 31))
-            .min_by_key(|(sequence, _)| sequence.wrapping_sub(next))
-        else {
-            return Vec::new();
-        };
-        if now.saturating_duration_since(pending.arrival) < self.reorder_delay {
-            return Vec::new();
+    /// [`Self::push_at`] appending to `out`, so a caller that reuses `out`
+    /// allocates nothing per packet. On `Err` nothing was appended.
+    pub fn push_into(
+        &mut self,
+        payload: ReceivedPayload,
+        now: Instant,
+        out: &mut Vec<ReceivedPayload>,
+    ) -> Result<OrderedPush, OrderedPayloadBufferError> {
+        if payload.duplicate {
+            self.stats.duplicates += 1;
+            return Ok(OrderedPush::Duplicate);
         }
-        self.next_sequence = Some(sequence);
-        self.drain_contiguous(sequence)
+        let sequence = payload.sequence;
+        let next = *self.next.get_or_insert(u64::from(sequence) + (1u64 << 32));
+        let distance = sequence.wrapping_sub(next as u32);
+        if distance >= 1 << 31 {
+            self.stats.late_dropped += 1;
+            return Ok(OrderedPush::Late);
+        }
+        if distance == 0 && self.pending.is_empty() {
+            out.push(payload);
+            self.next = Some(next + 1);
+            self.stats.released += 1;
+            return Ok(OrderedPush::Released);
+        }
+        let key = next + u64::from(distance);
+        if self.pending.contains_key(&key) {
+            self.stats.duplicates += 1;
+            return Ok(OrderedPush::Duplicate);
+        }
+        let arrival = self
+            .pending
+            .range(key..)
+            .next()
+            .map_or(now, |(_, held)| held.arrival.min(now));
+        self.pending
+            .insert(key, PendingPayload { arrival, payload });
+        self.stats.held_max = self.stats.held_max.max(self.pending.len() as u64);
+
+        let before = out.len();
+        self.drain_into(out);
+        if self.pending.len() > self.max_pending_packets {
+            // A gap whose deadline has passed is skipped before the bound
+            // decides.
+            self.release_expired_into(now, out);
+        }
+        while self.pending.len() > self.max_pending_packets {
+            match self.overflow {
+                OverflowPolicy::FailClosed => {
+                    // Nothing was released: a release would have shrunk
+                    // `pending` back under the bound.
+                    self.pending.remove(&key);
+                    return Err(OrderedPayloadBufferError {
+                        next_sequence: self.next.unwrap_or(next) as u32,
+                        received_sequence: sequence,
+                        max_pending_packets: self.max_pending_packets,
+                    });
+                }
+                OverflowPolicy::SkipOldestGap => {
+                    self.skip_to_first(out);
+                }
+            }
+        }
+        if out.len() == before {
+            self.release_expired_into(now, out);
+        }
+        Ok(if out.len() > before {
+            OrderedPush::Released
+        } else {
+            OrderedPush::Held
+        })
     }
 
-    fn drain_contiguous(&mut self, start: u32) -> Vec<ReceivedPayload> {
+    /// Skips every gap whose first held successor has waited the reorder
+    /// delay, and drains what follows each: several expired gaps go in one
+    /// call. O(log n) per gap.
+    pub fn release_expired(&mut self, now: Instant) -> Vec<ReceivedPayload> {
         let mut ready = Vec::new();
-        let mut next = start;
-        while let Some(pending) = self.pending.remove(&next) {
-            ready.push(pending.payload);
-            next = next.wrapping_add(1);
-        }
-        self.next_sequence = Some(next);
+        self.release_expired_into(now, &mut ready);
         ready
+    }
+
+    /// [`Self::release_expired`] appending to `out`. Returns the number of
+    /// sequences skipped.
+    pub fn release_expired_into(&mut self, now: Instant, out: &mut Vec<ReceivedPayload>) -> u64 {
+        let mut skipped = 0;
+        while let Some((_, held)) = self.pending.first_key_value() {
+            if now.saturating_duration_since(held.arrival) < self.reorder_delay {
+                break;
+            }
+            skipped += self.skip_to_first(out);
+        }
+        skipped
+    }
+
+    /// Releases everything held in order, skipping every gap (counted): for
+    /// the end of a stream.
+    pub fn flush_all(&mut self) -> Vec<ReceivedPayload> {
+        let mut ready = Vec::new();
+        self.flush_all_into(&mut ready);
+        ready
+    }
+
+    pub fn flush_all_into(&mut self, out: &mut Vec<ReceivedPayload>) -> u64 {
+        let mut skipped = 0;
+        while !self.pending.is_empty() {
+            skipped += self.skip_to_first(out);
+        }
+        skipped
+    }
+
+    /// When [`Self::release_expired`] next skips a gap: the arrival of the
+    /// first payload after the gap plus the reorder delay. `None` when
+    /// nothing is held or the delay is unbounded.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        let (_, held) = self.pending.first_key_value()?;
+        held.arrival.checked_add(self.reorder_delay)
+    }
+
+    /// Moves the release point to the first held payload and drains from
+    /// there. Returns the sequences skipped.
+    fn skip_to_first(&mut self, out: &mut Vec<ReceivedPayload>) -> u64 {
+        let Some((&first, _)) = self.pending.first_key_value() else {
+            return 0;
+        };
+        let next = self.next.unwrap_or(first);
+        let skipped = first.saturating_sub(next);
+        if skipped > 0 {
+            self.stats.gaps_skipped += 1;
+            self.stats.packets_skipped += skipped;
+        }
+        self.next = Some(first);
+        self.drain_into(out);
+        skipped
+    }
+
+    fn drain_into(&mut self, out: &mut Vec<ReceivedPayload>) {
+        let Some(mut next) = self.next else {
+            return;
+        };
+        while let Some(entry) = self.pending.first_entry() {
+            if *entry.key() != next {
+                break;
+            }
+            out.push(entry.remove().payload);
+            self.stats.released += 1;
+            next += 1;
+        }
+        self.next = Some(next);
     }
 
     pub fn pending_len(&self) -> usize {
@@ -159,7 +341,33 @@ impl OrderedPayloadBuffer {
     }
 
     pub fn next_sequence(&self) -> Option<u32> {
-        self.next_sequence
+        self.next.map(|next| next as u32)
+    }
+
+    pub fn reorder_delay(&self) -> Duration {
+        self.reorder_delay
+    }
+
+    pub fn overflow_policy(&self) -> OverflowPolicy {
+        self.overflow
+    }
+
+    pub fn stats(&self) -> OrderedStats {
+        self.stats
+    }
+
+    /// Sequences given up inside skipped gaps.
+    pub fn skipped_packets(&self) -> u64 {
+        self.stats.packets_skipped
+    }
+
+    pub fn gaps_skipped(&self) -> u64 {
+        self.stats.gaps_skipped
+    }
+
+    /// Payloads dropped because they arrived behind the release point.
+    pub fn late_dropped(&self) -> u64 {
+        self.stats.late_dropped
     }
 }
 
@@ -1257,6 +1465,281 @@ mod tests {
 
     fn ms(value: u64) -> Duration {
         Duration::from_millis(value)
+    }
+
+    fn sequences(payloads: &[ReceivedPayload]) -> Vec<u32> {
+        payloads.iter().map(|payload| payload.sequence).collect()
+    }
+
+    #[test]
+    fn ordered_in_order_packets_take_the_fast_path() {
+        let start = Instant::now();
+        let mut buffer = OrderedPayloadBuffer::with_deadline(4, Duration::from_millis(10));
+        let mut out = Vec::new();
+        for sequence in 100..110 {
+            assert_eq!(
+                buffer.push_into(payload(sequence, 0), start, &mut out),
+                Ok(OrderedPush::Released)
+            );
+            assert_eq!(buffer.pending_len(), 0);
+        }
+        assert_eq!(sequences(&out), (100..110).collect::<Vec<_>>());
+        assert_eq!(buffer.stats().released, 10);
+        assert_eq!(buffer.stats().held_max, 0);
+        assert_eq!(buffer.next_deadline(), None);
+    }
+
+    #[test]
+    fn ordered_late_packet_after_skip_is_dropped_not_held() {
+        let start = Instant::now();
+        let mut buffer = OrderedPayloadBuffer::with_reorder_delay(8, Duration::from_millis(10));
+        buffer.push_at(payload(1, 1), start).unwrap();
+        assert!(buffer.push_at(payload(3, 3), start).unwrap().is_empty());
+        assert_eq!(sequences(&buffer.release_expired(start + ms(10))), vec![3]);
+        assert_eq!(buffer.pending_len(), 0);
+        assert_eq!(buffer.skipped_packets(), 1);
+        assert_eq!(buffer.gaps_skipped(), 1);
+
+        // The repair of 2 comes after its gap was given up.
+        let mut out = Vec::new();
+        assert_eq!(
+            buffer.push_into(payload(2, 2), start + ms(11), &mut out),
+            Ok(OrderedPush::Late)
+        );
+        assert!(out.is_empty());
+        assert_eq!(buffer.pending_len(), 0);
+        assert_eq!(buffer.late_dropped(), 1);
+        assert_eq!(buffer.next_sequence(), Some(4));
+        // A copy of a released packet is late as well.
+        assert!(buffer
+            .push_at(payload(1, 1), start + ms(12))
+            .unwrap()
+            .is_empty());
+        assert_eq!(buffer.late_dropped(), 2);
+        assert_eq!(buffer.pending_len(), 0);
+    }
+
+    #[test]
+    fn ordered_two_expired_gaps_release_in_one_call() {
+        let start = Instant::now();
+        let mut buffer = OrderedPayloadBuffer::with_reorder_delay(16, Duration::from_millis(10));
+        buffer.push_at(payload(10, 0), start).unwrap();
+        // Gaps at 11 and 14.
+        assert!(buffer.push_at(payload(12, 0), start).unwrap().is_empty());
+        assert!(buffer
+            .push_at(payload(13, 0), start + ms(1))
+            .unwrap()
+            .is_empty());
+        assert!(buffer
+            .push_at(payload(15, 0), start + ms(2))
+            .unwrap()
+            .is_empty());
+        assert_eq!(buffer.next_deadline(), Some(start + ms(10)));
+        assert!(buffer.release_expired(start + ms(9)).is_empty());
+        assert_eq!(
+            sequences(&buffer.release_expired(start + ms(12))),
+            vec![12, 13, 15]
+        );
+        assert_eq!(buffer.gaps_skipped(), 2);
+        assert_eq!(buffer.skipped_packets(), 2);
+        assert_eq!(buffer.pending_len(), 0);
+        assert_eq!(buffer.next_sequence(), Some(16));
+    }
+
+    #[test]
+    fn ordered_gap_deadline_counts_from_its_first_successor() {
+        // 11 is missing; 13 arrives first, then 12 (a repair or reordering)
+        // later: the gap at 11 has been open since 13 arrived.
+        let start = Instant::now();
+        let mut buffer = OrderedPayloadBuffer::with_reorder_delay(8, Duration::from_millis(10));
+        buffer.push_at(payload(10, 0), start).unwrap();
+        assert!(buffer.push_at(payload(13, 0), start).unwrap().is_empty());
+        assert!(buffer
+            .push_at(payload(12, 0), start + ms(8))
+            .unwrap()
+            .is_empty());
+        assert_eq!(buffer.next_deadline(), Some(start + ms(10)));
+        assert_eq!(
+            sequences(&buffer.release_expired(start + ms(10))),
+            vec![12, 13]
+        );
+    }
+
+    #[test]
+    fn ordered_keys_cross_the_u32_rollover() {
+        let start = Instant::now();
+        let mut buffer = OrderedPayloadBuffer::with_reorder_delay(8, Duration::from_millis(10));
+        buffer.push_at(payload(u32::MAX - 1, 0), start).unwrap();
+        assert!(buffer.push_at(payload(1, 0), start).unwrap().is_empty());
+        assert!(buffer.push_at(payload(0, 0), start).unwrap().is_empty());
+        assert_eq!(
+            sequences(&buffer.push_at(payload(u32::MAX, 0), start).unwrap()),
+            vec![u32::MAX, 0, 1]
+        );
+        assert_eq!(buffer.next_sequence(), Some(2));
+        // Behind the first packet, across the boundary of the first
+        // extension: late, not held.
+        let mut fresh = OrderedPayloadBuffer::new(8);
+        fresh.push_at(payload(0, 0), start).unwrap();
+        assert!(fresh
+            .push_at(payload(u32::MAX, 0), start)
+            .unwrap()
+            .is_empty());
+        assert_eq!(fresh.late_dropped(), 1);
+        assert_eq!(fresh.pending_len(), 0);
+    }
+
+    #[test]
+    fn ordered_overflow_with_an_expired_gap_releases_instead_of_failing() {
+        let start = Instant::now();
+        let mut buffer = OrderedPayloadBuffer::with_reorder_delay(2, Duration::from_millis(10));
+        buffer.push_at(payload(30, 0), start).unwrap();
+        assert!(buffer.push_at(payload(32, 0), start).unwrap().is_empty());
+        assert!(buffer.push_at(payload(33, 0), start).unwrap().is_empty());
+        // The bound trips at 34, but the gap at 31 is due by then.
+        assert_eq!(
+            sequences(&buffer.push_at(payload(34, 0), start + ms(10)).unwrap()),
+            vec![32, 33, 34]
+        );
+        assert_eq!(buffer.skipped_packets(), 1);
+    }
+
+    #[test]
+    fn ordered_with_deadline_skips_the_oldest_gap_at_its_bound() {
+        let start = Instant::now();
+        let mut buffer = OrderedPayloadBuffer::with_deadline(2, Duration::from_secs(1));
+        assert_eq!(buffer.overflow_policy(), OverflowPolicy::SkipOldestGap);
+        buffer.push_at(payload(30, 0), start).unwrap();
+        assert!(buffer.push_at(payload(32, 0), start).unwrap().is_empty());
+        assert!(buffer.push_at(payload(34, 0), start).unwrap().is_empty());
+        // Three held: the gap at 31 goes, 32 is released; 33 still waits.
+        assert_eq!(
+            sequences(&buffer.push_at(payload(35, 0), start).unwrap()),
+            vec![32]
+        );
+        assert_eq!(buffer.pending_len(), 2);
+        assert_eq!(buffer.gaps_skipped(), 1);
+        for sequence in 36..1_000 {
+            buffer.push_at(payload(sequence, 0), start).unwrap();
+            assert!(buffer.pending_len() <= 2);
+        }
+        assert_eq!(buffer.skipped_packets(), 2);
+    }
+
+    #[test]
+    fn ordered_flush_all_releases_in_order() {
+        let start = Instant::now();
+        let mut buffer = OrderedPayloadBuffer::new(8);
+        buffer.push_at(payload(1, 0), start).unwrap();
+        for sequence in [5, 3, 4, 8] {
+            assert!(buffer
+                .push_at(payload(sequence, 0), start)
+                .unwrap()
+                .is_empty());
+        }
+        assert_eq!(buffer.next_deadline(), None);
+        assert_eq!(sequences(&buffer.flush_all()), vec![3, 4, 5, 8]);
+        assert_eq!(buffer.skipped_packets(), 3);
+        assert_eq!(buffer.gaps_skipped(), 2);
+        assert_eq!(buffer.pending_len(), 0);
+        assert_eq!(buffer.next_sequence(), Some(9));
+    }
+
+    #[test]
+    fn ordered_duplicates_are_counted_and_dropped() {
+        let start = Instant::now();
+        let mut buffer = OrderedPayloadBuffer::new(8);
+        buffer.push_at(payload(1, 0), start).unwrap();
+        let mut out = Vec::new();
+        assert_eq!(
+            buffer.push_into(payload(3, 0), start, &mut out),
+            Ok(OrderedPush::Held)
+        );
+        assert_eq!(
+            buffer.push_into(payload(3, 0), start, &mut out),
+            Ok(OrderedPush::Duplicate)
+        );
+        let mut flagged = payload(2, 0);
+        flagged.duplicate = true;
+        assert_eq!(
+            buffer.push_into(flagged, start, &mut out),
+            Ok(OrderedPush::Duplicate)
+        );
+        assert_eq!(buffer.stats().duplicates, 2);
+        assert!(out.is_empty());
+    }
+
+    /// Every payload the buffer accepts comes out once, in strictly
+    /// increasing extended order, and the skipped count fills the gaps.
+    #[test]
+    fn ordered_random_streams_keep_the_invariants() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rand = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..20u32 {
+            let start = Instant::now();
+            let mut buffer = if round % 2 == 0 {
+                OrderedPayloadBuffer::with_deadline(64, Duration::from_millis(20))
+            } else {
+                OrderedPayloadBuffer::with_reorder_delay(4_096, Duration::from_millis(20))
+            };
+            let base = u32::MAX - 500 + round * 7;
+            let mut out = Vec::new();
+            let mut accepted = 0u64;
+            let mut late = 0u64;
+            let mut repairs: Vec<(u64, u32)> = Vec::new();
+            for step in 0..3_000u64 {
+                let now = start + Duration::from_micros(step * 100);
+                let sequence = base.wrapping_add(step as u32);
+                let roll = rand() % 100;
+                if roll < 5 {
+                    // Lost; repaired 2-40 ms later, or never.
+                    if rand() % 4 != 0 {
+                        repairs.push((step + 20 + rand() % 380, sequence));
+                    }
+                } else {
+                    match buffer.push_into(payload(sequence, 0), now, &mut out) {
+                        Ok(OrderedPush::Released | OrderedPush::Held) => accepted += 1,
+                        Ok(OrderedPush::Late) => late += 1,
+                        Ok(OrderedPush::Duplicate) => {}
+                        Err(error) => panic!("{error}"),
+                    }
+                }
+                repairs.sort_unstable();
+                while repairs.first().is_some_and(|&(due, _)| due <= step) {
+                    let (_, repaired) = repairs.remove(0);
+                    match buffer.push_into(payload(repaired, 0), now, &mut out) {
+                        Ok(OrderedPush::Released | OrderedPush::Held) => accepted += 1,
+                        Ok(OrderedPush::Late) => late += 1,
+                        Ok(OrderedPush::Duplicate) => {}
+                        Err(error) => panic!("{error}"),
+                    }
+                }
+                if step % 10 == 0 {
+                    buffer.release_expired_into(now, &mut out);
+                }
+            }
+            buffer.flush_all_into(&mut out);
+            let stats = buffer.stats();
+            assert_eq!(out.len() as u64, accepted);
+            assert_eq!(stats.released, accepted);
+            assert_eq!(stats.late_dropped, late);
+            let first = u64::from(out[0].sequence);
+            let mut previous = first;
+            for released in &out[1..] {
+                let distance = released.sequence.wrapping_sub(previous as u32);
+                assert!((1..1 << 31).contains(&distance));
+                previous += u64::from(distance);
+            }
+            assert_eq!(
+                previous - first + 1,
+                out.len() as u64 + stats.packets_skipped
+            );
+        }
     }
 
     fn schedule(initial: u64, max_retries: u32) -> NackSchedule {
