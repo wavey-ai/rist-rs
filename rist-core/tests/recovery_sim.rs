@@ -11,6 +11,14 @@
 //! (`RecoveryConfig::default()`: bandwidth 100000 kbit/s, rtt_min 5 ms,
 //! rtt_max 500 ms, reorder 15 ms) with the buffer L of each case.
 //!
+//! Cases with `jitter_us` add U(0, jitter) to every one-way delay, both
+//! directions and all traffic, without keeping order; cases with
+//! `reorder_per_mille` also hold back that share of data packets by
+//! U(0, 2 x reorder buffer). The report then counts what reordering costs:
+//! NACKed sequences whose original was not lost (`spur nk`), repairs sent
+//! for them (`spur rx`) and repairs refused by the sender's spacing check
+//! (`refused`); duplicate repairs are `dupx2`.
+//!
 //! Variants, all on the same original-packet loss pattern:
 //! - `defaults`: `RecoveryTuning::default()` (P2/P3/P7/P8 + B1-B4);
 //! - `parity`: `RecoveryTuning::librist_like()` (P2/P3/P7/P8 only);
@@ -26,7 +34,8 @@
 //! `RIST_SIM_CASES=0,2` runs only those cases (indices into `CASES`).
 //! The non-ignored test runs a short case and checks the ordering.
 
-use rist_core::packet::rtcp::NackMode;
+use rist_core::packet::rtcp::{decode_nacks_from_compound, NackMode};
+use rist_core::sequence::extend_near;
 use rist_core::time::ntp_from_unix_duration;
 use rist_core::{
     CongestionControlMode, RecoveryConfig, RecoveryTuning, SenderStats, SimpleReceiverCore,
@@ -47,6 +56,45 @@ struct Case {
     length_ms: u64,
     packets_per_frame: u64,
     loss_per_mille: u64,
+    /// One-way delay jitter, U(0, jitter_us), on every packet.
+    jitter_us: u64,
+    /// Data packets held back by U(0, 2 x reorder buffer), per mille.
+    reorder_per_mille: u64,
+}
+
+/// 2 x the product reorder buffer (15 ms).
+const REORDER_DISPLACEMENT_US: u64 = 30_000;
+
+/// Delay variation of the simulated path. Draws come from their own
+/// generator, and none at all without jitter or reordering, so the loss
+/// pattern and the plain cases stay as they were.
+struct PathModel {
+    rng: Rng,
+    jitter_us: u64,
+    reorder_per_mille: u64,
+}
+
+impl PathModel {
+    fn jitter(&mut self) -> u64 {
+        if self.jitter_us == 0 {
+            return 0;
+        }
+        self.rng.next() % (self.jitter_us + 1)
+    }
+
+    /// One-way delay of a data packet (original or repair).
+    fn data(&mut self, owd: u64) -> u64 {
+        let mut delay = owd + self.jitter();
+        if self.reorder_per_mille > 0 && self.rng.next() % 1_000 < self.reorder_per_mille {
+            delay += self.rng.next() % (REORDER_DISPLACEMENT_US + 1);
+        }
+        delay
+    }
+
+    /// One-way delay of RTCP.
+    fn control(&mut self, owd: u64) -> u64 {
+        owd + self.jitter()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -152,6 +200,11 @@ struct Outcome {
     duplicate_repairs: u64,
     refused_spacing: u64,
     feedback_bytes: u64,
+    nack_entries: u64,
+    /// NACKed sequences (copies included) whose original was not lost.
+    spurious_nack_entries: u64,
+    /// NACK-driven repairs of sequences whose original was not lost.
+    spurious_repairs: u64,
 }
 
 fn run(case: Case, variant: Variant, seconds: u64, seed: u64) -> Outcome {
@@ -211,6 +264,11 @@ fn run(case: Case, variant: Variant, seconds: u64, seed: u64) -> Outcome {
         queue.push(Reverse(Event { at, order, kind }));
     };
     let mut rng = Rng(seed.wrapping_mul(0x2545_f491_4f6c_dd1d));
+    let mut path = PathModel {
+        rng: Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x5bd1_e995),
+        jitter_us: case.jitter_us,
+        reorder_per_mille: case.reorder_per_mille,
+    };
     let lost = |rng: &mut Rng| rng.next() % 1_000 < case.loss_per_mille;
     for frame in 0..frames {
         push(&mut queue, frame * FRAME_INTERVAL_US, Kind::Frame(frame));
@@ -242,7 +300,8 @@ fn run(case: Case, variant: Variant, seconds: u64, seed: u64) -> Outcome {
                         lost_original[sequence as usize] = true;
                         outcome.holes += 1;
                     } else {
-                        push(&mut queue, sent_at + owd, Kind::Data(packet.bytes));
+                        let delay = path.data(owd);
+                        push(&mut queue, sent_at + delay, Kind::Data(packet.bytes));
                     }
                 }
             }
@@ -259,24 +318,43 @@ fn run(case: Case, variant: Variant, seconds: u64, seed: u64) -> Outcome {
                 for response in receiver.handle_rtcp_at(&bytes, ntp(now)).unwrap() {
                     if !lost(&mut rng) {
                         feedback_bytes += response.len() as u64;
-                        push(&mut queue, now + owd, Kind::ToSender(response));
+                        let delay = path.control(owd);
+                        push(&mut queue, now + delay, Kind::ToSender(response));
                     }
                 }
             }
             Kind::ToSender(bytes) => {
                 // The sender reads feedback at its next 250 us service.
                 let served = now.div_ceil(250) * 250;
+                let newest = sender.next_sequence().wrapping_sub(1);
+                for sequence in decode_nacks_from_compound(&bytes).unwrap() {
+                    let sequence = u64::from(extend_near(newest, sequence as u16));
+                    outcome.nack_entries += 1;
+                    if !lost_original
+                        .get(sequence as usize)
+                        .copied()
+                        .unwrap_or(true)
+                    {
+                        outcome.spurious_nack_entries += 1;
+                    }
+                }
                 let outcome_at = sender
                     .handle_feedback_outcome_at(&bytes, ntp(served), at(served))
                     .unwrap();
                 for response in outcome_at.responses {
                     if !lost(&mut rng) {
-                        push(&mut queue, served + owd, Kind::ToReceiver(response));
+                        let delay = path.control(owd);
+                        push(&mut queue, served + delay, Kind::ToReceiver(response));
                     }
                 }
                 for retry in outcome_at.retries {
+                    let sequence = u64::from(retry.sequence) as usize;
+                    if !lost_original.get(sequence).copied().unwrap_or(true) {
+                        outcome.spurious_repairs += 1;
+                    }
                     if !lost(&mut rng) {
-                        push(&mut queue, served + owd, Kind::Data(retry.bytes));
+                        let delay = path.data(owd);
+                        push(&mut queue, served + delay, Kind::Data(retry.bytes));
                     }
                 }
             }
@@ -286,7 +364,8 @@ fn run(case: Case, variant: Variant, seconds: u64, seed: u64) -> Outcome {
                 for packet in packets {
                     if !lost(&mut rng) {
                         feedback_bytes += packet.len() as u64;
-                        push(&mut queue, now + owd, Kind::ToSender(packet));
+                        let delay = path.control(owd);
+                        push(&mut queue, now + delay, Kind::ToSender(packet));
                     }
                 }
                 push(&mut queue, now + 1_000, Kind::ReceiverTick);
@@ -294,13 +373,15 @@ fn run(case: Case, variant: Variant, seconds: u64, seed: u64) -> Outcome {
             Kind::SenderTick => {
                 for repair in sender.poll_repairs_at(at(now)) {
                     if !lost(&mut rng) {
-                        push(&mut queue, now + owd, Kind::Data(repair.bytes));
+                        let delay = path.data(owd);
+                        push(&mut queue, now + delay, Kind::Data(repair.bytes));
                     }
                 }
                 if now % 5_000 == 0 {
                     if let Some(rtcp) = sender.poll_rtcp(at(now), ntp(now)) {
                         if !lost(&mut rng) {
-                            push(&mut queue, now + owd, Kind::ToReceiver(rtcp));
+                            let delay = path.control(owd);
+                            push(&mut queue, now + delay, Kind::ToReceiver(rtcp));
                         }
                     }
                 }
@@ -370,17 +451,19 @@ fn env_u64(name: &str, default: u64) -> u64 {
 
 fn report(case: Case, seconds: u64, seeds: u64) {
     println!(
-        "\n{} (RTT {} ms, L {} ms, {} packets/frame, {} % loss each way, {} s x {} seeds)",
+        "\n{} (RTT {} ms, L {} ms, {} packets/frame, {} % loss each way, jitter {} us, {} % held back, {} s x {} seeds)",
         case.name,
         case.rtt_ms,
         case.length_ms,
         case.packets_per_frame,
         case.loss_per_mille as f64 / 10.0,
+        case.jitter_us,
+        case.reorder_per_mille as f64 / 10.0,
         seconds,
         seeds
     );
     println!(
-        "{:<15} {:>7} {:>7} {:>6} {:>6} {:>8} {:>8} {:>8} {:>7} {:>7} {:>7} {:>6} {:>6} {:>8}",
+        "{:<15} {:>7} {:>7} {:>6} {:>6} {:>8} {:>8} {:>8} {:>7} {:>7} {:>7} {:>6} {:>6} {:>8} {:>7} {:>7} {:>7}",
         "variant",
         "frames",
         "lost",
@@ -394,7 +477,10 @@ fn report(case: Case, seconds: u64, seeds: u64) {
         "nack/s",
         "probe",
         "dupx2",
-        "fb kB/s"
+        "fb kB/s",
+        "spur nk",
+        "spur rx",
+        "refused"
     );
     let mut variants = vec![Variant::Defaults, Variant::Parity, Variant::LibristTiming];
     if std::env::var_os("RIST_SIM_ABLATION").is_some() {
@@ -426,10 +512,13 @@ fn report(case: Case, seconds: u64, seeds: u64) {
             total.duplicate_repairs += outcome.duplicate_repairs;
             total.refused_spacing += outcome.refused_spacing;
             total.feedback_bytes += outcome.feedback_bytes;
+            total.nack_entries += outcome.nack_entries;
+            total.spurious_nack_entries += outcome.spurious_nack_entries;
+            total.spurious_repairs += outcome.spurious_repairs;
         }
         let secs = (seconds * seeds) as f64;
         println!(
-            "{:<15} {:>7} {:>7} {:>6} {:>6} {:>8} {:>8.1} {:>8.1} {:>7.2} {:>7} {:>7.0} {:>6} {:>6} {:>8.1}",
+            "{:<15} {:>7} {:>7} {:>6} {:>6} {:>8} {:>8.1} {:>8.1} {:>7.2} {:>7} {:>7.0} {:>6} {:>6} {:>8.1} {:>7} {:>7} {:>7}",
             variant.name(),
             total.frames,
             total.frames_lost,
@@ -444,17 +533,22 @@ fn report(case: Case, seconds: u64, seeds: u64) {
             total.tail_probes,
             total.duplicate_repairs,
             total.feedback_bytes as f64 / secs / 1_000.0,
+            total.spurious_nack_entries,
+            total.spurious_repairs,
+            total.refused_spacing,
         );
     }
 }
 
-const CASES: [Case; 6] = [
+const CASES: [Case; 8] = [
     Case {
         name: "2160p25 rtt1 l40",
         rtt_ms: 1,
         length_ms: 40,
         packets_per_frame: 96,
         loss_per_mille: 50,
+        jitter_us: 0,
+        reorder_per_mille: 0,
     },
     Case {
         name: "2160p25 rtt1 l40 1%",
@@ -462,6 +556,8 @@ const CASES: [Case; 6] = [
         length_ms: 40,
         packets_per_frame: 96,
         loss_per_mille: 10,
+        jitter_us: 0,
+        reorder_per_mille: 0,
     },
     Case {
         name: "2160p160 rtt30 l120",
@@ -469,6 +565,8 @@ const CASES: [Case; 6] = [
         length_ms: 120,
         packets_per_frame: 630,
         loss_per_mille: 50,
+        jitter_us: 0,
+        reorder_per_mille: 0,
     },
     Case {
         name: "2160p25 rtt100 l400",
@@ -476,6 +574,8 @@ const CASES: [Case; 6] = [
         length_ms: 400,
         packets_per_frame: 96,
         loss_per_mille: 50,
+        jitter_us: 0,
+        reorder_per_mille: 0,
     },
     Case {
         name: "2160p25 rtt250 l1000",
@@ -483,6 +583,8 @@ const CASES: [Case; 6] = [
         length_ms: 1_000,
         packets_per_frame: 96,
         loss_per_mille: 50,
+        jitter_us: 0,
+        reorder_per_mille: 0,
     },
     Case {
         name: "2160p25 rtt30 l1000 (product L)",
@@ -490,6 +592,26 @@ const CASES: [Case; 6] = [
         length_ms: 1_000,
         packets_per_frame: 96,
         loss_per_mille: 50,
+        jitter_us: 0,
+        reorder_per_mille: 0,
+    },
+    Case {
+        name: "2160p25 rtt5 l200 1% jitter3 reorder1%",
+        rtt_ms: 5,
+        length_ms: 200,
+        packets_per_frame: 96,
+        loss_per_mille: 10,
+        jitter_us: 3_000,
+        reorder_per_mille: 10,
+    },
+    Case {
+        name: "2160p25 rtt30 l1000 5% jitter2 reorder1% (product L)",
+        rtt_ms: 30,
+        length_ms: 1_000,
+        packets_per_frame: 96,
+        loss_per_mille: 50,
+        jitter_us: 2_000,
+        reorder_per_mille: 10,
     },
 ];
 
@@ -532,4 +654,65 @@ fn defaults_deliver_more_frames_in_time_than_parity_at_rtt1_l40() {
         parity <= librist,
         "parity {parity} librist timing {librist}"
     );
+}
+
+/// Reordering and jitter must not make the extras misfire: on a path with
+/// 3 ms of jitter both ways and 1 % of the data held back by up to twice
+/// the reorder buffer, the defaults (adaptive first NACK, NACK copies,
+/// duplicate repairs, tail probes) repair at most a little more of what
+/// was never lost than librist-like recovery does, the spacing check
+/// absorbs the NACK copies, duplicate repairs stay rare, and no more
+/// frames are missed.
+#[test]
+fn reordering_and_jitter_keep_spurious_repairs_bounded() {
+    let case = CASES[6];
+    assert!(case.jitter_us > 0 && case.reorder_per_mille > 0);
+    let totals = |variant| {
+        let mut total = Outcome::default();
+        for seed in 1..=2 {
+            let outcome = run(case, variant, 3, seed);
+            total.frames_lost += outcome.frames_lost + outcome.frames_late;
+            total.holes += outcome.holes;
+            total.spurious_repairs += outcome.spurious_repairs;
+            total.spurious_nack_entries += outcome.spurious_nack_entries;
+            total.duplicate_repairs += outcome.duplicate_repairs;
+            total.refused_spacing += outcome.refused_spacing;
+            total.nack_copies += outcome.nack_copies;
+        }
+        total
+    };
+    let defaults = totals(Variant::Defaults);
+    let parity = totals(Variant::Parity);
+    let summary = |name: &str, total: &Outcome| {
+        format!(
+            "{name}: missed {} holes {} spurious NACKed {} spurious repairs {} \
+             duplicate repairs {} refused by spacing {} NACK copies {}",
+            total.frames_lost,
+            total.holes,
+            total.spurious_nack_entries,
+            total.spurious_repairs,
+            total.duplicate_repairs,
+            total.refused_spacing,
+            total.nack_copies
+        )
+    };
+    let report = format!(
+        "{}\n{}",
+        summary("defaults", &defaults),
+        summary("parity", &parity)
+    );
+    // Reordering beyond the reorder buffer costs both the same repairs.
+    assert!(parity.spurious_repairs > 0, "{report}");
+    assert!(
+        defaults.spurious_repairs * 100 <= parity.spurious_repairs * 115 + 1_000,
+        "{report}"
+    );
+    // The copies are what the sender's spacing check refuses.
+    assert!(defaults.refused_spacing > 0, "{report}");
+    assert!(defaults.refused_spacing <= defaults.nack_copies, "{report}");
+    assert!(
+        defaults.duplicate_repairs * 10 <= defaults.holes,
+        "{report}"
+    );
+    assert!(defaults.frames_lost <= parity.frames_lost, "{report}");
 }
