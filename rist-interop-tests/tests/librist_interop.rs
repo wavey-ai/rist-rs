@@ -173,6 +173,127 @@ fn librist_simple_sender_to_pure_rust_receiver() {
     }
 }
 
+/// Binds an even/odd UDP pair on loopback (Simple profile RTP + RTCP).
+fn bind_udp_pair() -> (UdpSocket, UdpSocket) {
+    for _ in 0..16 {
+        let port = next_even_test_port_pair();
+        if let (Ok(rtp), Ok(rtcp)) = (
+            UdpSocket::bind((Ipv4Addr::LOCALHOST, port)),
+            UdpSocket::bind((Ipv4Addr::LOCALHOST, port + 1)),
+        ) {
+            rtp.set_nonblocking(true).unwrap();
+            rtcp.set_nonblocking(true).unwrap();
+            return (rtp, rtcp);
+        }
+    }
+    panic!("no even UDP port pair");
+}
+
+/// P9 as the product runs it: a bound `SimpleMioReceiver` that only calls
+/// `try_recv_payload` and `poll_rtcp_and_send`, behind a Simple-profile
+/// relay that drops every 10th first transmission from a librist Simple
+/// sender. The receiver learns the RTCP port from the RTP source, NACKs,
+/// and librist repairs every drop.
+#[test]
+fn librist_simple_sender_with_loss_to_bound_pure_rust_receiver() {
+    if !interop_enabled() {
+        return;
+    }
+    let _guard = lock_interop();
+    // Ends past the last drop: a lost last packet has no successor to
+    // reveal it (that is the sender's tail probe, which librist lacks).
+    const PACKETS: usize = 65;
+    const DROP_EVERY: u16 = 10;
+    let flow_id = 0x1122_3344;
+    let mut receiver =
+        SimpleMioReceiver::bind(loopback_any(), flow_id, "rust", NackMode::Range).unwrap();
+    let receiver_rtp = receiver.local_addr().unwrap();
+    let receiver_rtcp = receiver.rtcp_local_addr().unwrap();
+    // Faces librist.
+    let (in_rtp, in_rtcp) = bind_udp_pair();
+    // Faces the receiver: the RTCP socket is the RTP port + 1, which is
+    // where the receiver must send its NACKs.
+    let (out_rtp, out_rtcp) = bind_udp_pair();
+
+    let sender_url = format!("rist://127.0.0.1:{}", in_rtp.local_addr().unwrap().port());
+    let mut sender = rist::Sender::new(rist::Profile::Simple).unwrap();
+    sender.add_peer(&sender_url).unwrap();
+    sender.start().unwrap();
+
+    let mut librist_rtcp: Option<SocketAddr> = None;
+    let mut highest: Option<u16> = None;
+    let mut dropped = HashSet::new();
+    let mut repaired = 0usize;
+    let mut relay = |dropped: &mut HashSet<u16>, repaired: &mut usize| {
+        let mut buf = [0u8; 2048];
+        while let Ok((len, _)) = in_rtp.recv_from(&mut buf) {
+            let sequence = u16::from_be_bytes([buf[2], buf[3]]);
+            let first = highest.map_or(true, |h| sequence.wrapping_sub(h) as i16 > 0);
+            if first {
+                highest = Some(sequence);
+                if sequence % DROP_EVERY == DROP_EVERY - 1 {
+                    dropped.insert(sequence);
+                    continue;
+                }
+            } else if dropped.contains(&sequence) {
+                *repaired += 1;
+            }
+            out_rtp.send_to(&buf[..len], receiver_rtp).unwrap();
+        }
+        while let Ok((len, from)) = in_rtcp.recv_from(&mut buf) {
+            librist_rtcp = Some(from);
+            out_rtcp.send_to(&buf[..len], receiver_rtcp).unwrap();
+        }
+        while let Ok((len, _)) = out_rtcp.recv_from(&mut buf) {
+            if let Some(to) = librist_rtcp {
+                in_rtcp.send_to(&buf[..len], to).unwrap();
+            }
+        }
+    };
+
+    let mut received = HashSet::new();
+    let mut buf = [0u8; 1500];
+    for index in 0..PACKETS {
+        sender.send(&[index as u8; 1316]).unwrap();
+        thread::sleep(Duration::from_millis(2));
+        relay(&mut dropped, &mut repaired);
+        while let Some((_from, payload)) = receiver.try_recv_payload(&mut buf).unwrap() {
+            received.insert(payload.payload[0]);
+        }
+        receiver
+            .poll_rtcp_and_send(Instant::now(), ntp_now())
+            .unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while received.len() < PACKETS {
+        relay(&mut dropped, &mut repaired);
+        while let Some((_from, payload)) = receiver.try_recv_payload(&mut buf).unwrap() {
+            received.insert(payload.payload[0]);
+        }
+        receiver
+            .poll_rtcp_and_send(Instant::now(), ntp_now())
+            .unwrap();
+        assert!(
+            Instant::now() < deadline,
+            "received {} of {PACKETS}; dropped {dropped:?}, repaired {repaired}; receiver {:?}",
+            received.len(),
+            receiver.stats()
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        dropped.len() >= PACKETS / usize::from(DROP_EVERY) - 1,
+        "{dropped:?}"
+    );
+    assert!(
+        repaired >= dropped.len(),
+        "repaired {repaired} of {dropped:?}"
+    );
+    let stats = receiver.stats();
+    assert!(stats.nack_packets > 0, "{stats:?}");
+    assert_eq!(receiver.peer_addr(), Some(out_rtp.local_addr().unwrap()));
+}
+
 #[test]
 fn librist_simple_sender_answers_pure_rust_receiver_echo_requests() {
     if !interop_enabled() {
