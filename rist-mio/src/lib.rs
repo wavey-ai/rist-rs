@@ -1231,8 +1231,11 @@ pub struct SimpleMioReceiver {
     configured_peer: Option<SocketAddr>,
 }
 
-/// Mio readiness for a Simple Profile receiver refers to its RTP payload socket.
-/// RTCP processing remains deadline-driven through the receiver methods.
+/// Mio readiness for a Simple Profile receiver covers both its sockets under
+/// the one token: RTP payloads and the RTCP the sender sends (echo requests
+/// and answers, sender reports). [`SimpleMioReceiver::try_recv_event`] reads
+/// both; RTCP sending stays deadline-driven
+/// ([`SimpleMioReceiver::next_timeout`]).
 impl Source for SimpleMioReceiver {
     fn register(
         &mut self,
@@ -1240,7 +1243,8 @@ impl Source for SimpleMioReceiver {
         token: Token,
         interests: Interest,
     ) -> io::Result<()> {
-        self.rtp_socket.register(registry, token, interests)
+        self.rtp_socket.register(registry, token, interests)?;
+        self.rtcp_socket.register(registry, token, interests)
     }
 
     fn reregister(
@@ -1249,12 +1253,26 @@ impl Source for SimpleMioReceiver {
         token: Token,
         interests: Interest,
     ) -> io::Result<()> {
-        self.rtp_socket.reregister(registry, token, interests)
+        self.rtp_socket.reregister(registry, token, interests)?;
+        self.rtcp_socket.reregister(registry, token, interests)
     }
 
     fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
-        self.rtp_socket.deregister(registry)
+        self.rtp_socket.deregister(registry)?;
+        self.rtcp_socket.deregister(registry)
     }
+}
+
+/// One datagram read by [`SimpleMioReceiver::try_recv_event`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SimpleReceiverEvent {
+    Payload {
+        from: SocketAddr,
+        payload: ReceivedPayload,
+    },
+    /// An RTCP compound from the sender, handled; `responses` answers (echo
+    /// responses) were sent back.
+    Rtcp { from: SocketAddr, responses: usize },
 }
 
 impl SimpleMioReceiver {
@@ -1319,12 +1337,50 @@ impl SimpleMioReceiver {
         let Some((from, packet)) = self.rtp_socket.recv_datagram(buf)? else {
             return Ok(None);
         };
+        Ok(self
+            .accept_rtp_datagram(from, packet)?
+            .map(|payload| (from, payload)))
+    }
+
+    /// `None` for a datagram from a peer other than the configured one.
+    fn accept_rtp_datagram(
+        &mut self,
+        from: SocketAddr,
+        packet: &[u8],
+    ) -> io::Result<Option<ReceivedPayload>> {
         if self.configured_peer.is_some_and(|peer| peer != from) {
             return Ok(None);
         }
         let payload = self.core.accept_packet(packet).map_err(core_to_io_error)?;
         self.last_rtp_peer = Some(from);
-        Ok(Some((from, payload)))
+        if self.last_rtcp_peer.is_none() {
+            // A bound receiver that only reads payloads still has a place
+            // to send NACKs and reports: the sender's RTCP port is the one
+            // after its RTP port (RFC 3550, as librist sends from).
+            self.last_rtcp_peer = simple_rtcp_addr(from).ok();
+        }
+        Ok(Some(payload))
+    }
+
+    /// Reads one datagram from either socket: a payload first, else an RTCP
+    /// compound (answered as [`Self::try_recv_rtcp_and_respond`] does).
+    /// `None` only when both sockets are drained, so a caller that
+    /// registers the receiver with mio and loops on this until `None`
+    /// serves both.
+    pub fn try_recv_event(&mut self, buf: &mut [u8]) -> io::Result<Option<SimpleReceiverEvent>> {
+        while let Some((from, packet)) = self.rtp_socket.recv_datagram(buf)? {
+            if let Some(payload) = self.accept_rtp_datagram(from, packet)? {
+                return Ok(Some(SimpleReceiverEvent::Payload { from, payload }));
+            }
+        }
+        loop {
+            let Some((from, packet)) = self.rtcp_socket.recv_datagram(buf)? else {
+                return Ok(None);
+            };
+            if let Some(responses) = self.handle_rtcp_datagram(from, packet)? {
+                return Ok(Some(SimpleReceiverEvent::Rtcp { from, responses }));
+            }
+        }
     }
 
     pub fn set_recovery_config(
@@ -1410,6 +1466,15 @@ impl SimpleMioReceiver {
         let Some((from, packet)) = self.rtcp_socket.recv_datagram(buf)? else {
             return Ok(None);
         };
+        self.handle_rtcp_datagram(from, packet)
+    }
+
+    /// `None` for a datagram from a peer other than the configured one.
+    fn handle_rtcp_datagram(
+        &mut self,
+        from: SocketAddr,
+        packet: &[u8],
+    ) -> io::Result<Option<usize>> {
         if self
             .configured_peer
             .and_then(|peer| simple_rtcp_addr(peer).ok())
@@ -4163,6 +4228,108 @@ mod tests {
         let stats = receiver.stats();
         assert_eq!(stats.nack_packets, 2);
         assert_eq!(stats.nack_entries_sent, 250);
+    }
+
+    /// P9: a bound Simple receiver driven like the product (payload reads
+    /// and `poll_rtcp_and_send` only) learns the sender's RTCP port from
+    /// its RTP source and NACKs a lost packet, which the sender repairs.
+    #[test]
+    fn bound_simple_receiver_nacks_from_payload_reads_alone() {
+        let flow_id = 0x1122_3344;
+        let mut receiver =
+            SimpleMioReceiver::bind(loopback_any(), flow_id, "receiver", NackMode::Range).unwrap();
+        receiver.set_recovery_tuning(static_tuning());
+        assert_eq!(receiver.next_timeout(), None);
+        let mut sender =
+            SimpleMioSender::connect(loopback_any(), receiver.local_addr().unwrap(), flow_id, 64)
+                .unwrap();
+        sender.set_recovery_tuning(static_tuning());
+        let ntp = ntp_now();
+        let start = Instant::now();
+        sender.send_payload(b"zero", ntp, start).unwrap();
+        // Sequence 1 is lost: built (so it is in the history), never sent.
+        sender.build_payload(b"one", ntp, start);
+        sender.send_payload(b"two", ntp, start).unwrap();
+
+        let mut buf = [0_u8; 2048];
+        let mut received = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while received.len() < 3 {
+            while let Some((_from, payload)) = receiver.try_recv_payload(&mut buf).unwrap() {
+                received.push((payload.sequence, payload.recovered));
+            }
+            receiver
+                .poll_rtcp_and_send(Instant::now(), ntp_now())
+                .unwrap();
+            while sender
+                .try_recv_feedback_and_retransmit(&mut buf)
+                .unwrap()
+                .is_some()
+            {}
+            assert!(
+                Instant::now() < deadline,
+                "no repair: received {received:?}, receiver {:?}, sender {:?}",
+                receiver.stats(),
+                sender.stats()
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            receiver.peer_addr(),
+            Some(sender.local_addr().unwrap()),
+            "the RTP peer"
+        );
+        assert_eq!(
+            receiver.last_rtcp_peer,
+            Some(sender.rtcp_local_addr().unwrap())
+        );
+        assert_eq!(received, vec![(0, false), (2, false), (1, true)]);
+        assert!(receiver.stats().nack_packets >= 1);
+        assert_eq!(sender.stats().retransmitted_packets, 1);
+    }
+
+    /// P9: one mio registration wakes for RTCP as well as RTP, and
+    /// `try_recv_event` serves both sockets until both are drained.
+    #[test]
+    fn simple_receiver_source_wakes_for_rtcp_and_try_recv_event_reads_both() {
+        let flow_id = 0x1122_3344;
+        let mut receiver =
+            SimpleMioReceiver::bind(loopback_any(), flow_id, "receiver", NackMode::Range).unwrap();
+        let mut poll = mio::Poll::new().unwrap();
+        let mut events = mio::Events::with_capacity(8);
+        poll.registry()
+            .register(&mut receiver, Token(7), Interest::READABLE)
+            .unwrap();
+        let mut sender =
+            SimpleMioSender::connect(loopback_any(), receiver.local_addr().unwrap(), flow_id, 64)
+                .unwrap();
+        // An echo request alone, on the RTCP port.
+        sender.send_echo_request_at(ntp_now()).unwrap();
+        poll.poll(&mut events, Some(Duration::from_secs(2)))
+            .unwrap();
+        assert!(events.iter().any(|event| event.token() == Token(7)));
+
+        let mut buf = [0_u8; 2048];
+        let event = receiver.try_recv_event(&mut buf).unwrap();
+        let Some(SimpleReceiverEvent::Rtcp { from, responses }) = event else {
+            panic!("expected RTCP, got {event:?}");
+        };
+        assert_eq!(from, sender.rtcp_local_addr().unwrap());
+        assert_eq!(responses, 1, "the echo request is answered");
+        assert_eq!(receiver.try_recv_event(&mut buf).unwrap(), None);
+
+        sender
+            .send_payload(b"payload", ntp_now(), Instant::now())
+            .unwrap();
+        poll.poll(&mut events, Some(Duration::from_secs(2)))
+            .unwrap();
+        let event = receiver.try_recv_event(&mut buf).unwrap();
+        assert!(
+            matches!(event, Some(SimpleReceiverEvent::Payload { ref payload, .. }) if payload.sequence == 0),
+            "{event:?}"
+        );
+        assert_eq!(receiver.try_recv_event(&mut buf).unwrap(), None);
+        poll.registry().deregister(&mut receiver).unwrap();
     }
 
     fn loopback_any() -> SocketAddr {
