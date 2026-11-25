@@ -20,6 +20,9 @@ pub const ECHO_REQUEST: u8 = 2;
 pub const ECHO_RESPONSE: u8 = 3;
 pub const MAX_NACK_RANGE_PACKETS: usize = 256;
 pub const MAX_NACK_PACKET_REQUESTS: usize = 4096;
+/// Records per NACK packet; librist sends at most 200 sequences per NACK
+/// (`RIST_MAX_NACKS`).
+pub const MAX_NACK_RECORDS_PER_PACKET: usize = 200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RtcpHeader {
@@ -206,6 +209,12 @@ pub fn encode_echo(echo: Echo, out: &mut Vec<u8>) {
     out.extend_from_slice(&delay.to_be_bytes());
 }
 
+/// Encodes one NACK packet for `missing`.
+///
+/// The sequences are encoded in ascending wrapping order (input in any order
+/// is sorted relative to its first element and de-duplicated). At most
+/// [`MAX_NACK_PACKET_REQUESTS`] sequences are represented, the oldest ones;
+/// use [`encode_nack_chunk`] to split a longer list over several packets.
 pub fn encode_nack(mode: NackMode, flow_id: u32, missing: &[u32], out: &mut Vec<u8>) {
     if missing.is_empty() {
         return;
@@ -214,36 +223,109 @@ pub fn encode_nack(mode: NackMode, flow_id: u32, missing: &[u32], out: &mut Vec<
     // Simple/Main NACK records carry the RTP low 16 bits. The sender maps
     // them back into its current full-sequence history window. PTYPE 204
     // subtype 1 is not a sequence-extension record in librist v0.2.20.
-    encode_nack_records(mode, flow_id, missing, out);
+    if is_strictly_ascending(missing) {
+        encode_nack_chunk(mode, flow_id, missing, usize::MAX, out);
+    } else {
+        let first = missing[0];
+        let mut sorted = missing.to_vec();
+        sorted.sort_unstable_by_key(|sequence| sequence.wrapping_sub(first) as i32);
+        sorted.dedup();
+        encode_nack_chunk(mode, flow_id, &sorted, usize::MAX, out);
+    }
 }
 
-fn encode_nack_records(mode: NackMode, flow_id: u32, missing: &[u32], out: &mut Vec<u8>) {
-    let missing = &missing[..missing.len().min(MAX_NACK_PACKET_REQUESTS)];
-    let records = match mode {
-        NackMode::Range => range_records(missing),
-        NackMode::Bitmask => bitmask_records(missing),
-    };
-    let length_words_minus_one = 2 + records.len() as u16;
+/// Encodes one NACK packet from the leading sequences of `missing` and
+/// returns how many of them it covers.
+///
+/// `missing` should be in ascending wrapping order, oldest first (as
+/// [`crate::MissingTracker::take_due_nacks`] returns it); other orders are
+/// still encoded correctly, only less compactly. The packet holds at most
+/// `max_records` records and represents at most [`MAX_NACK_PACKET_REQUESTS`]
+/// sequences (rist-rs senders reject a larger NACK compound). With
+/// [`MAX_NACK_RECORDS_PER_PACKET`] records, the RR + SDES + NACK compound
+/// stays below a 1500-byte MTU. Nothing is written for an empty input or a
+/// zero record limit.
+pub fn encode_nack_chunk(
+    mode: NackMode,
+    flow_id: u32,
+    missing: &[u32],
+    max_records: usize,
+    out: &mut Vec<u8>,
+) -> usize {
+    if missing.is_empty() || max_records == 0 {
+        return 0;
+    }
+    let header_at = out.len();
     match mode {
         NackMode::Range => {
             out.push(RTCP_NACK_RANGE_FLAGS);
             out.push(PTYPE_NACK_CUSTOM);
-            out.extend_from_slice(&length_words_minus_one.to_be_bytes());
+            out.extend_from_slice(&[0, 0]);
             out.extend_from_slice(&flow_id.to_be_bytes());
             out.extend_from_slice(b"RIST");
         }
         NackMode::Bitmask => {
             out.push(RTCP_NACK_BITMASK_FLAGS);
             out.push(PTYPE_NACK_BITMASK);
-            out.extend_from_slice(&length_words_minus_one.to_be_bytes());
+            out.extend_from_slice(&[0, 0]);
             out.extend_from_slice(&0u32.to_be_bytes());
             out.extend_from_slice(&flow_id.to_be_bytes());
         }
     }
-    for record in records {
-        out.extend_from_slice(&record.start.to_be_bytes());
-        out.extend_from_slice(&record.extra.to_be_bytes());
+
+    let mut records = 1_usize;
+    let mut start = missing[0];
+    let mut extra = 0_u16;
+    let mut consumed = 1_usize;
+    for &sequence in &missing[1..] {
+        if consumed >= MAX_NACK_PACKET_REQUESTS {
+            break;
+        }
+        let offset = sequence.wrapping_sub(start);
+        match mode {
+            NackMode::Range
+                if offset == u32::from(extra) + 1
+                    && usize::from(extra) + 1 < MAX_NACK_RANGE_PACKETS =>
+            {
+                extra += 1;
+            }
+            NackMode::Bitmask if (1..=16).contains(&offset) => {
+                extra |= 1 << (offset - 1);
+            }
+            _ => {
+                if records == max_records {
+                    break;
+                }
+                push_nack_record(out, start, extra);
+                records += 1;
+                start = sequence;
+                extra = 0;
+            }
+        }
+        consumed += 1;
     }
+    push_nack_record(out, start, extra);
+    let length_words_minus_one = u16::try_from(2 + records).unwrap_or(u16::MAX);
+    out[header_at + 2..header_at + 4].copy_from_slice(&length_words_minus_one.to_be_bytes());
+    consumed
+}
+
+/// The number of leading sequences of `missing` that one NACK packet of at
+/// most `max_records` records can carry (see [`encode_nack_chunk`]).
+pub fn nack_chunk_len(mode: NackMode, missing: &[u32], max_records: usize) -> usize {
+    let mut scratch = Vec::new();
+    encode_nack_chunk(mode, 0, missing, max_records, &mut scratch)
+}
+
+fn push_nack_record(out: &mut Vec<u8>, start: u32, extra: u16) {
+    out.extend_from_slice(&(start as u16).to_be_bytes());
+    out.extend_from_slice(&extra.to_be_bytes());
+}
+
+fn is_strictly_ascending(sequences: &[u32]) -> bool {
+    sequences
+        .windows(2)
+        .all(|pair| (pair[1].wrapping_sub(pair[0]) as i32) > 0)
 }
 
 pub fn encode_nack_compound(mode: NackMode, flow_id: u32, cname: &str, missing: &[u32]) -> Vec<u8> {
@@ -434,67 +516,6 @@ fn read_u32(input: &[u8], offset: usize) -> u32 {
         input[offset + 2],
         input[offset + 3],
     ])
-}
-
-fn range_records(missing: &[u32]) -> Vec<NackRecord> {
-    let mut sorted = missing.to_vec();
-    sorted.sort_unstable();
-    sorted.dedup();
-    let mut records = Vec::new();
-    let mut iter = sorted.into_iter();
-    let Some(first) = iter.next() else {
-        return records;
-    };
-    let mut start = first as u16;
-    let mut last = start;
-    let mut extra = 0u16;
-
-    for sequence in iter {
-        let seq = sequence as u16;
-        if usize::from(extra) + 1 < MAX_NACK_RANGE_PACKETS && seq == last.wrapping_add(1) {
-            extra = extra.wrapping_add(1);
-        } else {
-            records.push(NackRecord { start, extra });
-            start = seq;
-            extra = 0;
-        }
-        last = seq;
-    }
-    records.push(NackRecord { start, extra });
-    records
-}
-
-fn bitmask_records(missing: &[u32]) -> Vec<NackRecord> {
-    let mut sorted = missing.to_vec();
-    sorted.sort_unstable();
-    sorted.dedup();
-    let mut records = Vec::new();
-    let mut iter = sorted.into_iter();
-    let Some(first) = iter.next() else {
-        return records;
-    };
-    let mut start = first;
-    let mut extra = 0u16;
-    let mut boundary = start + 16;
-
-    for sequence in iter {
-        if start < sequence && sequence <= boundary {
-            extra |= 1 << (sequence - start - 1);
-        } else {
-            records.push(NackRecord {
-                start: start as u16,
-                extra,
-            });
-            start = sequence;
-            extra = 0;
-            boundary = start + 16;
-        }
-    }
-    records.push(NackRecord {
-        start: start as u16,
-        extra,
-    });
-    records
 }
 
 fn decode_range_nack(input: &[u8], seq_msb: u32) -> Result<Vec<u32>> {
@@ -735,5 +756,85 @@ mod tests {
                 maximum: MAX_NACK_PACKET_REQUESTS
             }
         );
+    }
+
+    fn low16(sequences: &[u32]) -> Vec<u32> {
+        sequences.iter().map(|sequence| sequence & 0xffff).collect()
+    }
+
+    #[test]
+    fn nack_chunks_respect_record_and_sequence_limits_in_both_modes() {
+        let isolated = (0..10_000_u32).map(|n| 100 + 2 * n).collect::<Vec<_>>();
+        let contiguous = (0..10_000_u32).map(|n| 70_000 + n).collect::<Vec<_>>();
+        for (mode, missing, per_packet) in [
+            (NackMode::Range, &isolated, 200),
+            (NackMode::Bitmask, &isolated, 200 * 9),
+            (NackMode::Range, &contiguous, MAX_NACK_PACKET_REQUESTS),
+            (NackMode::Bitmask, &contiguous, 200 * 17),
+        ] {
+            let mut offset = 0;
+            while offset < missing.len() {
+                let mut packet = Vec::new();
+                encode_empty_receiver_report(1, &mut packet);
+                encode_sdes_cname(1, "receiver", &mut packet);
+                let taken = encode_nack_chunk(
+                    mode,
+                    1,
+                    &missing[offset..],
+                    MAX_NACK_RECORDS_PER_PACKET,
+                    &mut packet,
+                );
+                assert_eq!(taken, per_packet.min(missing.len() - offset), "{mode:?}");
+                assert_eq!(
+                    nack_chunk_len(mode, &missing[offset..], MAX_NACK_RECORDS_PER_PACKET),
+                    taken
+                );
+                assert!(packet.len() <= 1_200, "{mode:?}: {} bytes", packet.len());
+                let decoded = decode_nacks_from_compound(&packet).unwrap();
+                assert_eq!(decoded, low16(&missing[offset..offset + taken]), "{mode:?}");
+                offset += taken;
+            }
+        }
+    }
+
+    #[test]
+    fn nack_records_keep_wrapping_order_across_the_u32_rollover() {
+        let ordered = [u32::MAX - 1, u32::MAX, 0, 1];
+        for input in [ordered.to_vec(), vec![1, u32::MAX, 0, u32::MAX - 1, 0]] {
+            let mut out = Vec::new();
+            encode_nack(NackMode::Range, 9, &input, &mut out);
+            // One range record: start 0xfffe plus three more.
+            assert_eq!(&out[2..4], &[0, 3]);
+            assert_eq!(&out[12..16], &[0xff, 0xfe, 0, 3]);
+            assert_eq!(decode_nack(&out, 0).unwrap(), low16(&ordered));
+        }
+    }
+
+    #[test]
+    fn bitmask_records_near_u32_max_do_not_overflow() {
+        let missing = [u32::MAX - 2, u32::MAX, 3, u32::MAX - 20];
+        let mut out = Vec::new();
+        encode_nack(NackMode::Bitmask, 9, &missing, &mut out);
+        assert_eq!(
+            decode_nack(&out, 0).unwrap(),
+            low16(&[u32::MAX - 20, u32::MAX - 2, u32::MAX, 3])
+        );
+        let mut out = Vec::new();
+        assert_eq!(
+            encode_nack_chunk(NackMode::Bitmask, 9, &[u32::MAX, 15], 1, &mut out),
+            2
+        );
+        assert_eq!(decode_nack(&out, 0).unwrap(), vec![0xffff, 15]);
+    }
+
+    #[test]
+    fn legacy_encode_nack_keeps_the_oldest_4096_sequences() {
+        let newest_first = (0..5_000_u32).rev().map(|n| 2 * n).collect::<Vec<_>>();
+        let mut out = Vec::new();
+        encode_nack(NackMode::Range, 1, &newest_first, &mut out);
+        let decoded = decode_nack(&out, 0).unwrap();
+        assert_eq!(decoded.len(), MAX_NACK_PACKET_REQUESTS);
+        assert_eq!(decoded[0], 0);
+        assert_eq!(*decoded.last().unwrap(), 2 * 4095);
     }
 }
