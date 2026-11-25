@@ -10,6 +10,7 @@ use crate::packet::rtp::{
     RTP_PAYLOAD_TYPE_MPEGTS,
 };
 use crate::recovery::{NackSchedule, SenderHistory, MAX_TRACKED_HOLE_DISTANCE};
+use crate::rtt::RttEstimator;
 use crate::sequence::extend_near;
 use crate::stats::{ReceiverStats, SenderStats};
 use crate::time::{calculate_rtt_micros, mpegts_rtp_timestamp, ntp_now};
@@ -20,7 +21,9 @@ use std::time::{Duration, Instant};
 
 pub const DEFAULT_RTCP_FEEDBACK_INTERVAL: Duration = Duration::from_millis(20);
 pub const DEFAULT_RTCP_REPORT_INTERVAL: Duration = Duration::from_secs(1);
-pub const DEFAULT_RTCP_ECHO_INTERVAL: Duration = Duration::from_secs(1);
+/// Echo requests every 100 ms, as librist (`RIST_PING_INTERVAL`), so both
+/// ends keep a current RTT.
+pub const DEFAULT_RTCP_ECHO_INTERVAL: Duration = Duration::from_millis(100);
 /// NACK packets a receiver flow sends at most per feedback poll.
 pub const MAX_NACK_PACKETS_PER_POLL: usize = 64;
 
@@ -37,12 +40,25 @@ pub struct OutboundPacket {
     pub bytes: Vec<u8>,
 }
 
+/// What a sender owes the peer for one feedback compound.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FeedbackOutcome {
+    /// Retransmissions of the NACKed sequences that passed the sender's
+    /// checks (send these after `responses`).
+    pub retries: Vec<OutboundPacket>,
+    /// RTCP compounds answering echo requests: an empty receiver report,
+    /// SDES and the echo response with delay 0, as librist builds them
+    /// (`lr/udp.c:853-867`).
+    pub responses: Vec<Vec<u8>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SimpleSenderPeerState {
     retry_slots: Vec<SenderPeerRetrySlot>,
     retry_mask: usize,
     retry_window_started: Instant,
     retry_window_bytes: u64,
+    rtt: RttEstimator,
     stats: SenderStats,
 }
 
@@ -72,12 +88,18 @@ impl SimpleSenderPeerState {
             retry_mask: capacity.saturating_sub(1),
             retry_window_started: Instant::now(),
             retry_window_bytes: 0,
+            rtt: RttEstimator::new(),
             stats: SenderStats::new(flow_id),
         }
     }
 
     pub fn stats(&self) -> SenderStats {
         self.stats
+    }
+
+    /// The peer's RTT as measured by this sender's echo requests.
+    pub fn rtt(&self) -> RttEstimator {
+        self.rtt
     }
 
     pub fn record_send(&mut self, bytes: usize) {
@@ -356,6 +378,8 @@ impl SimpleSenderCore {
         )
     }
 
+    /// Retransmissions for one feedback compound. Echo requests in it are
+    /// not answered here; use [`Self::handle_feedback_outcome_at`].
     pub fn handle_feedback(&mut self, packet: &[u8]) -> Result<Vec<OutboundPacket>> {
         self.handle_feedback_at(packet, ntp_now())
     }
@@ -365,11 +389,29 @@ impl SimpleSenderCore {
         packet: &[u8],
         now_ntp: u64,
     ) -> Result<Vec<OutboundPacket>> {
-        self.recovery_state.stats.record_feedback();
-        let reference = self.next_sequence.wrapping_sub(1);
-        let sequences =
-            decode_sender_feedback(packet, now_ntp, reference, &mut self.recovery_state.stats)?;
-        Ok(self.retransmit(&sequences))
+        Ok(self
+            .handle_feedback_outcome_at(packet, now_ntp, Instant::now())?
+            .retries)
+    }
+
+    /// Handles one feedback compound: takes RTT samples from echo
+    /// responses, answers echo requests and retransmits the NACKed
+    /// sequences that pass the sender's checks.
+    pub fn handle_feedback_outcome_at(
+        &mut self,
+        packet: &[u8],
+        now_ntp: u64,
+        now: Instant,
+    ) -> Result<FeedbackOutcome> {
+        let context = SenderContext {
+            ssrc: self.ssrc,
+            cname: &self.cname,
+            reference: self.next_sequence.wrapping_sub(1),
+            history: &self.history,
+            recovery: &self.recovery,
+            congestion_control: self.congestion_control,
+        };
+        context.handle_feedback(&mut self.recovery_state, packet, now_ntp, now)
     }
 
     pub fn handle_feedback_for_peer(
@@ -387,10 +429,38 @@ impl SimpleSenderCore {
         now_ntp: u64,
         now: Instant,
     ) -> Result<Vec<OutboundPacket>> {
-        state.stats.record_feedback();
-        let reference = self.next_sequence.wrapping_sub(1);
-        let sequences = decode_sender_feedback(packet, now_ntp, reference, &mut state.stats)?;
-        Ok(self.retransmit_for_peer_at(state, &sequences, now))
+        Ok(self
+            .handle_feedback_outcome_for_peer_at(state, packet, now_ntp, now)?
+            .retries)
+    }
+
+    /// [`Self::handle_feedback_outcome_at`] for one peer of a multi-peer
+    /// sender.
+    pub fn handle_feedback_outcome_for_peer_at(
+        &self,
+        state: &mut SimpleSenderPeerState,
+        packet: &[u8],
+        now_ntp: u64,
+        now: Instant,
+    ) -> Result<FeedbackOutcome> {
+        self.context().handle_feedback(state, packet, now_ntp, now)
+    }
+
+    /// The answer to an echo request: an empty receiver report, SDES and an
+    /// echo response with the request's SSRC and timestamp and delay 0.
+    pub fn build_echo_response(&self, request: Echo) -> Vec<u8> {
+        build_echo_response(self.ssrc, &self.cname, request)
+    }
+
+    fn context(&self) -> SenderContext<'_> {
+        SenderContext {
+            ssrc: self.ssrc,
+            cname: &self.cname,
+            reference: self.next_sequence.wrapping_sub(1),
+            history: &self.history,
+            recovery: &self.recovery,
+            congestion_control: self.congestion_control,
+        }
     }
 
     pub fn next_sequence(&self) -> u32 {
@@ -504,18 +574,7 @@ fn retransmit_from_history(
         state.retry_window_started = now;
         state.retry_window_bytes = 0;
     }
-    let rtt = Duration::from_micros(
-        state
-            .stats
-            .rtt_micros
-            .unwrap_or(recovery.rtt_min.as_micros() as u64),
-    )
-    .clamp(recovery.rtt_min, recovery.rtt_max);
-    let spacing = match congestion_control {
-        CongestionControlMode::Off => Duration::ZERO,
-        CongestionControlMode::Normal => rtt,
-        CongestionControlMode::Aggressive => rtt.saturating_mul(2),
-    };
+    let spacing = sender_retry_spacing(&state.rtt, recovery, congestion_control);
     let maximum_bytes = u64::from(recovery.max_bitrate)
         .saturating_mul(1_000)
         .saturating_div(8);
@@ -577,16 +636,94 @@ fn retry_marked(rtp: &[u8]) -> Vec<u8> {
     bytes
 }
 
-/// Decodes one feedback compound for a sender: updates the RTT from echo
-/// responses and returns the NACKed sequences extended near `reference`.
-/// Decode failures are counted.
+/// The parts of a [`SimpleSenderCore`] that serve one peer's feedback, so the
+/// single-peer state can be borrowed beside them.
+struct SenderContext<'a> {
+    ssrc: u32,
+    cname: &'a str,
+    reference: u32,
+    history: &'a SenderHistory,
+    recovery: &'a RecoveryConfig,
+    congestion_control: CongestionControlMode,
+}
+
+impl SenderContext<'_> {
+    fn handle_feedback(
+        &self,
+        state: &mut SimpleSenderPeerState,
+        packet: &[u8],
+        now_ntp: u64,
+        now: Instant,
+    ) -> Result<FeedbackOutcome> {
+        state.stats.record_feedback();
+        let mut echo_requests = Vec::new();
+        let sequences =
+            decode_sender_feedback(packet, now_ntp, self.reference, state, &mut echo_requests)?;
+        let responses = echo_requests
+            .into_iter()
+            .map(|request| build_echo_response(self.ssrc, self.cname, request))
+            .collect::<Vec<_>>();
+        state.stats.echo_responses += responses.len() as u64;
+        let retries = retransmit_from_history(
+            self.history,
+            self.recovery,
+            self.congestion_control,
+            &sequences,
+            now,
+            state,
+        );
+        Ok(FeedbackOutcome { retries, responses })
+    }
+}
+
+fn build_echo_response(ssrc: u32, cname: &str, request: Echo) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64);
+    encode_empty_receiver_report(ssrc, &mut out);
+    encode_sdes_cname(ssrc, cname, &mut out);
+    encode_echo(
+        Echo {
+            ssrc: request.ssrc,
+            ntp_timestamp: request.ntp_timestamp,
+            kind: EchoKind::Response { delay: 0 },
+        },
+        &mut out,
+    );
+    out
+}
+
+/// The minimum time between two repairs of one sequence for one peer:
+/// 0.9 x clamp(rtt, rtt_min, rtt_max), doubled in aggressive mode, none
+/// with congestion control off. `rtt` is the smaller of the smoothed and the
+/// last echo sample, so the sender errs early: a receiver re-requests after
+/// 1.1 x its own (larger) estimate, and a copy of a NACK sent a few
+/// milliseconds after the first is still refused.
+fn sender_retry_spacing(
+    rtt: &RttEstimator,
+    recovery: &RecoveryConfig,
+    congestion_control: CongestionControlMode,
+) -> Duration {
+    let rtt = rtt
+        .for_spacing()
+        .unwrap_or(recovery.rtt_min)
+        .clamp(recovery.rtt_min, recovery.rtt_max.max(recovery.rtt_min));
+    match congestion_control {
+        CongestionControlMode::Off => Duration::ZERO,
+        CongestionControlMode::Normal => rtt.mul_f64(0.9),
+        CongestionControlMode::Aggressive => rtt.mul_f64(1.8),
+    }
+}
+
+/// Decodes one feedback compound for a sender: takes RTT samples from echo
+/// responses, collects echo requests and returns the NACKed sequences
+/// extended near `reference`. Decode failures are counted.
 fn decode_sender_feedback(
     packet: &[u8],
     now_ntp: u64,
     reference: u32,
-    stats: &mut SenderStats,
+    state: &mut SimpleSenderPeerState,
+    echo_requests: &mut Vec<Echo>,
 ) -> Result<Vec<u32>> {
-    let decoded = update_sender_rtcp_state(packet, now_ntp, stats)
+    let decoded = update_sender_rtcp_state(packet, now_ntp, state, echo_requests)
         .and_then(|()| decode_nacks_from_compound(packet));
     match decoded {
         Ok(sequences) => Ok(sequences
@@ -594,21 +731,35 @@ fn decode_sender_feedback(
             .map(|sequence| extend_near(reference, sequence as u16))
             .collect()),
         Err(error) => {
-            stats.feedback_decode_errors += 1;
+            state.stats.feedback_decode_errors += 1;
             Err(error)
         }
     }
 }
 
-fn update_sender_rtcp_state(packet: &[u8], now_ntp: u64, stats: &mut SenderStats) -> Result<()> {
+fn update_sender_rtcp_state(
+    packet: &[u8],
+    now_ntp: u64,
+    state: &mut SimpleSenderPeerState,
+    echo_requests: &mut Vec<Echo>,
+) -> Result<()> {
     for packet in decode_compound(packet)? {
-        if let RtcpPacket::Echo(Echo {
-            ntp_timestamp,
-            kind: EchoKind::Response { delay },
-            ..
-        }) = packet
-        {
-            stats.set_rtt_micros(calculate_rtt_micros(ntp_timestamp, now_ntp, delay));
+        match packet {
+            RtcpPacket::Echo(Echo {
+                ntp_timestamp,
+                kind: EchoKind::Response { delay },
+                ..
+            }) => {
+                state
+                    .rtt
+                    .sample(calculate_rtt_micros(ntp_timestamp, now_ntp, delay));
+                state.stats.rtt_micros = state.rtt.srtt_micros();
+            }
+            RtcpPacket::Echo(request @ Echo {
+                kind: EchoKind::Request,
+                ..
+            }) => echo_requests.push(request),
+            _ => {}
         }
     }
     Ok(())
@@ -1905,6 +2056,76 @@ mod tests {
         assert_eq!(report.highest_sequence, 2);
         // Expected u32::MAX-1 ..= 2 (5 packets), received 2.
         assert_eq!(report.cumulative_packet_loss, 3);
+    }
+
+    fn echo_request_compound(ssrc: u32, ntp_timestamp: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        encode_empty_receiver_report(ssrc, &mut out);
+        encode_echo(
+            Echo {
+                ssrc,
+                ntp_timestamp,
+                kind: EchoKind::Request,
+            },
+            &mut out,
+        );
+        out
+    }
+
+    #[test]
+    fn sender_answers_echo_request() {
+        let request_ntp = ntp_from_unix_duration(Duration::from_secs(5));
+        let mut sender = SimpleSenderCore::new(0x1122_3344, 64).with_cname("tx");
+        let outcome = sender
+            .handle_feedback_outcome_at(
+                &echo_request_compound(0x5566_7788, request_ntp),
+                request_ntp,
+                Instant::now(),
+            )
+            .unwrap();
+        assert!(outcome.retries.is_empty());
+        assert_eq!(outcome.responses.len(), 1);
+        let decoded = decode_compound(&outcome.responses[0]).unwrap();
+        assert_eq!(
+            decoded.last(),
+            Some(&RtcpPacket::Echo(Echo {
+                ssrc: 0x5566_7788,
+                ntp_timestamp: request_ntp,
+                kind: EchoKind::Response { delay: 0 },
+            }))
+        );
+        // librist's layout: empty RR and SDES of the sender's flow first, so
+        // a Main receiver routes the response to that flow.
+        assert_eq!(&outcome.responses[0][4..8], &0x1122_3344u32.to_be_bytes());
+        assert!(decoded.contains(&RtcpPacket::SourceDescription {
+            ssrc: 0x1122_3344,
+            cname: "tx".to_string(),
+        }));
+        assert_eq!(sender.stats().echo_responses, 1);
+        // The legacy entry point still retransmits but does not answer.
+        let retries = sender
+            .handle_feedback_at(&echo_request_compound(1, request_ntp), request_ntp)
+            .unwrap();
+        assert!(retries.is_empty());
+        assert_eq!(sender.stats().echo_responses, 2);
+    }
+
+    #[test]
+    fn receiver_answer_to_sender_echo_feeds_a_smoothed_rtt() {
+        let base = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut sender = SimpleSenderCore::new(0x1122_3344, 64);
+        let mut receiver = SimpleReceiverCore::new(0x1122_3344, "rust", NackMode::Range);
+        for (sent_ms, rtt_ms) in [(0u64, 8u64), (100, 16)] {
+            let sent = base + (sent_ms << 32) / 1000;
+            let request = sender.build_echo_request(sent);
+            let response = receiver.handle_rtcp_at(&request, sent).unwrap().remove(0);
+            let back = sent + (rtt_ms << 32) / 1000;
+            sender
+                .handle_feedback_outcome_at(&response, back, Instant::now())
+                .unwrap();
+        }
+        // 8 ms seeds the estimate; 16 ms moves it by one eighth.
+        assert_eq!(sender.stats().rtt_micros, Some(9_000));
     }
 
     #[test]

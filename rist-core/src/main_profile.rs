@@ -18,6 +18,7 @@ use crate::simple::{
     MAX_NACK_PACKETS_PER_POLL,
 };
 use crate::stats::{ReceiverStats, SenderStats};
+use crate::time::ntp_now;
 use crate::Result;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
@@ -187,6 +188,14 @@ pub struct MainOutboundPacket {
     pub gre_sequence: u32,
     pub retry: bool,
     pub bytes: Vec<u8>,
+}
+
+/// What a Main sender owes the peer for one feedback compound: echo
+/// responses (send first) and retransmissions, each wrapped in reduced GRE.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MainFeedbackOutcome {
+    pub retries: Vec<MainOutboundPacket>,
+    pub responses: Vec<MainControlPacket>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -362,16 +371,41 @@ impl MainSenderCore {
         self.handle_reduced_feedback(packet.reduced(), packet.payload())
     }
 
+    /// Retransmissions for one feedback compound. Echo requests in it are
+    /// not answered; use [`Self::handle_reduced_feedback_outcome`].
     pub fn handle_reduced_feedback(
+        &mut self,
+        reduced: ReducedHeader,
+        payload: &[u8],
+    ) -> Result<Vec<MainOutboundPacket>> {
+        Ok(self
+            .handle_reduced_feedback_outcome(reduced, payload, ntp_now(), Instant::now())?
+            .retries)
+    }
+
+    /// Handles one feedback compound: RTT samples from echo responses,
+    /// answers to echo requests and retransmissions, all wrapped.
+    pub fn handle_reduced_feedback_outcome(
         &mut self,
         _reduced: ReducedHeader,
         payload: &[u8],
-    ) -> Result<Vec<MainOutboundPacket>> {
-        let retries = self.simple.handle_feedback(payload)?;
-        Ok(retries
+        now_ntp: u64,
+        now: Instant,
+    ) -> Result<MainFeedbackOutcome> {
+        let outcome = self
+            .simple
+            .handle_feedback_outcome_at(payload, now_ntp, now)?;
+        let responses = outcome
+            .responses
+            .iter()
+            .map(|response| self.wrap_control_payload(response))
+            .collect();
+        let retries = outcome
+            .retries
             .into_iter()
             .map(|retry| self.wrap_rtp(retry.sequence, true, &retry.bytes))
-            .collect())
+            .collect();
+        Ok(MainFeedbackOutcome { retries, responses })
     }
 
     pub fn handle_feedback_for_peer(
@@ -388,13 +422,34 @@ impl MainSenderCore {
         state: &mut MainSenderPeerState,
         payload: &[u8],
     ) -> Result<Vec<MainOutboundPacket>> {
-        let retries = self
-            .simple
-            .handle_feedback_for_peer(&mut state.simple, payload)?;
-        Ok(retries
+        Ok(self
+            .handle_reduced_feedback_outcome_for_peer(state, payload, ntp_now(), Instant::now())?
+            .retries)
+    }
+
+    /// [`Self::handle_reduced_feedback_outcome`] for one peer of a
+    /// multi-peer sender.
+    pub fn handle_reduced_feedback_outcome_for_peer(
+        &self,
+        state: &mut MainSenderPeerState,
+        payload: &[u8],
+        now_ntp: u64,
+        now: Instant,
+    ) -> Result<MainFeedbackOutcome> {
+        let outcome =
+            self.simple
+                .handle_feedback_outcome_for_peer_at(&mut state.simple, payload, now_ntp, now)?;
+        let responses = outcome
+            .responses
+            .iter()
+            .map(|response| self.wrap_control_for_peer(state, response))
+            .collect();
+        let retries = outcome
+            .retries
             .into_iter()
             .map(|retry| self.wrap_rtp_for_peer(state, retry.sequence, true, &retry.bytes))
-            .collect())
+            .collect();
+        Ok(MainFeedbackOutcome { retries, responses })
     }
 
     pub fn poll_rtcp(&mut self, now: Instant, ntp_timestamp: u64) -> Option<MainControlPacket> {
@@ -1418,6 +1473,41 @@ mod tests {
         assert_eq!(recovered.payload, b"lost");
         assert!(receiver.missing_sequences().is_empty());
         assert_eq!(receiver.stats().recovered_packets, 1);
+    }
+
+    #[test]
+    fn main_sender_answers_echo_request_through_reduced_gre() {
+        let now = Instant::now();
+        let request_ntp = ntp_from_unix_duration(Duration::from_secs(9));
+        let mut sender = MainSenderCore::new(0x1122_3344, 64);
+        let mut request = Vec::new();
+        crate::packet::rtcp::encode_empty_receiver_report(0x1122_3344, &mut request);
+        crate::packet::rtcp::encode_echo(
+            Echo {
+                ssrc: 0x1122_3344,
+                ntp_timestamp: request_ntp,
+                kind: EchoKind::Request,
+            },
+            &mut request,
+        );
+        let reduced = ReducedHeader {
+            src_port: DEFAULT_VIRT_DST_PORT,
+            dst_port: DEFAULT_VIRT_SRC_PORT,
+        };
+        let outcome = sender
+            .handle_reduced_feedback_outcome(reduced, &request, request_ntp, now)
+            .unwrap();
+        assert!(outcome.retries.is_empty());
+        assert_eq!(outcome.responses.len(), 1);
+        let decoded = ReducedPacket::decode(&outcome.responses[0].bytes).unwrap();
+        assert_eq!(decoded.reduced.src_port, DEFAULT_VIRT_SRC_PORT);
+        assert!(decode_compound(&decoded.payload)
+            .unwrap()
+            .contains(&RtcpPacket::Echo(Echo {
+                ssrc: 0x1122_3344,
+                ntp_timestamp: request_ntp,
+                kind: EchoKind::Response { delay: 0 },
+            })));
     }
 
     #[test]

@@ -21,6 +21,8 @@ pub struct SenderStats {
     pub retransmit_refused_max_retries: u64,
     /// Feedback packets that failed to decode.
     pub feedback_decode_errors: u64,
+    /// Echo requests answered.
+    pub echo_responses: u64,
 }
 
 impl SenderStats {
@@ -40,6 +42,7 @@ impl SenderStats {
             retransmit_refused_spacing: 0,
             retransmit_refused_max_retries: 0,
             feedback_decode_errors: 0,
+            echo_responses: 0,
         }
     }
 
@@ -66,10 +69,6 @@ impl SenderStats {
 
     pub(crate) fn record_feedback(&mut self) {
         self.feedback_packets += 1;
-    }
-
-    pub(crate) fn set_rtt_micros(&mut self, rtt_micros: u64) {
-        self.rtt_micros = Some(rtt_micros);
     }
 }
 

@@ -35,7 +35,7 @@ pub use endpoint::{
 };
 pub use error::Error;
 pub use main_profile::{
-    MainControlPacket, MainOutboundPacket, MainReceiverCore, MainReceiverFeedback, MainSenderCore,
+    MainControlPacket, MainFeedbackOutcome, MainOutboundPacket, MainReceiverCore, MainReceiverFeedback, MainSenderCore,
     MainSenderPeerState, MainSessionConfig, MainSessionPoll, MainSessionTimers,
 };
 pub use mpegts::{expand_null_packets, suppress_null_packets, NullPacketSuppression};
@@ -48,7 +48,7 @@ pub use recovery::{
 pub use rtt::RttEstimator;
 pub use sequence::SequenceExtender;
 pub use simple::{
-    OutboundPacket, ReceivedPayload, RtcpIntervals, SimpleReceiverCore, SimpleSenderCore,
+    FeedbackOutcome, OutboundPacket, ReceivedPayload, RtcpIntervals, SimpleReceiverCore, SimpleSenderCore,
     SimpleSenderPeerState,
 };
 pub use stats::{ReceiverStats, SenderStats};

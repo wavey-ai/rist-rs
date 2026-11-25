@@ -18,7 +18,8 @@ use rist_core::packet::gre::{
 use rist_core::packet::rtp::{encode_packet, RtpHeader, RtpPacket};
 use rist_core::time::ntp_now;
 use rist_core::{
-    packet::rtcp::NackMode, CongestionControlMode, MainControlPacket, MainOutboundPacket,
+    packet::rtcp::NackMode, CongestionControlMode, FeedbackOutcome, MainControlPacket,
+    MainOutboundPacket,
     MainPacket, MainReceiverCore, MainReceiverFeedback, MainSenderCore, MainSenderPeerState,
     MainSessionConfig, MainSessionPoll, MainSessionTimers, OutboundPacket, PeerSelection,
     ReceivedPayload, ReceiverStats, RecoveryConfig, SenderStats, SimpleReceiverCore,
@@ -1054,15 +1055,29 @@ impl SimpleMioSender {
         if self.peer.is_some_and(|peer| peer != rtp_peer) {
             return Ok(None);
         }
-        let retries = self
+        let outcome = self
             .core
-            .handle_feedback(feedback)
+            .handle_feedback_outcome_at(feedback, ntp_now(), Instant::now())
             .map_err(core_to_io_error)?;
         self.peer = Some(rtp_peer);
-        for retry in &retries {
+        self.send_feedback_outcome(&outcome)?;
+        Ok(Some(outcome.retries))
+    }
+
+    /// Echo responses first (best effort: a full queue drops them, as a
+    /// lost datagram would), then the retransmissions.
+    fn send_feedback_outcome(&mut self, outcome: &FeedbackOutcome) -> io::Result<()> {
+        for response in &outcome.responses {
+            match self.send_rtcp(response) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
+        }
+        for retry in &outcome.retries {
             self.send_outbound(retry)?;
         }
-        Ok(Some(retries))
+        Ok(())
     }
 
     fn handle_feedback_and_retransmit_at_from(
@@ -1075,15 +1090,13 @@ impl SimpleMioSender {
         if self.peer.is_some_and(|peer| peer != rtp_peer) {
             return Ok(Vec::new());
         }
-        let retries = self
+        let outcome = self
             .core
-            .handle_feedback_at(feedback, now_ntp)
+            .handle_feedback_outcome_at(feedback, now_ntp, Instant::now())
             .map_err(core_to_io_error)?;
         self.peer = Some(rtp_peer);
-        for retry in &retries {
-            self.send_outbound(retry)?;
-        }
-        Ok(retries)
+        self.send_feedback_outcome(&outcome)?;
+        Ok(outcome.retries)
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -2035,16 +2048,32 @@ impl MainMioSender {
                 return Ok(Some(MainSenderEvent::Unhandled { from, packet }));
             }
             MainPacket::Reduced(packet) if looks_like_rtcp(&packet.payload) => {
-                let retries = self
+                let now = Instant::now();
+                let outcome = self
                     .core
-                    .handle_reduced_feedback(packet.reduced, &packet.payload)
+                    .handle_reduced_feedback_outcome(packet.reduced, &packet.payload, ntp_now(), now)
                     .map_err(core_to_io_error)?;
                 self.select_unsecured_listener_peer(from);
-                for retry in &retries {
+                for response in &outcome.responses {
+                    // Best effort: a full queue drops an echo response as a
+                    // lost datagram would.
+                    match self.enqueue_packet(&response.bytes) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                for retry in &outcome.retries {
                     self.send_outbound(retry)?;
                 }
-                self.timers.observe_peer_activity(Instant::now());
-                MainSenderEvent::Feedback { from, retries }
+                if outcome.retries.is_empty() && !outcome.responses.is_empty() {
+                    self.flush_pending()?;
+                }
+                self.timers.observe_peer_activity(now);
+                MainSenderEvent::Feedback {
+                    from,
+                    retries: outcome.retries,
+                }
             }
             MainPacket::Keepalive(packet) => {
                 let discovered = self.listening && self.peer.is_none();
@@ -2709,16 +2738,26 @@ impl MainMioMultiSender {
                 MainSenderEvent::Unhandled { from, packet }
             }
             MainPacket::Reduced(packet) if looks_like_rtcp(&packet.payload) => {
-                let retries = self
+                let outcome = self
                     .core
-                    .handle_reduced_feedback_for_peer(
+                    .handle_reduced_feedback_outcome_for_peer(
                         &mut self.peer_runtime[peer].sender,
                         &packet.payload,
+                        ntp_now(),
+                        Instant::now(),
                     )
                     .map_err(core_to_io_error)?;
-                for retry in &retries {
+                for response in &outcome.responses {
+                    match self.enqueue_datagram(&response.bytes, vec![self.peers[peer].addr]) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                for retry in &outcome.retries {
                     self.enqueue_datagram(&retry.bytes, vec![self.peers[peer].addr])?;
                 }
+                let retries = outcome.retries;
                 self.flush_pending()?;
                 self.peer_runtime[peer]
                     .timers
