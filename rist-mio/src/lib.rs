@@ -235,6 +235,13 @@ impl RtpUdpSocket {
         self.peer
     }
 
+    /// Connects a bound socket to `peer` (see [`Self::connect`]).
+    fn connect_to(&mut self, peer: SocketAddr) -> io::Result<()> {
+        self.socket.connect(peer)?;
+        self.peer = Some(peer);
+        Ok(())
+    }
+
     /// Sends `head` and `body` as one datagram without joining them first
     /// (one `sendmsg` with two parts on Unix). `peer` `None` sends to the
     /// connected peer. A connected socket reports an ICMP unreachable from
@@ -957,6 +964,39 @@ pub struct SimpleMioSender {
     peer: Option<SocketAddr>,
     pending: VecDeque<PendingDatagram>,
     rtcp_pending: VecDeque<PendingDatagram>,
+    spare: Vec<Vec<u8>>,
+    /// When the SR/echo timer is next due (see [`MainMioSender`]).
+    next_timer_at: Option<Instant>,
+}
+
+/// Readiness of a Simple sender covers both its sockets under one token
+/// (feedback arrives on the RTCP port). Sleep until the
+/// [`SimpleMioSender::service`] deadline and call it on wakeup.
+impl Source for SimpleMioSender {
+    fn register(
+        &mut self,
+        registry: &Registry,
+        token: Token,
+        interests: Interest,
+    ) -> io::Result<()> {
+        self.rtp_socket.register(registry, token, interests)?;
+        self.rtcp_socket.register(registry, token, interests)
+    }
+
+    fn reregister(
+        &mut self,
+        registry: &Registry,
+        token: Token,
+        interests: Interest,
+    ) -> io::Result<()> {
+        self.rtp_socket.reregister(registry, token, interests)?;
+        self.rtcp_socket.reregister(registry, token, interests)
+    }
+
+    fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
+        self.rtp_socket.deregister(registry)?;
+        self.rtcp_socket.deregister(registry)
+    }
 }
 
 impl SimpleMioSender {
@@ -968,27 +1008,47 @@ impl SimpleMioSender {
     ) -> io::Result<Self> {
         ensure_same_address_family(local, peer)?;
         simple_rtcp_addr(peer)?;
-        let (rtp_socket, rtcp_socket) = bind_simple_pair(local, ssrc, false)?;
-        Ok(Self {
+        let (mut rtp_socket, rtcp_socket) = bind_simple_pair(local, ssrc, false)?;
+        // The data socket only sends, to this one peer: connected, each send
+        // skips the route lookup. Feedback arrives on the RTCP socket.
+        rtp_socket.connect_to(peer)?;
+        Ok(Self::with_sockets(
             rtp_socket,
             rtcp_socket,
-            core: SimpleSenderCore::new(ssrc, history_packets),
-            peer: Some(peer),
-            pending: VecDeque::with_capacity(PENDING_SEND_CAPACITY),
-            rtcp_pending: VecDeque::with_capacity(PENDING_SEND_CAPACITY),
-        })
+            ssrc,
+            history_packets,
+            Some(peer),
+        ))
     }
 
     pub fn listen(local: SocketAddr, ssrc: u32, history_packets: usize) -> io::Result<Self> {
         let (rtp_socket, rtcp_socket) = bind_simple_pair(local, ssrc, false)?;
-        Ok(Self {
+        Ok(Self::with_sockets(
+            rtp_socket,
+            rtcp_socket,
+            ssrc,
+            history_packets,
+            None,
+        ))
+    }
+
+    fn with_sockets(
+        rtp_socket: RtpUdpSocket,
+        rtcp_socket: RtpUdpSocket,
+        ssrc: u32,
+        history_packets: usize,
+        peer: Option<SocketAddr>,
+    ) -> Self {
+        Self {
             rtp_socket,
             rtcp_socket,
             core: SimpleSenderCore::new(ssrc, history_packets),
-            peer: None,
+            peer,
             pending: VecDeque::with_capacity(PENDING_SEND_CAPACITY),
             rtcp_pending: VecDeque::with_capacity(PENDING_SEND_CAPACITY),
-        })
+            spare: Vec::new(),
+            next_timer_at: None,
+        }
     }
 
     pub fn build_payload(
@@ -1044,61 +1104,137 @@ impl SimpleMioSender {
     }
 
     pub fn send_outbound(&mut self, packet: &OutboundPacket) -> io::Result<usize> {
-        self.enqueue_packet(&packet.bytes)?;
+        let peer = self.peer.ok_or_else(no_remote_peer_error)?;
         self.flush_pending()?;
+        send_or_queue(
+            &mut self.rtp_socket,
+            &mut self.pending,
+            &mut self.spare,
+            peer,
+            &packet.bytes,
+            &[],
+        )?;
         Ok(packet.bytes.len())
     }
 
+    /// Sends one payload and returns the packet sent. Also sends the SR and
+    /// echo request when due (see [`MainMioSender::send_payload`]). Use
+    /// [`Self::send_payload_meta`] when the bytes are not needed.
     pub fn send_payload(
         &mut self,
         payload: &[u8],
         ntp_timestamp: u64,
         now: Instant,
     ) -> io::Result<OutboundPacket> {
-        self.peer.ok_or_else(no_remote_peer_error)?;
+        let mut bytes = Vec::new();
+        let sequence = self.send_payload_parts(payload, ntp_timestamp, now, |rtp| {
+            bytes = rtp.to_vec();
+        })?;
+        Ok(OutboundPacket {
+            sequence,
+            retry: false,
+            bytes,
+        })
+    }
+
+    /// [`Self::send_payload`] without the bytes: sent straight from the
+    /// history slot it was encoded into. Returns the RTP sequence.
+    pub fn send_payload_meta(
+        &mut self,
+        payload: &[u8],
+        ntp_timestamp: u64,
+        now: Instant,
+    ) -> io::Result<u32> {
+        self.send_payload_parts(payload, ntp_timestamp, now, |_| {})
+    }
+
+    fn send_payload_parts(
+        &mut self,
+        payload: &[u8],
+        ntp_timestamp: u64,
+        now: Instant,
+        observe: impl FnOnce(&[u8]),
+    ) -> io::Result<u32> {
+        let peer = self.peer.ok_or_else(no_remote_peer_error)?;
         self.ensure_pending_capacity()?;
-        let packet = self.build_payload(payload, ntp_timestamp, now);
-        self.send_outbound(&packet)?;
-        Ok(packet)
+        if !self.pending.is_empty() {
+            self.flush_pending()?;
+        }
+        let Self {
+            core,
+            rtp_socket,
+            pending,
+            spare,
+            ..
+        } = self;
+        let sequence = core.send_payload_with(payload, ntp_timestamp, now, |sequence, rtp| {
+            observe(rtp);
+            send_or_queue(rtp_socket, pending, spare, peer, rtp, &[]).map(|()| sequence)
+        })?;
+        if self.next_timer_at.map_or(true, |at| now >= at) {
+            if let Some(packet) = self.core.poll_rtcp(now, ntp_timestamp) {
+                let _ = self.send_rtcp(&packet);
+            }
+            self.next_timer_at = Some(
+                self.core
+                    .next_rtcp_at()
+                    .unwrap_or(now + std::time::Duration::from_millis(100)),
+            );
+        }
+        Ok(sequence)
+    }
+
+    /// The Simple-profile [`MainMioSender::service`]: flushes the queues,
+    /// serves feedback until the RTCP socket is drained (at most 512
+    /// datagrams), sends the SR/echo request and due repairs, and returns
+    /// when to call it again.
+    pub fn service(
+        &mut self,
+        now: Instant,
+        ntp_timestamp: u64,
+        buf: &mut [u8],
+    ) -> io::Result<Option<Instant>> {
+        self.flush_pending()?;
+        for _ in 0..SERVICE_READ_LIMIT {
+            if self.pending.len() >= PENDING_SEND_CAPACITY {
+                break;
+            }
+            match self.try_recv_feedback_and_retransmit(buf) {
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(error) if error.kind() == io::ErrorKind::InvalidData => {}
+                Err(error) if error.kind() == io::ErrorKind::InvalidInput => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error),
+            }
+        }
+        if self.peer.is_some() {
+            match self.poll_rtcp_and_send(now, ntp_timestamp) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
+        }
+        self.next_timer_at = self.core.next_rtcp_at();
+        let next = self.next_timeout();
+        if self.pending.is_empty() && self.rtcp_pending.is_empty() {
+            Ok(next)
+        } else {
+            let retry = now + PENDING_RETRY;
+            Ok(Some(next.map_or(retry, |next| next.min(retry))))
+        }
     }
 
     /// Retries queued datagrams in FIFO order. A `WouldBlock` condition keeps
     /// the exact encoded bytes at the head of the bounded queue.
     pub fn flush_pending(&mut self) -> io::Result<usize> {
-        let mut sent = 0;
-        while let Some(packet) = self.pending.front() {
-            match self.rtp_socket.send_packet_to(packet.peer, &packet.bytes) {
-                Ok(len) if len == packet.bytes.len() => {
-                    self.pending.pop_front();
-                    sent += 1;
-                }
-                Ok(_) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "UDP send accepted a partial datagram",
-                    ))
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                Err(error) => return Err(error),
-            }
-        }
-        while let Some(packet) = self.rtcp_pending.front() {
-            match self.rtcp_socket.send_packet_to(packet.peer, &packet.bytes) {
-                Ok(len) if len == packet.bytes.len() => {
-                    self.rtcp_pending.pop_front();
-                    sent += 1;
-                }
-                Ok(_) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "UDP send accepted a partial datagram",
-                    ))
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(sent)
+        let sent = flush_queue(&mut self.rtp_socket, &mut self.pending, &mut self.spare)?;
+        Ok(sent
+            + flush_queue(
+                &mut self.rtcp_socket,
+                &mut self.rtcp_pending,
+                &mut self.spare,
+            )?)
     }
 
     pub fn pending_send_len(&self) -> usize {
@@ -1119,10 +1255,7 @@ impl SimpleMioSender {
     fn enqueue_packet(&mut self, packet: &[u8]) -> io::Result<()> {
         self.ensure_pending_capacity()?;
         let peer = self.peer.ok_or_else(no_remote_peer_error)?;
-        self.pending.push_back(PendingDatagram {
-            bytes: packet.to_vec(),
-            peer,
-        });
+        queue_datagram(&mut self.pending, &mut self.spare, peer, packet, &[]);
         Ok(())
     }
 
@@ -2899,6 +3032,36 @@ pub struct MainMioMultiSender {
     peer_runtime: Vec<MainMultiSenderPeerRuntime>,
     selector: WeightedPeerSelector,
     pending: VecDeque<PendingMultiDatagram>,
+    /// When the SR/echo or a keepalive timer is next due (see
+    /// [`MainMioSender`]).
+    next_timer_at: Option<Instant>,
+    keepalive_mac: [u8; 6],
+}
+
+/// Readiness of a multi-peer sender is its socket's (feedback from every
+/// peer). Sleep until the [`MainMioMultiSender::service`] deadline.
+impl Source for MainMioMultiSender {
+    fn register(
+        &mut self,
+        registry: &Registry,
+        token: Token,
+        interests: Interest,
+    ) -> io::Result<()> {
+        self.socket.register(registry, token, interests)
+    }
+
+    fn reregister(
+        &mut self,
+        registry: &Registry,
+        token: Token,
+        interests: Interest,
+    ) -> io::Result<()> {
+        self.socket.reregister(registry, token, interests)
+    }
+
+    fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
+        self.socket.deregister(registry)
+    }
 }
 
 struct MainMultiSenderPeerRuntime {
@@ -2925,7 +3088,81 @@ impl MainMioMultiSender {
             peer_runtime: Vec::new(),
             selector: WeightedPeerSelector::new(),
             pending: VecDeque::with_capacity(PENDING_SEND_CAPACITY),
+            next_timer_at: None,
+            keepalive_mac: [0; 6],
         })
+    }
+
+    /// The MAC-like id of the keepalives `send_payload` and `service` send.
+    pub fn set_keepalive_mac(&mut self, mac: [u8; 6]) {
+        self.keepalive_mac = mac;
+    }
+
+    /// Everything the sender owes besides data (see
+    /// [`MainMioSender::service`]): flushes the queue, serves feedback from
+    /// every peer until the socket is drained (at most 512 datagrams), sends
+    /// the SR/echo request, keepalives and due repairs, and returns when to
+    /// call it again.
+    pub fn service(
+        &mut self,
+        now: Instant,
+        ntp_timestamp: u64,
+        buf: &mut [u8],
+    ) -> io::Result<Option<Instant>> {
+        self.flush_pending()?;
+        for _ in 0..SERVICE_READ_LIMIT {
+            if self.pending.len() >= PENDING_SEND_CAPACITY {
+                break;
+            }
+            match self.try_recv_event(buf) {
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(error) if error.kind() == io::ErrorKind::InvalidData => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error),
+            }
+        }
+        if !self.peers.is_empty() {
+            self.serve_timers(now, ntp_timestamp)?;
+            self.poll_repairs_and_send(now)?;
+        }
+        let next = self.next_timeout();
+        if self.pending.is_empty() {
+            Ok(next)
+        } else {
+            let retry = now + PENDING_RETRY;
+            Ok(Some(next.map_or(retry, |next| next.min(retry))))
+        }
+    }
+
+    /// SR/echo and keepalives; a full queue (`WouldBlock`) leaves them for
+    /// the next call, as does an unauthenticated peer.
+    fn serve_timers(&mut self, now: Instant, ntp_timestamp: u64) -> io::Result<()> {
+        match self.poll_rtcp_and_send(now, ntp_timestamp) {
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::PermissionDenied
+                ) => {}
+            Err(error) => return Err(error),
+        }
+        let keepalive = GreKeepalive::librist_default(self.keepalive_mac);
+        match self.poll_session_and_send_keepalive(now, keepalive) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error),
+        }
+        let keepalive_at = self
+            .peer_runtime
+            .iter()
+            .filter_map(|runtime| runtime.timers.next_keepalive_at())
+            .min();
+        self.next_timer_at = [self.core.next_rtcp_at(), keepalive_at]
+            .into_iter()
+            .flatten()
+            .min();
+        Ok(())
     }
 
     pub fn add_peer(&mut self, peer: SocketAddr, weight: u32) -> io::Result<usize> {
@@ -2982,6 +3219,13 @@ impl MainMioMultiSender {
             peer_packets.push(MainMioPeerPacket { peer, packet });
         }
         self.flush_pending()?;
+        // A sender that is only handed data still sends its SR/echo request
+        // and keepalives once due; errors wait for `service`.
+        if self.next_timer_at.map_or(true, |at| now >= at) {
+            if self.serve_timers(now, ntp_timestamp).is_err() || self.next_timer_at.is_none() {
+                self.next_timer_at = Some(now + std::time::Duration::from_millis(100));
+            }
+        }
         Ok(MainMioMultiSend {
             peers,
             peer_packets,
@@ -5020,6 +5264,163 @@ mod tests {
         assert_eq!(received, vec![(0, false), (2, false), (1, true)]);
         assert_eq!(sender.stats().retransmitted_packets, 1);
         poll.registry().deregister(&mut sender).unwrap();
+    }
+
+    /// Counts the RTCP a Simple sink pair's RTCP socket received.
+    fn drain_simple_rtcp(socket: &mut RtpUdpSocket, counts: &mut SinkCounts) {
+        let mut buf = vec![0u8; SAFE_RECEIVE_CAPACITY];
+        while let Some((_, datagram)) = socket.recv_datagram(&mut buf).unwrap() {
+            for packet in rist_core::packet::rtcp::decode_compound(datagram).unwrap() {
+                match packet {
+                    rist_core::packet::rtcp::RtcpPacket::SenderReport(_) => {
+                        counts.sender_reports += 1
+                    }
+                    rist_core::packet::rtcp::RtcpPacket::Echo(echo)
+                        if echo.kind == rist_core::packet::rtcp::EchoKind::Request =>
+                    {
+                        counts.echo_requests += 1
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Simple sender: `send_payload` sends the SR/echo request once due, and
+    /// an idle sender driven by `service` wakes about ten times a second.
+    #[test]
+    fn simple_sender_drives_its_rtcp_from_sends_and_from_service() {
+        let (mut sink_rtp, mut sink_rtcp) = bind_simple_pair(loopback_any(), 2, false).unwrap();
+        let mut sender =
+            SimpleMioSender::connect(loopback_any(), sink_rtp.local_addr().unwrap(), 2, 64)
+                .unwrap();
+        assert_eq!(
+            sender.rtp_socket.connected_peer(),
+            Some(sink_rtp.local_addr().unwrap())
+        );
+        let ntp = ntp_now();
+        let start = Instant::now();
+        assert_eq!(sender.send_payload_meta(b"zero", ntp, start).unwrap(), 0);
+        let owned = sender
+            .send_payload(b"one", ntp, start + Duration::from_millis(1_001))
+            .unwrap();
+        assert_eq!((owned.sequence, &owned.bytes[12..]), (1, &b"one"[..]));
+        thread::sleep(Duration::from_millis(20));
+        let mut buf = vec![0u8; SAFE_RECEIVE_CAPACITY];
+        let mut data = Vec::new();
+        while let Some((_, datagram)) = sink_rtp.recv_datagram(&mut buf).unwrap() {
+            data.push(datagram.to_vec());
+        }
+        assert_eq!(data.len(), 2);
+        assert_eq!(data[1], owned.bytes);
+        let mut counts = SinkCounts::default();
+        drain_simple_rtcp(&mut sink_rtcp, &mut counts);
+        assert_eq!(
+            (counts.sender_reports, counts.echo_requests),
+            (1, 1),
+            "{counts:?}"
+        );
+
+        let mut now = start + Duration::from_millis(1_001);
+        let end = now + Duration::from_secs(5);
+        let mut wakeups = 0;
+        while now < end {
+            let next = sender.service(now, ntp, &mut buf).unwrap().unwrap();
+            assert!(next > now && next <= now + Duration::from_millis(100));
+            wakeups += 1;
+            now = next;
+        }
+        assert!((50..=51).contains(&wakeups), "{wakeups}");
+        thread::sleep(Duration::from_millis(20));
+        drain_simple_rtcp(&mut sink_rtcp, &mut counts);
+        assert!((5..=6).contains(&counts.sender_reports), "{counts:?}");
+        assert!((50..=51).contains(&counts.echo_requests), "{counts:?}");
+    }
+
+    /// A registered Simple sender wakes for a NACK on its RTCP port and
+    /// `service` repairs.
+    #[test]
+    fn registered_simple_sender_wakes_for_a_nack_and_repairs() {
+        let flow_id = 0x1122_3344;
+        let mut receiver =
+            SimpleMioReceiver::bind(loopback_any(), flow_id, "receiver", NackMode::Range).unwrap();
+        receiver.set_recovery_tuning(static_tuning());
+        let mut sender =
+            SimpleMioSender::connect(loopback_any(), receiver.local_addr().unwrap(), flow_id, 64)
+                .unwrap();
+        sender.set_recovery_tuning(static_tuning());
+        let mut poll = mio::Poll::new().unwrap();
+        let mut events = mio::Events::with_capacity(8);
+        poll.registry()
+            .register(&mut sender, Token(3), Interest::READABLE)
+            .unwrap();
+        let ntp = ntp_now();
+        let start = Instant::now();
+        sender.send_payload_meta(b"zero", ntp, start).unwrap();
+        sender.build_payload(b"one", ntp, start);
+        sender.send_payload_meta(b"two", ntp, start).unwrap();
+        let mut buf = vec![0u8; SAFE_RECEIVE_CAPACITY];
+        let mut sender_buf = vec![0u8; SAFE_RECEIVE_CAPACITY];
+        let mut received = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while received.len() < 3 {
+            while let Some(event) = receiver.try_recv_event(&mut buf).unwrap() {
+                if let SimpleReceiverEvent::Payload { payload, .. } = event {
+                    received.push((payload.sequence, payload.recovered));
+                }
+            }
+            receiver
+                .poll_rtcp_and_send(Instant::now(), ntp_now())
+                .unwrap();
+            let next = sender
+                .service(Instant::now(), ntp_now(), &mut sender_buf)
+                .unwrap();
+            let timeout = next
+                .map(|at| at.saturating_duration_since(Instant::now()))
+                .unwrap_or(Duration::from_secs(1))
+                .min(Duration::from_millis(5));
+            poll.poll(&mut events, Some(timeout)).unwrap();
+            assert!(Instant::now() < deadline, "received {received:?}");
+        }
+        assert_eq!(received, vec![(0, false), (2, false), (1, true)]);
+        assert_eq!(sender.stats().retransmitted_packets, 1);
+    }
+
+    /// Multi-peer sender: data alone drives the SR/echo and every peer's
+    /// keepalive; `service` returns the next deadline.
+    #[test]
+    fn multi_sender_drives_its_timers_from_sends_and_service() {
+        let sinks = [raw_sink(), raw_sink()];
+        let mut sender = MainMioMultiSender::bind(loopback_any(), 2, 64).unwrap();
+        for sink in &sinks {
+            sink.set_nonblocking(true).unwrap();
+            sender.add_peer(sink.local_addr().unwrap(), 1).unwrap();
+        }
+        let ntp = ntp_now();
+        let start = Instant::now();
+        sender.send_payload(b"zero", ntp, start).unwrap();
+        sender
+            .send_payload(b"one", ntp, start + Duration::from_millis(1_001))
+            .unwrap();
+        thread::sleep(Duration::from_millis(20));
+        let mut total = SinkCounts::default();
+        for sink in &sinks {
+            let mut counts = SinkCounts::default();
+            drain_sink(sink, &mut counts);
+            assert_eq!(counts.keepalives, 1, "{counts:?}");
+            total.data += counts.data;
+            total.sender_reports += counts.sender_reports;
+            total.echo_requests += counts.echo_requests;
+        }
+        assert!(total.data >= 2, "{total:?}");
+        assert!(total.sender_reports >= 1, "{total:?}");
+        assert!(total.echo_requests >= 1, "{total:?}");
+
+        let mut buf = vec![0u8; SAFE_RECEIVE_CAPACITY];
+        let now = start + Duration::from_millis(1_050);
+        let next = sender.service(now, ntp, &mut buf).unwrap().unwrap();
+        assert!(next > now && next <= now + Duration::from_millis(100));
+        assert_eq!(sender.next_timeout(), Some(next));
     }
 
     fn loopback_any() -> SocketAddr {
