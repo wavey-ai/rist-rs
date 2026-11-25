@@ -3221,10 +3221,10 @@ impl MainMioMultiSender {
         self.flush_pending()?;
         // A sender that is only handed data still sends its SR/echo request
         // and keepalives once due; errors wait for `service`.
-        if self.next_timer_at.map_or(true, |at| now >= at) {
-            if self.serve_timers(now, ntp_timestamp).is_err() || self.next_timer_at.is_none() {
-                self.next_timer_at = Some(now + std::time::Duration::from_millis(100));
-            }
+        if self.next_timer_at.map_or(true, |at| now >= at)
+            && (self.serve_timers(now, ntp_timestamp).is_err() || self.next_timer_at.is_none())
+        {
+            self.next_timer_at = Some(now + std::time::Duration::from_millis(100));
         }
         Ok(MainMioMultiSend {
             peers,
