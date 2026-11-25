@@ -1680,7 +1680,9 @@ mod tests {
         let start = Instant::now();
         let mut buffer = OrderedPayloadBuffer::with_deadline(64, Duration::from_millis(10));
         let mut out = Vec::new();
-        buffer.push_into(payload(100_000, 0), start, &mut out).unwrap();
+        buffer
+            .push_into(payload(100_000, 0), start, &mut out)
+            .unwrap();
         // 100_002 is held behind the gap at 100_001.
         assert_eq!(
             buffer.push_into(payload(100_002, 0), start, &mut out),
@@ -1761,7 +1763,10 @@ mod tests {
         let mut buffer = OrderedPayloadBuffer::new(64);
         buffer.push_at(payload(100_000, 0), start).unwrap();
         for sequence in 0..RESYNC_LATE_RUN - 1 {
-            assert!(buffer.push_at(payload(sequence, 0), start).unwrap().is_empty());
+            assert!(buffer
+                .push_at(payload(sequence, 0), start)
+                .unwrap()
+                .is_empty());
         }
         let error = buffer
             .push_at(payload(RESYNC_LATE_RUN - 1, 0), start)
