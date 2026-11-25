@@ -244,9 +244,10 @@ impl RtpUdpSocket {
 
     /// Sends `head` and `body` as one datagram without joining them first
     /// (one `sendmsg` with two parts on Unix). `peer` `None` sends to the
-    /// connected peer. A connected socket reports an ICMP unreachable from
-    /// an earlier datagram as `ConnectionRefused` on a later call; that
-    /// datagram was not refused, so the send is tried once more.
+    /// connected peer. A connected socket reports an ICMP error an earlier
+    /// datagram drew (`is_reported_icmp_error`) on a later call,
+    /// which then sends nothing; that datagram was not refused, so the send
+    /// is tried once more.
     pub fn send_parts_to(
         &mut self,
         peer: Option<SocketAddr>,
@@ -254,9 +255,7 @@ impl RtpUdpSocket {
         body: &[u8],
     ) -> io::Result<usize> {
         match self.send_parts_once(peer, head, body) {
-            Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
-                self.send_parts_once(peer, head, body)
-            }
+            Err(error) if is_reported_icmp_error(&error) => self.send_parts_once(peer, head, body),
             result => result,
         }
         .map_err(normalize_udp_send_error)
@@ -491,11 +490,9 @@ impl RtpUdpSocket {
         buf: &'a mut [u8],
     ) -> io::Result<Option<(SocketAddr, &'a [u8])>> {
         let received = match self.recv_datagram_len(buf) {
-            // A connected socket reports an ICMP unreachable for an earlier
-            // send on the next call; it says nothing about what is queued.
-            Err(error)
-                if self.peer.is_some() && error.kind() == io::ErrorKind::ConnectionRefused =>
-            {
+            // A connected socket reports an ICMP error for an earlier send
+            // on the next call; it says nothing about what is queued.
+            Err(error) if self.peer.is_some() && is_reported_icmp_error(&error) => {
                 self.recv_datagram_len(buf)
             }
             result => result,
@@ -837,6 +834,37 @@ fn bind_simple_pair(
     }))
 }
 
+/// Errors a connected UDP socket returns, on the next send or receive, for
+/// an ICMP error an earlier datagram drew (Linux reports hard ICMP errors
+/// only to connected sockets): port unreachable (`ECONNREFUSED`), host or
+/// administratively prohibited (`EHOSTUNREACH`), network unknown
+/// (`ENETUNREACH`), host unknown (`EHOSTDOWN`), protocol unreachable
+/// (`ENOPROTOOPT`) and source route failed (`EOPNOTSUPP`). The call that
+/// returns one did nothing else.
+fn is_reported_icmp_error(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::ConnectionRefused {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        matches!(
+            error.raw_os_error(),
+            Some(
+                libc::ECONNREFUSED
+                    | libc::EHOSTUNREACH
+                    | libc::ENETUNREACH
+                    | libc::EHOSTDOWN
+                    | libc::ENOPROTOOPT
+                    | libc::EOPNOTSUPP
+            )
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 fn normalize_udp_send_error(error: io::Error) -> io::Error {
     if is_udp_enobufs(&error) {
         io::Error::new(io::ErrorKind::WouldBlock, error)
@@ -914,7 +942,9 @@ fn send_parts(
             io::ErrorKind::WriteZero,
             "UDP send accepted a partial datagram",
         )),
-        Err(error) if connected && error.kind() == io::ErrorKind::ConnectionRefused => Ok(()),
+        // Reported again on the retry: the path drops it, as it would
+        // have dropped it on an unconnected socket, which never hears.
+        Err(error) if connected && is_reported_icmp_error(&error) => Ok(()),
         Err(error) => Err(error),
     }
 }
@@ -5478,6 +5508,33 @@ mod tests {
             .and_then(|source| source.downcast_ref::<io::Error>())
             .expect("normalized error must retain the operating-system error");
         assert_eq!(source.raw_os_error(), Some(libc::ENOBUFS));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn icmp_errors_reported_for_earlier_datagrams_are_recognised() {
+        for errno in [
+            libc::ECONNREFUSED,
+            libc::EHOSTUNREACH,
+            libc::ENETUNREACH,
+            libc::EHOSTDOWN,
+            libc::ENOPROTOOPT,
+            libc::EOPNOTSUPP,
+        ] {
+            assert!(
+                is_reported_icmp_error(&io::Error::from_raw_os_error(errno)),
+                "{errno}"
+            );
+        }
+        assert!(is_reported_icmp_error(&io::Error::from(
+            io::ErrorKind::ConnectionRefused
+        )));
+        for errno in [libc::EMSGSIZE, libc::ENOBUFS, libc::EAGAIN, libc::EBADF] {
+            assert!(
+                !is_reported_icmp_error(&io::Error::from_raw_os_error(errno)),
+                "{errno}"
+            );
+        }
     }
 
     #[test]
