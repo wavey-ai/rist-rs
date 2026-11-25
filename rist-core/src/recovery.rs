@@ -393,6 +393,10 @@ pub struct NackRepeat {
     /// next is due `delay x 2^(n-1)` later. Used while the RTT is unknown,
     /// so a long path is not flooded with re-requests.
     pub backoff: bool,
+    /// Request every NACKed hole once more this long after the NACK (a
+    /// copy, see [`MissingTracker::take_due_copies`]); it does not count
+    /// as an attempt.
+    pub copy_gap: Option<Duration>,
 }
 
 impl NackRepeat {
@@ -400,6 +404,7 @@ impl NackRepeat {
         Self {
             delay,
             backoff: false,
+            copy_gap: None,
         }
     }
 
@@ -460,6 +465,8 @@ struct Hole {
     first_missing_at: Instant,
     last_nack_at: Option<Instant>,
     next_due: Instant,
+    /// When the copy of the last NACK is due, if one is pending.
+    copy_at: Option<Instant>,
 }
 
 /// Receiver-side loss tracker.
@@ -486,6 +493,7 @@ pub struct MissingTracker {
     live: usize,
     fresh: usize,
     schedule: BinaryHeap<Reverse<(Instant, u32)>>,
+    copies: BinaryHeap<Reverse<(Instant, u32)>>,
     taken: Vec<u32>,
     counters: TrackerCounters,
     last_recovered: Option<RecoveredHole>,
@@ -523,6 +531,7 @@ impl MissingTracker {
             live: 0,
             fresh: 0,
             schedule: BinaryHeap::new(),
+            copies: BinaryHeap::new(),
             taken: Vec::new(),
             counters: TrackerCounters::default(),
             last_recovered: None,
@@ -585,6 +594,7 @@ impl MissingTracker {
                         first_missing_at: at,
                         last_nack_at: None,
                         next_due: at,
+                        copy_at: None,
                     });
                     newly_missing.push(missing);
                 }
@@ -680,6 +690,7 @@ impl MissingTracker {
         self.counters.holes_reset += self.live as u64;
         self.holes.clear();
         self.schedule.clear();
+        self.copies.clear();
         self.taken.clear();
         self.live = 0;
         self.fresh = 0;
@@ -693,14 +704,42 @@ impl MissingTracker {
     /// early (a scheduled hole recovered since), never late.
     pub fn next_nack_at(&self) -> Option<Instant> {
         let scheduled = self.schedule.peek().map(|Reverse((due, _))| *due);
+        let copy = self.copies.peek().map(|Reverse((due, _))| *due);
         let fresh = self
             .holes
             .get(self.fresh)
             .map(|hole| hole.first_missing_at + self.initial_delay);
-        match (scheduled, fresh) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
+        [scheduled, copy, fresh].into_iter().flatten().min()
+    }
+
+    /// Appends up to `limit` holes whose NACK copy is due at `now`, oldest
+    /// first, and clears them: a copy is sent at most once, whether or not
+    /// it reaches the wire, and never changes a hole's NACK count or
+    /// schedule. Holes recovered, expired or abandoned since are skipped.
+    pub fn take_due_copies(&mut self, now: Instant, limit: usize, out: &mut Vec<u32>) {
+        let start = out.len();
+        while out.len() - start < limit {
+            let Some(&Reverse((due, sequence))) = self.copies.peek() else {
+                break;
+            };
+            if due > now {
+                break;
+            }
+            self.copies.pop();
+            let Some(index) = self.find_hole(sequence) else {
+                continue;
+            };
+            let hole = &mut self.holes[index];
+            if hole.copy_at != Some(due) {
+                continue;
+            }
+            hole.copy_at = None;
+            if matches!(hole.status, HoleStatus::Scheduled | HoleStatus::Taken) {
+                out.push(sequence);
+            }
         }
+        let highest = self.highest.unwrap_or(0);
+        out[start..].sort_unstable_by_key(|sequence| Reverse(highest.wrapping_sub(*sequence)));
     }
 
     /// The instant at which the oldest open hole expires.
@@ -807,6 +846,11 @@ impl MissingTracker {
             }
             hole.nack_count = hole.nack_count.saturating_add(1);
             hole.last_nack_at = Some(now);
+            if let Some(gap) = repeat.copy_gap {
+                let copy_at = now + gap;
+                hole.copy_at = Some(copy_at);
+                self.copies.push(Reverse((copy_at, sequence)));
+            }
             let next_due = now + repeat.after(hole.nack_count);
             hole.next_due = next_due;
             hole.status = HoleStatus::Scheduled;
@@ -1225,6 +1269,7 @@ mod tests {
         let repeat = NackRepeat {
             delay: ms(5),
             backoff: true,
+            copy_gap: None,
         };
         assert_eq!(repeat.after(1), ms(5));
         assert_eq!(repeat.after(2), ms(10));
@@ -1247,6 +1292,37 @@ mod tests {
             at = next;
         }
         assert_eq!(gaps, vec![ms(5), ms(10), ms(20), ms(40)]);
+    }
+
+    #[test]
+    fn nack_copies_are_due_once_and_do_not_count_as_attempts() {
+        let t0 = Instant::now();
+        let mut tracker = MissingTracker::with_limits(64, Duration::from_secs(10));
+        tracker.observe_at(0, t0);
+        tracker.observe_at(3, t0);
+        let plan = schedule(0, 20);
+        assert_eq!(take(&mut tracker, t0, &plan, 8), vec![1, 2]);
+        let repeat = NackRepeat {
+            delay: ms(20),
+            backoff: false,
+            copy_gap: Some(ms(2)),
+        };
+        tracker.commit_nacks_with(&[1, 2], t0, repeat);
+        assert_eq!(tracker.next_nack_at(), Some(t0 + ms(2)));
+        let mut copies = Vec::new();
+        tracker.take_due_copies(t0 + ms(1), 8, &mut copies);
+        assert!(copies.is_empty());
+        // Hole 2 is recovered before its copy is due: only 1 is copied.
+        tracker.observe_at(2, t0 + ms(1));
+        tracker.take_due_copies(t0 + ms(2), 8, &mut copies);
+        assert_eq!(copies, vec![1]);
+        tracker.check_invariants();
+        assert_eq!(tracker.hole(1).unwrap().nack_count, 1);
+        assert_eq!(tracker.hole(1).unwrap().next_nack_at, Some(t0 + ms(20)));
+        copies.clear();
+        tracker.take_due_copies(t0 + ms(3), 8, &mut copies);
+        assert!(copies.is_empty(), "a copy is sent once");
+        assert_eq!(tracker.next_nack_at(), Some(t0 + ms(20)));
     }
 
     #[test]

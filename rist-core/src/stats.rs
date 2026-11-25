@@ -116,6 +116,9 @@ pub struct ReceiverStats {
     pub reorder_samples: u64,
     /// The first-NACK delay at the last poll.
     pub first_nack_delay_micros: u64,
+    /// Sequences requested again in NACK copies (not attempts; also
+    /// counted in nack_packets, not in nack_entries_sent).
+    pub nack_copies_sent: u64,
 }
 
 impl ReceiverStats {
@@ -146,6 +149,7 @@ impl ReceiverStats {
             echo_requests_sent: 0,
             reorder_samples: 0,
             first_nack_delay_micros: 0,
+            nack_copies_sent: 0,
         }
     }
 

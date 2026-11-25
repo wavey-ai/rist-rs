@@ -1407,9 +1407,22 @@ impl SimpleReceiverCore {
             CongestionControlMode::Aggressive => 2.2,
             CongestionControlMode::Off | CongestionControlMode::Normal => 1.1,
         };
+        // A copy of each NACK a few ms later (B2): the sender refuses it
+        // by its spacing when the first arrived. Not with congestion control
+        // off (the sender would serve every copy), and not when the gap
+        // would come near the sender's spacing (tiny rtt_min).
+        let copy_gap = (rtt / 20).clamp(Duration::from_millis(1), Duration::from_millis(5));
+        let copy_gap = (self.tuning.redundant_nacks
+            && self.congestion_control != CongestionControlMode::Off
+            && copy_gap.saturating_mul(2) <= rtt)
+            .then_some(copy_gap);
+        // The next attempt is 1.1 x rtt after the copy reached the sender.
         let repeat = NackRepeat {
-            delay: rtt.mul_f64(multiplier) + self.tuning.renack_margin,
+            delay: rtt.mul_f64(multiplier)
+                + self.tuning.renack_margin
+                + copy_gap.unwrap_or_default(),
             backoff: measuring && measured.is_none(),
+            copy_gap,
         };
         let min_time_left = if measuring {
             self.rtt.for_spacing().unwrap_or(Duration::ZERO)
@@ -1491,12 +1504,74 @@ impl SimpleReceiverCore {
             }
             self.nack_packet_scratch = packet;
         }
-        if sent < due.len() {
+        let stopped = sent < due.len();
+        if stopped {
             self.missing_tracker.defer_nacks(&due[sent..], retry_at);
             self.stats.nack_entries_deferred += (due.len() - sent) as u64;
         }
         due.clear();
+        if !stopped && produced < max_packets {
+            let copy_limit = (max_packets - produced).saturating_mul(MAX_NACK_PACKET_REQUESTS);
+            self.missing_tracker
+                .take_due_copies(now, copy_limit, &mut due);
+            let (copies, copy_echo) =
+                self.send_nack_copies(&due, now, now_ntp, echo && produced == 0, send);
+            produced += copies;
+            echo_sent |= copy_echo;
+            due.clear();
+        }
         self.nack_scratch = due;
+        (produced, echo_sent)
+    }
+
+    /// Sends NACK copies (best effort: copies that do not fit the return
+    /// budget or are refused by `send` are dropped; holes are unchanged).
+    fn send_nack_copies(
+        &mut self,
+        copies: &[u32],
+        now: Instant,
+        now_ntp: u64,
+        echo: bool,
+        send: &mut dyn FnMut(&[u8]) -> bool,
+    ) -> (usize, bool) {
+        let mut produced = 0;
+        let mut echo_sent = false;
+        let mut sent = 0;
+        let mut packet = std::mem::take(&mut self.nack_packet_scratch);
+        packet.clear();
+        if !copies.is_empty() {
+            self.encode_receiver_report(now_ntp, &mut packet);
+        }
+        let prefix_len = packet.len();
+        while sent < copies.len() {
+            packet.truncate(prefix_len);
+            let count = encode_nack_chunk(
+                self.nack_mode,
+                self.flow_id,
+                &copies[sent..],
+                MAX_NACK_RECORDS_PER_PACKET,
+                &mut packet,
+            );
+            let with_echo = echo && produced == 0;
+            if with_echo {
+                self.encode_echo_request(now_ntp, &mut packet);
+            }
+            if !self.allow_return_bytes(now, packet.len()) {
+                break;
+            }
+            if !send(&packet) {
+                self.return_window_bytes =
+                    self.return_window_bytes.saturating_sub(packet.len() as u64);
+                break;
+            }
+            self.stats.feedback_packets += 1;
+            self.stats.nack_packets += 1;
+            self.stats.nack_copies_sent += count as u64;
+            echo_sent |= with_echo;
+            produced += 1;
+            sent += count;
+        }
+        self.nack_packet_scratch = packet;
         (produced, echo_sent)
     }
 
@@ -2222,6 +2297,97 @@ mod tests {
             receiver.first_nack_delay(t0 + ms(32)),
             Duration::from_micros(2_500)
         );
+    }
+
+    fn redundant_tuning() -> RecoveryTuning {
+        RecoveryTuning {
+            redundant_nacks: true,
+            ..RecoveryTuning::librist_like()
+        }
+    }
+
+    #[test]
+    fn redundant_nack_is_not_counted_as_attempt() {
+        let (mut receiver, t0) = receiver_with_hole(redundant_tuning(), RecoveryConfig::default());
+        learn_rtt(&mut receiver, ms(30));
+        // Copy gap 30 / 20 = 1.5 ms; next attempt 1.1 x 30 + 1 + 1.5 = 35.5
+        // ms after the first.
+        assert_eq!(
+            nack_times(&mut receiver, t0, 0, 60, 1),
+            vec![15, 17, 51, 53]
+        );
+        let stats = receiver.stats();
+        assert_eq!(receiver.missing_tracker.hole(1).unwrap().nack_count, 2);
+        assert_eq!(stats.nack_entries_sent, 2);
+        assert_eq!(stats.nack_copies_sent, 2);
+        assert_eq!(stats.nack_packets, 4);
+    }
+
+    #[test]
+    fn no_nack_copies_with_congestion_control_off_or_a_tiny_rtt() {
+        let (mut receiver, t0) = receiver_with_hole(redundant_tuning(), RecoveryConfig::default());
+        receiver.congestion_control = CongestionControlMode::Off;
+        learn_rtt(&mut receiver, ms(30));
+        assert_eq!(nack_times(&mut receiver, t0, 0, 50, 1), vec![15, 49]);
+        let recovery = RecoveryConfig {
+            rtt_min: ms(1),
+            ..RecoveryConfig::default()
+        };
+        let (mut receiver, t0) = receiver_with_hole(redundant_tuning(), recovery);
+        learn_rtt(&mut receiver, ms(1));
+        // A 1 ms copy gap would not stay below the sender's spacing.
+        assert_eq!(nack_times(&mut receiver, t0, 0, 20, 1), vec![15, 18]);
+        assert_eq!(receiver.stats().nack_copies_sent, 0);
+    }
+
+    #[test]
+    fn spacing_refuses_copy_accepts_next_attempt() {
+        let start = Instant::now();
+        let base = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut sender = SimpleSenderCore::new(FLOW, 64);
+        // The sender measured 1.05 x the receiver's RTT.
+        let request = sender.build_echo_request(base);
+        let mut echo_peer = SimpleReceiverCore::new(FLOW, "rust", NackMode::Range);
+        let response = echo_peer.handle_rtcp_at(&request, base).unwrap().remove(0);
+        sender
+            .handle_feedback_outcome_at(&response, base + (31_500u64 << 32) / 1_000_000, start)
+            .unwrap();
+        assert_eq!(sender.stats().rtt_micros, Some(31_500));
+        let t0 = start;
+        for index in 0..3_u32 {
+            sender.send_payload(&index.to_be_bytes(), base, t0);
+        }
+        let mut receiver = SimpleReceiverCore::new(FLOW, "rust", NackMode::Range)
+            .with_recovery_tuning(redundant_tuning());
+        receiver.accept_packet_at(&data(0), t0).unwrap();
+        receiver.accept_packet_at(&data(2), t0).unwrap();
+        learn_rtt(&mut receiver, ms(30));
+        let mut served = Vec::new();
+        for offset in 0..=60 {
+            let now = t0 + ms(offset);
+            let mut packets = Vec::new();
+            receiver.poll_rtcp_into(now, base, &mut packets, 64);
+            for packet in packets {
+                if decode_nacks_from_compound(&packet).unwrap().is_empty() {
+                    continue;
+                }
+                let outcome = sender
+                    .handle_feedback_outcome_at(&packet, base, now)
+                    .unwrap();
+                served.push((offset, outcome.retries.len()));
+            }
+        }
+        // Each copy is refused because its attempt arrived; the next
+        // attempt clears the 0.9 x 31.5 ms spacing.
+        assert_eq!(served, vec![(15, 1), (17, 0), (51, 1), (53, 0)]);
+        assert_eq!(sender.stats().retransmit_refused_spacing, 2);
+
+        // When an attempt is lost, its copy is the first request: served.
+        let mut lonely = SimpleSenderCore::new(FLOW, 64);
+        for index in 0..3_u32 {
+            lonely.send_payload(&index.to_be_bytes(), base, t0);
+        }
+        assert_eq!(lonely.retransmit_at(&[1], t0 + ms(17)).len(), 1);
     }
 
     #[test]
