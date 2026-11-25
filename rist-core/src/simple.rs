@@ -1850,7 +1850,11 @@ impl SimpleReceiverCore {
         for packet in decode_compound(packet)? {
             match packet {
                 RtcpPacket::SenderReport(report) => {
-                    self.peer_ssrc = Some(report.ssrc);
+                    // As on data: the SSRC's least significant bit is the
+                    // retry mark, not part of the flow id, so an odd SSRC
+                    // here must not look like a new sender to the next
+                    // data packet (which would drop every open hole).
+                    self.peer_ssrc = Some(report.ssrc & !1);
                     self.last_sender_report = Some((report.ntp_timestamp, now_ntp));
                 }
                 RtcpPacket::Echo(Echo {
@@ -3639,6 +3643,39 @@ mod tests {
         // The receiver report names the flow, not the retry SSRC.
         let report = receiver.build_receiver_report(ntp);
         assert_eq!(&report[8..12], &0x1122_3344u32.to_be_bytes());
+    }
+
+    #[test]
+    fn sender_report_with_an_odd_ssrc_keeps_the_open_holes() {
+        // A sender whose SSRC has the retry bit set (a legacy rist-rs
+        // sender, or any RTP sender with an odd SSRC): its data and its SR
+        // both carry the odd value.
+        for ssrc in [0x1122_3344, 0x1122_3345] {
+            let mut receiver = SimpleReceiverCore::new(0x1122_3344, "rust", NackMode::Range);
+            let data = |sequence| {
+                encode_packet(RtpHeader::new_mpegts(sequence, 90_000, ssrc), b"data")
+            };
+            receiver.accept_packet(&data(0)).unwrap();
+            receiver.accept_packet(&data(2)).unwrap();
+            assert_eq!(receiver.missing_sequences(), vec![1], "{ssrc:#x}");
+
+            let mut report = Vec::new();
+            encode_sender_report(
+                SenderReport {
+                    ssrc,
+                    ntp_timestamp: ntp_from_unix_duration(Duration::from_secs(1)),
+                    rtp_timestamp: 90_000,
+                    sender_packets: 3,
+                    sender_bytes: 12,
+                },
+                &mut report,
+            );
+            receiver.handle_rtcp(&report).unwrap();
+            let next = receiver.accept_packet(&data(3)).unwrap();
+            assert_eq!(next.sequence, 3, "{ssrc:#x}");
+            assert_eq!(receiver.missing_sequences(), vec![1], "{ssrc:#x}");
+            assert_eq!(receiver.stats().holes_reset, 0, "{ssrc:#x}");
+        }
     }
 
     fn ts_packet(pid: u16, label: &[u8]) -> Vec<u8> {
