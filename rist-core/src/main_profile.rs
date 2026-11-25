@@ -229,6 +229,11 @@ impl MainSenderPeerState {
         self.simple.stats()
     }
 
+    /// When a duplicate repair for this peer is next due.
+    pub fn next_repair_at(&self) -> Option<Instant> {
+        self.simple.next_repair_at()
+    }
+
     pub fn set_tx_key(&mut self, key: PskKey) {
         self.tx_key = Some(key);
     }
@@ -472,6 +477,37 @@ impl MainSenderCore {
             .map(|retry| self.wrap_rtp_for_peer(state, retry.sequence, true, &retry.bytes))
             .collect();
         Ok(MainFeedbackOutcome { retries, responses })
+    }
+
+    /// Repairs the sender sends on its own, due at `now` (see
+    /// [`SimpleSenderCore::poll_repairs_at`]), wrapped.
+    pub fn poll_repairs(&mut self, now: Instant) -> Vec<MainOutboundPacket> {
+        self.simple
+            .poll_repairs_at(now)
+            .into_iter()
+            .map(|repair| self.wrap_rtp(repair.sequence, true, &repair.bytes))
+            .collect()
+    }
+
+    /// [`Self::poll_repairs`] for one peer of a multi-peer sender.
+    pub fn poll_repairs_for_peer(
+        &self,
+        state: &mut MainSenderPeerState,
+        now: Instant,
+    ) -> Vec<MainOutboundPacket> {
+        self.simple
+            .poll_repairs_for_peer_at(&mut state.simple, now)
+            .into_iter()
+            .map(|repair| self.wrap_rtp_for_peer(state, repair.sequence, true, &repair.bytes))
+            .collect()
+    }
+
+    pub fn next_repair_at(&self) -> Option<Instant> {
+        self.simple.next_repair_at()
+    }
+
+    pub fn next_rtcp_at(&self) -> Option<Instant> {
+        self.simple.next_rtcp_at()
     }
 
     pub fn poll_rtcp(&mut self, now: Instant, ntp_timestamp: u64) -> Option<MainControlPacket> {
@@ -1568,6 +1604,45 @@ mod tests {
                 ntp_timestamp: request_ntp,
                 kind: EchoKind::Response { delay: 0 },
             })));
+    }
+
+    #[test]
+    fn main_duplicate_repairs_are_wrapped_and_marked() {
+        let t = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut sender = MainSenderCore::new(0x1122_3344, 64);
+        let mut receiver = MainReceiverCore::new(0x1122_3344, "rust", NackMode::Range);
+        let first = sender.send_payload(b"first", ntp, t);
+        let _lost = sender.send_payload(b"lost", ntp, t);
+        let third = sender.send_payload(b"third", ntp, t);
+        receiver.accept_packet(&first.bytes).unwrap();
+        receiver.accept_packet(&third.bytes).unwrap();
+        let feedback = receiver.build_feedback();
+        let reduced = ReducedHeader {
+            src_port: DEFAULT_VIRT_DST_PORT,
+            dst_port: DEFAULT_VIRT_SRC_PORT,
+        };
+        let payload = ReducedPacket::decode(&feedback.bytes)
+            .unwrap()
+            .payload
+            .to_vec();
+        for at in [t, t + Duration::from_millis(10)] {
+            let outcome = sender
+                .handle_reduced_feedback_outcome(reduced, &payload, ntp, at)
+                .unwrap();
+            assert_eq!(outcome.retries.len(), 1);
+        }
+        let due = sender.next_repair_at().unwrap();
+        let copies = sender.poll_repairs(due);
+        assert_eq!(copies.len(), 1);
+        assert!(copies[0].retry);
+        let decoded = ReducedPacket::decode(&copies[0].bytes).unwrap();
+        assert_eq!(
+            RtpPacket::decode(&decoded.payload).unwrap().header.ssrc,
+            0x1122_3345
+        );
+        let recovered = receiver.accept_packet(&copies[0].bytes).unwrap();
+        assert!(recovered.recovered);
     }
 
     #[test]

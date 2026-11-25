@@ -20,6 +20,7 @@ use crate::{
     CongestionControlMode, MissingTracker, RecoveryConfig, RecoveryMode, RecoveryTuning, Result,
     SequenceExtender,
 };
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 /// Receivers: the minimum gap between two NACK sends of one flow. A NACK
@@ -68,8 +69,14 @@ pub struct SimpleSenderPeerState {
     retry_window_started: Instant,
     retry_window_bytes: u64,
     rtt: RttEstimator,
+    /// Second copies of repairs, due at the instant given (FIFO: the
+    /// duplicate gap is fixed).
+    duplicates: VecDeque<(Instant, u32)>,
     stats: SenderStats,
 }
+
+/// Duplicates waiting at most per peer; more are not scheduled.
+const MAX_PENDING_DUPLICATES: usize = 4_096;
 
 #[derive(Debug, Clone, Copy)]
 struct SenderPeerRetrySlot {
@@ -98,6 +105,7 @@ impl SimpleSenderPeerState {
             retry_window_started: Instant::now(),
             retry_window_bytes: 0,
             rtt: RttEstimator::new(),
+            duplicates: VecDeque::new(),
             stats: SenderStats::new(flow_id),
         }
     }
@@ -109,6 +117,11 @@ impl SimpleSenderPeerState {
     /// The peer's RTT as measured by this sender's echo requests.
     pub fn rtt(&self) -> RttEstimator {
         self.rtt
+    }
+
+    /// When a duplicate repair for this peer is next due.
+    pub fn next_repair_at(&self) -> Option<Instant> {
+        self.duplicates.front().map(|(due, _)| *due)
     }
 
     pub fn record_send(&mut self, bytes: usize) {
@@ -150,7 +163,7 @@ impl SimpleSenderPeerState {
         now: Instant,
         minimum_spacing: Duration,
         maximum_retries: u32,
-    ) -> std::result::Result<(), RetryRefusal> {
+    ) -> std::result::Result<u32, RetryRefusal> {
         let Some(slot) = self
             .retry_slots
             .get_mut(sequence as usize & self.retry_mask)
@@ -175,7 +188,7 @@ impl SimpleSenderPeerState {
         }
         slot.retry_count += 1;
         slot.last_retry_at = Some(now);
-        Ok(())
+        Ok(slot.retry_count)
     }
 }
 
@@ -425,6 +438,41 @@ impl SimpleSenderCore {
         context.retransmit(sequences, now, state)
     }
 
+    /// Repairs the sender sends on its own, due at `now`: second copies of
+    /// late repairs ([`RecoveryTuning::duplicate_late_repairs`]). Send them
+    /// like retransmissions. Call this from the caller's poll; see
+    /// [`Self::next_repair_at`].
+    pub fn poll_repairs_at(&mut self, now: Instant) -> Vec<OutboundPacket> {
+        let mut out = Vec::new();
+        due_duplicates(&self.history, now, &mut self.recovery_state, &mut out);
+        out
+    }
+
+    /// [`Self::poll_repairs_at`] for one peer of a multi-peer sender.
+    pub fn poll_repairs_for_peer_at(
+        &self,
+        state: &mut SimpleSenderPeerState,
+        now: Instant,
+    ) -> Vec<OutboundPacket> {
+        let mut out = Vec::new();
+        due_duplicates(&self.history, now, state, &mut out);
+        out
+    }
+
+    /// When [`Self::poll_repairs_at`] next has something to send.
+    pub fn next_repair_at(&self) -> Option<Instant> {
+        self.recovery_state.next_repair_at()
+    }
+
+    /// When the next SR or echo request of [`Self::poll_rtcp`] is due
+    /// (`None` before the first poll arms the schedule).
+    pub fn next_rtcp_at(&self) -> Option<Instant> {
+        [self.rtcp.next_report, self.rtcp.next_echo]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
     pub fn new_peer_state(&self) -> SimpleSenderPeerState {
         SimpleSenderPeerState::new(self.ssrc, self.history.capacity())
     }
@@ -513,6 +561,7 @@ impl SimpleSenderCore {
             history: &self.history,
             recovery: &self.recovery,
             congestion_control: self.congestion_control,
+            tuning: &self.tuning,
         }
     }
 
@@ -526,6 +575,7 @@ impl SimpleSenderCore {
                 history: &self.history,
                 recovery: &self.recovery,
                 congestion_control: self.congestion_control,
+                tuning: &self.tuning,
             },
             &mut self.recovery_state,
         )
@@ -671,8 +721,8 @@ fn retransmit_from_history(
             state.stats.retransmit_refused_bitrate += 1;
             continue;
         }
-        match state.take_retry(sequence, now, spacing, recovery.max_retries) {
-            Ok(()) => {}
+        let retry_count = match state.take_retry(sequence, now, spacing, recovery.max_retries) {
+            Ok(count) => count,
             Err(RetryRefusal::Spacing) => {
                 state.stats.retransmit_refused_spacing += 1;
                 continue;
@@ -681,7 +731,7 @@ fn retransmit_from_history(
                 state.stats.retransmit_refused_max_retries += 1;
                 continue;
             }
-        }
+        };
         state.retry_window_bytes = state
             .retry_window_bytes
             .saturating_add(packet.payload_len as u64);
@@ -691,8 +741,51 @@ fn retransmit_from_history(
             retry: true,
             bytes: retry_marked(&packet.payload),
         });
+        if context.tuning.duplicate_late_repairs
+            && (retry_count >= 2 || context.last_chance(packet, now, rtt))
+            && state.duplicates.len() < MAX_PENDING_DUPLICATES
+            && (maximum_bytes == 0
+                || state
+                    .retry_window_bytes
+                    .saturating_add(packet.payload_len as u64)
+                    <= maximum_bytes)
+        {
+            // Charged now, sent duplicate_gap later so one loss burst does
+            // not take both copies.
+            state.retry_window_bytes = state
+                .retry_window_bytes
+                .saturating_add(packet.payload_len as u64);
+            state
+                .duplicates
+                .push_back((now + context.tuning.duplicate_gap, sequence));
+        }
     }
     packets
+}
+
+/// Duplicate repairs due at `now` (see `RecoveryTuning::duplicate_late_repairs`).
+fn due_duplicates(
+    history: &SenderHistory,
+    now: Instant,
+    state: &mut SimpleSenderPeerState,
+    out: &mut Vec<OutboundPacket>,
+) {
+    while let Some(&(due, sequence)) = state.duplicates.front() {
+        if due > now {
+            break;
+        }
+        state.duplicates.pop_front();
+        let Some(packet) = history.get(sequence) else {
+            continue;
+        };
+        state.stats.record_retransmit(packet.payload_len);
+        state.stats.duplicate_repairs += 1;
+        out.push(OutboundPacket {
+            sequence,
+            retry: true,
+            bytes: retry_marked(&packet.payload),
+        });
+    }
 }
 
 /// Byte 11 of an RTP packet holds the SSRC's least significant bit.
@@ -718,6 +811,7 @@ struct SenderContext<'a> {
     history: &'a SenderHistory,
     recovery: &'a RecoveryConfig,
     congestion_control: CongestionControlMode,
+    tuning: &'a RecoveryTuning,
 }
 
 impl SenderContext<'_> {
@@ -778,6 +872,17 @@ impl SenderContext<'_> {
         let since_successor =
             now.saturating_duration_since(successor_sent_at(self.history, packet));
         since_successor <= length + rtt + REPAIR_AGE_SLACK
+    }
+}
+
+impl SenderContext<'_> {
+    /// No later attempt for `packet` can bring a repair back in time: the
+    /// receiver would re-request about 1.1 x rtt after this repair and the
+    /// answer needs another half RTT, which is past L after the successor.
+    fn last_chance(&self, packet: &SavedPacket, now: Instant, rtt: Duration) -> bool {
+        let since_successor =
+            now.saturating_duration_since(successor_sent_at(self.history, packet));
+        since_successor + rtt.mul_f64(1.5) > effective_recovery_age(self.recovery)
     }
 }
 
@@ -2637,6 +2742,93 @@ mod tests {
         assert_eq!(sender.stats().retransmit_refused_spacing, 1);
         // 9 shared sequence 1's old slot; it has its own now.
         assert_eq!(sender.retransmit_at(&[9], t + ms(1)).len(), 1);
+    }
+
+    #[test]
+    fn second_attempt_is_sent_twice() {
+        let t = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut sender = SimpleSenderCore::new(FLOW, 64);
+        for index in 0..3_u32 {
+            sender.send_payload(&index.to_be_bytes(), ntp, t);
+        }
+        // First request: one repair, no duplicate (L 1000 leaves time).
+        assert_eq!(sender.retransmit_at(&[1], t).len(), 1);
+        assert_eq!(sender.next_repair_at(), None);
+        // Asked again after the spacing: the first repair was lost, so this
+        // one is sent twice, the copy duplicate_gap (1 ms) later.
+        assert_eq!(sender.retransmit_at(&[1], t + ms(10)).len(), 1);
+        assert_eq!(sender.next_repair_at(), Some(t + ms(11)));
+        assert!(sender
+            .poll_repairs_at(t + Duration::from_micros(10_500))
+            .is_empty());
+        let copies = sender.poll_repairs_at(t + ms(11));
+        assert_eq!(copies.len(), 1);
+        assert_eq!(copies[0].sequence, 1);
+        assert!(copies[0].retry);
+        assert_eq!(
+            RtpPacket::decode(&copies[0].bytes).unwrap().header.ssrc,
+            FLOW | 1
+        );
+        assert_eq!(sender.next_repair_at(), None);
+        let stats = sender.stats();
+        assert_eq!(stats.duplicate_repairs, 1);
+        assert_eq!(stats.retransmitted_packets, 3);
+    }
+
+    #[test]
+    fn last_chance_duplicate_only_when_no_further_attempt_fits() {
+        let t = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        // L 40, rtt = rtt_min 5: a further attempt needs 1.5 x 5 = 7.5 ms.
+        let first_request = |at: u64| {
+            let mut sender = frame_sender(40);
+            for index in 0..3_u32 {
+                sender.send_payload(&index.to_be_bytes(), ntp, t);
+            }
+            sender.retransmit_at(&[1], t + ms(at));
+            sender.next_repair_at()
+        };
+        assert_eq!(
+            first_request(32),
+            None,
+            "32 + 7.5 < 40: another attempt fits"
+        );
+        assert_eq!(
+            first_request(33),
+            Some(t + ms(34)),
+            "33 + 7.5 > 40: last chance"
+        );
+    }
+
+    #[test]
+    fn duplicates_respect_the_retransmit_budget_and_the_switch() {
+        let t = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        // A budget for exactly two payloads per second.
+        let recovery = RecoveryConfig {
+            max_bitrate: 1,
+            ..RecoveryConfig::default()
+        };
+        let mut sender = SimpleSenderCore::new(FLOW, 64)
+            .with_recovery_config(recovery, CongestionControlMode::Normal);
+        let packet = sender.send_payload(&[0; 50], ntp, t);
+        sender.send_payload(&[1; 50], ntp, t);
+        let size = packet.bytes.len() as u64;
+        assert!(2 * size <= 125 && 3 * size > 125);
+        assert_eq!(sender.retransmit_at(&[0], t).len(), 1);
+        assert_eq!(sender.retransmit_at(&[0], t + ms(10)).len(), 1);
+        assert_eq!(sender.next_repair_at(), None, "no room for the copy");
+
+        let mut off = SimpleSenderCore::new(FLOW, 64).with_recovery_tuning(RecoveryTuning {
+            duplicate_late_repairs: false,
+            ..RecoveryTuning::default()
+        });
+        off.send_payload(b"a", ntp, t);
+        off.send_payload(b"b", ntp, t);
+        off.retransmit_at(&[0], t);
+        off.retransmit_at(&[0], t + ms(10));
+        assert_eq!(off.next_repair_at(), None);
     }
 
     #[test]

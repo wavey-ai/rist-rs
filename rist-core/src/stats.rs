@@ -23,6 +23,8 @@ pub struct SenderStats {
     pub feedback_decode_errors: u64,
     /// Echo requests answered.
     pub echo_responses: u64,
+    /// Second copies of late repairs sent (also in retransmitted_packets).
+    pub duplicate_repairs: u64,
 }
 
 impl SenderStats {
@@ -43,6 +45,7 @@ impl SenderStats {
             retransmit_refused_max_retries: 0,
             feedback_decode_errors: 0,
             echo_responses: 0,
+            duplicate_repairs: 0,
         }
     }
 

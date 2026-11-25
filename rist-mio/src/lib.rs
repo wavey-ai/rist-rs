@@ -1020,6 +1020,7 @@ impl SimpleMioSender {
         now: Instant,
         ntp_timestamp: u64,
     ) -> io::Result<Option<usize>> {
+        self.poll_repairs_and_send(now)?;
         self.ensure_rtcp_pending_capacity()?;
         let Some(packet) = self.core.poll_rtcp(now, ntp_timestamp) else {
             return Ok(None);
@@ -1027,11 +1028,15 @@ impl SimpleMioSender {
         self.send_rtcp(&packet).map(Some)
     }
 
+    /// Reads one feedback datagram and sends what it asks for. When the
+    /// socket is drained, sends the repairs due on the sender's own
+    /// schedule (see [`Self::poll_repairs_and_send`]) and returns `None`.
     pub fn try_recv_feedback_and_retransmit(
         &mut self,
         buf: &mut [u8],
     ) -> io::Result<Option<Vec<OutboundPacket>>> {
         let Some((from, feedback)) = self.rtcp_socket.recv_datagram(buf)? else {
+            self.poll_due_repairs()?;
             return Ok(None);
         };
         self.handle_feedback_and_retransmit_from(from, feedback)
@@ -1043,6 +1048,7 @@ impl SimpleMioSender {
         now_ntp: u64,
     ) -> io::Result<Option<Vec<OutboundPacket>>> {
         let Some((from, feedback)) = self.rtcp_socket.recv_datagram(buf)? else {
+            self.poll_due_repairs()?;
             return Ok(None);
         };
         self.handle_feedback_and_retransmit_at_from(from, feedback, now_ntp)
@@ -1065,6 +1071,43 @@ impl SimpleMioSender {
         self.peer = Some(rtp_peer);
         self.send_feedback_outcome(&outcome)?;
         Ok(Some(outcome.retries))
+    }
+
+    /// Sends the repairs the sender owes on its own schedule that are due at
+    /// `now`: second copies of late repairs (and tail probes). The receive
+    /// calls and [`Self::poll_rtcp_and_send`] call this; a caller that
+    /// sleeps can wake at [`Self::next_timeout`]. A full send queue drops
+    /// the rest (they are extra copies). Returns the repairs queued.
+    pub fn poll_repairs_and_send(&mut self, now: Instant) -> io::Result<usize> {
+        if self.peer.is_none() || self.core.next_repair_at().map_or(true, |at| at > now) {
+            return Ok(0);
+        }
+        let mut queued = 0;
+        for repair in self.core.poll_repairs_at(now) {
+            match self.enqueue_packet(&repair.bytes) {
+                Ok(()) => queued += 1,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error),
+            }
+        }
+        self.flush_pending()?;
+        Ok(queued)
+    }
+
+    fn poll_due_repairs(&mut self) -> io::Result<()> {
+        if self.core.next_repair_at().is_some() {
+            self.poll_repairs_and_send(Instant::now())?;
+        }
+        Ok(())
+    }
+
+    /// When the sender next has something to send on its own: an SR or
+    /// echo request ([`Self::poll_rtcp_and_send`]) or a scheduled repair.
+    pub fn next_timeout(&self) -> Option<Instant> {
+        [self.core.next_rtcp_at(), self.core.next_repair_at()]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     /// Echo responses first (best effort: a full queue drops them, as a
@@ -1959,6 +2002,7 @@ impl MainMioSender {
     ) -> io::Result<Option<MainControlPacket>> {
         self.ensure_peer_available()?;
         self.ensure_srp_authenticated()?;
+        self.poll_repairs_and_send(now)?;
         self.ensure_pending_capacity()?;
         let Some(packet) = self.core.poll_rtcp(now, ntp_timestamp) else {
             return Ok(None);
@@ -1966,6 +2010,44 @@ impl MainMioSender {
         self.enqueue_packet(&packet.bytes)?;
         self.flush_pending()?;
         Ok(Some(packet))
+    }
+
+    /// Sends the repairs the sender owes on its own schedule that are due at
+    /// `now`: second copies of late repairs (and tail probes). The receive
+    /// calls and [`Self::poll_rtcp_and_send`] call this; a caller that
+    /// sleeps can wake at [`Self::next_timeout`]. A full send queue drops
+    /// the rest (they are extra copies). Returns the repairs queued.
+    pub fn poll_repairs_and_send(&mut self, now: Instant) -> io::Result<usize> {
+        if self.peer.is_none()
+            || !self.srp_authenticated()
+            || self.core.next_repair_at().map_or(true, |at| at > now)
+        {
+            return Ok(0);
+        }
+        let mut queued = 0;
+        for repair in self.core.poll_repairs(now) {
+            match self.enqueue_packet(&repair.bytes) {
+                Ok(()) => queued += 1,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error),
+            }
+        }
+        self.flush_pending()?;
+        Ok(queued)
+    }
+
+    /// When the sender next has something to send on its own: an SR or
+    /// echo request ([`Self::poll_rtcp_and_send`]), a keepalive
+    /// ([`Self::poll_session_and_send_keepalive`]) or a scheduled repair.
+    pub fn next_timeout(&self) -> Option<Instant> {
+        [
+            self.core.next_rtcp_at(),
+            self.core.next_repair_at(),
+            self.timers.next_keepalive_at(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     pub fn build_keepalive(&mut self, keepalive: GreKeepalive<'_>) -> MainControlPacket {
@@ -2040,8 +2122,15 @@ impl MainMioSender {
         Ok(packet)
     }
 
+    /// Reads one datagram and handles it (feedback is answered and its
+    /// retransmissions sent). When the socket is drained, sends the repairs
+    /// due on the sender's own schedule (see [`Self::poll_repairs_and_send`])
+    /// and returns `None`.
     pub fn try_recv_event(&mut self, buf: &mut [u8]) -> io::Result<Option<MainSenderEvent>> {
         let Some((from, datagram)) = self.socket.recv_datagram(buf)? else {
+            if self.core.next_repair_at().is_some() {
+                self.poll_repairs_and_send(Instant::now())?;
+            }
             return Ok(None);
         };
         let packet = self
@@ -2487,6 +2576,7 @@ impl MainMioMultiSender {
         ntp_timestamp: u64,
     ) -> io::Result<Option<(MainControlPacket, Vec<usize>)>> {
         self.ensure_all_peers_authenticated()?;
+        self.poll_repairs_and_send(now)?;
         let Some(payload) = self.core.poll_rtcp_payload(now, ntp_timestamp) else {
             return Ok(None);
         };
@@ -2503,6 +2593,54 @@ impl MainMioMultiSender {
         }
         self.flush_pending()?;
         Ok(first_packet.map(|packet| (packet, peers)))
+    }
+
+    /// Sends every authenticated peer's repairs due at `now` (second copies
+    /// of late repairs). A full send queue drops the rest. Returns the
+    /// repairs queued.
+    pub fn poll_repairs_and_send(&mut self, now: Instant) -> io::Result<usize> {
+        if self.next_repair_at().map_or(true, |at| at > now) {
+            return Ok(0);
+        }
+        let mut queued = 0;
+        for peer in 0..self.peers.len() {
+            if !peer_authenticated(&self.peer_runtime[peer]) {
+                continue;
+            }
+            let repairs = self
+                .core
+                .poll_repairs_for_peer(&mut self.peer_runtime[peer].sender, now);
+            for repair in repairs {
+                match self.enqueue_datagram(&repair.bytes, vec![self.peers[peer].addr]) {
+                    Ok(()) => queued += 1,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        self.flush_pending()?;
+        Ok(queued)
+    }
+
+    fn next_repair_at(&self) -> Option<Instant> {
+        self.peer_runtime
+            .iter()
+            .filter_map(|runtime| runtime.sender.next_repair_at())
+            .min()
+    }
+
+    /// When the sender next has something to send on its own: an SR or
+    /// echo request, a peer keepalive or a scheduled repair.
+    pub fn next_timeout(&self) -> Option<Instant> {
+        let keepalive = self
+            .peer_runtime
+            .iter()
+            .filter_map(|runtime| runtime.timers.next_keepalive_at())
+            .min();
+        [self.core.next_rtcp_at(), self.next_repair_at(), keepalive]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     pub fn poll_session(&mut self, now: Instant) -> MainSessionPoll {
@@ -2726,8 +2864,14 @@ impl MainMioMultiSender {
         Ok(packet)
     }
 
+    /// Reads one datagram and handles it. When the socket is drained, sends
+    /// the repairs due on the sender's own schedule (see
+    /// [`Self::poll_repairs_and_send`]) and returns `None`.
     pub fn try_recv_event(&mut self, buf: &mut [u8]) -> io::Result<Option<MainSenderEvent>> {
         let Some((from, datagram)) = self.socket.recv_datagram(buf)? else {
+            if self.next_repair_at().is_some() {
+                self.poll_repairs_and_send(Instant::now())?;
+            }
             return Ok(None);
         };
         let Some(peer) = self.peers.iter().position(|peer| peer.addr == from) else {
@@ -5363,6 +5507,60 @@ mod tests {
         // Idle: nothing due before the next echo request (100 ms).
         let next = receiver.next_timeout().unwrap();
         assert!(next > Instant::now() + Duration::from_millis(50));
+    }
+
+    #[test]
+    fn main_sender_sends_duplicate_repairs_when_drained_and_reports_its_deadline() {
+        let flow_id = 0x1122_3344;
+        let now = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut receiver =
+            MainMioReceiver::bind(loopback_any(), flow_id, "rust", NackMode::Range).unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+        let mut sender =
+            MainMioSender::connect(loopback_any(), receiver_addr, flow_id, 64).unwrap();
+        let sender_addr = sender.local_addr().unwrap();
+        assert_eq!(sender.next_timeout(), None, "nothing armed yet");
+        sender.poll_rtcp_and_send(now, ntp).unwrap();
+        let idle = sender.next_timeout().unwrap();
+        assert!(idle > now && idle <= now + Duration::from_millis(100));
+
+        let first = sender.build_payload(b"first", ntp, now);
+        let _lost = sender.build_payload(b"lost", ntp, now);
+        let third = sender.build_payload(b"third", ntp, now);
+        sender.send_outbound(&first).unwrap();
+        sender.send_outbound(&third).unwrap();
+        let mut rx_buf = [0u8; 1500];
+        recv_main_payload_eventually(&mut receiver, &mut rx_buf);
+        recv_main_payload_eventually(&mut receiver, &mut rx_buf);
+
+        // Two requests for the same hole, beyond the sender's spacing: the
+        // second repair is sent twice.
+        let mut tx_buf = [0u8; 1500];
+        receiver.send_feedback_to(sender_addr).unwrap();
+        assert_eq!(
+            recv_main_feedback_eventually(&mut sender, &mut tx_buf).len(),
+            1
+        );
+        thread::sleep(Duration::from_millis(10));
+        receiver.send_feedback_to(sender_addr).unwrap();
+        assert_eq!(
+            recv_main_feedback_eventually(&mut sender, &mut tx_buf).len(),
+            1
+        );
+        let due = sender.next_timeout().unwrap();
+        assert!(due <= Instant::now() + Duration::from_millis(1));
+        thread::sleep(Duration::from_millis(2));
+        // A drained receive sends it.
+        assert!(sender.try_recv_event(&mut tx_buf).unwrap().is_none());
+        assert_eq!(sender.stats().duplicate_repairs, 1);
+
+        let mut copies = Vec::new();
+        while copies.len() < 3 {
+            let payload = recv_main_payload_eventually(&mut receiver, &mut rx_buf);
+            copies.push((payload.recovered, payload.duplicate));
+        }
+        assert_eq!(copies, vec![(true, false), (false, true), (false, true)]);
     }
 
     #[test]
