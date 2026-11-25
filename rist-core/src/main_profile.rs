@@ -1597,7 +1597,7 @@ mod tests {
         assert_eq!(outcome.responses.len(), 1);
         let decoded = ReducedPacket::decode(&outcome.responses[0].bytes).unwrap();
         assert_eq!(decoded.reduced.src_port, DEFAULT_VIRT_SRC_PORT);
-        assert!(decode_compound(&decoded.payload)
+        assert!(decode_compound(decoded.payload)
             .unwrap()
             .contains(&RtcpPacket::Echo(Echo {
                 ssrc: 0x1122_3344,
@@ -1638,7 +1638,7 @@ mod tests {
         assert!(copies[0].retry);
         let decoded = ReducedPacket::decode(&copies[0].bytes).unwrap();
         assert_eq!(
-            RtpPacket::decode(&decoded.payload).unwrap().header.ssrc,
+            RtpPacket::decode(decoded.payload).unwrap().header.ssrc,
             0x1122_3345
         );
         let recovered = receiver.accept_packet(&copies[0].bytes).unwrap();
@@ -1662,7 +1662,7 @@ mod tests {
         let retries = sender.handle_feedback(&feedback.bytes).unwrap();
         assert_eq!(retries.len(), 1);
         let decoded = ReducedPacket::decode(&retries[0].bytes).unwrap();
-        let rtp = RtpPacket::decode(&decoded.payload).unwrap();
+        let rtp = RtpPacket::decode(decoded.payload).unwrap();
         assert_eq!(rtp.header.ssrc, 0x1122_3345, "retries are marked SSRC | 1");
 
         let recovered = receiver.accept_packet(&retries[0].bytes).unwrap();
