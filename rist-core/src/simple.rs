@@ -957,31 +957,37 @@ impl SenderContext<'_> {
 
     /// Whether a repair of `packet` sent now can still be used.
     ///
-    /// The receiver detects a hole when a later packet arrives and keeps
-    /// asking for L after that (rist-rs; librist about 1.1 x L after an
-    /// interpolated insertion time). So the useful age runs from the send
-    /// time of the successor, not of the packet: for the last packet of a
-    /// frame the successor is the next frame, a frame interval later. A
-    /// request is refused only when both
-    /// - the packet is older than L + 2 x rtt_min (librist's sender bound),
-    ///   and
-    /// - its successor was sent more than L + rtt + 5 ms ago (rtt =
-    ///   clamp(measured, rtt_min, rtt_max)).
+    /// A rist-rs receiver detects a hole when a later packet arrives and
+    /// keeps asking for L after that; librist gives up about 1.1 x L after
+    /// the hole's (interpolated) arrival. The detecting packet is the first
+    /// one after the hole that got through: the successor, or, when that
+    /// was lost too (the last two packets of a frame), a packet of the next
+    /// burst. It can have been any packet sent since, so the only age that
+    /// proves a repair useless is that of the newest packet sent: once even
+    /// that is older than L, every possible detection is. A request is
+    /// refused only when both
+    /// - the packet is older than L + 2 x rtt_min (librist's sender bound,
+    ///   which covers librist receivers), and
+    /// - the newest packet was sent more than L + rtt + 5 ms ago (rtt =
+    ///   clamp(measured, rtt_min, rtt_max)): the stream stopped.
     ///
-    /// The newest packet (no successor sent) is always served: no receiver
-    /// can have found it missing by sequence.
+    /// While a stream runs, a request is never refused for its age: the
+    /// receiver stops asking once a repair cannot arrive in time (rist-rs
+    /// skips such NACKs, librist gives up at 1.1 x L), and the history,
+    /// retry limits, spacing and retransmit budget bound the rest.
     fn repair_still_useful(&self, packet: &SavedPacket, now: Instant, rtt: Duration) -> bool {
         let length = effective_recovery_age(self.recovery);
         let age = now.saturating_duration_since(packet.inserted_at);
         if age <= length + self.recovery.rtt_min.saturating_mul(2) {
             return true;
         }
-        if packet.sequence == self.reference {
-            return true;
-        }
-        let since_successor =
-            now.saturating_duration_since(successor_sent_at(self.history, packet));
-        since_successor <= length + rtt + REPAIR_AGE_SLACK
+        let newest_sent = self
+            .history
+            .get(self.reference)
+            .map_or(packet.inserted_at, |newest| {
+                newest.inserted_at.max(packet.inserted_at)
+            });
+        now.saturating_duration_since(newest_sent) <= length + rtt + REPAIR_AGE_SLACK
     }
 }
 
@@ -2724,7 +2730,7 @@ mod tests {
     }
 
     #[test]
-    fn sender_age_by_successor_serves_frame_tail() {
+    fn sender_age_by_newest_send_serves_frame_tails() {
         let t = Instant::now();
         let ntp = ntp_from_unix_duration(Duration::from_secs(1));
         // L 40 ms, rtt_min 5: the tail of one frame, the next frame 40 ms
@@ -2734,8 +2740,22 @@ mod tests {
         sender.send_payload(b"next frame", ntp, t + ms(40));
         assert_eq!(sender.retransmit_at(&[tail.sequence], t + ms(57)).len(), 1);
 
-        // The same NACK once the successor is older than L + rtt + 5 ms
-        // (40 + 5 + 5): the receiver gave up on it, so it is refused.
+        // The last two packets of a frame lost: the next frame detects both,
+        // so the one before the tail is served too, although its successor
+        // was sent at once.
+        let mut sender = frame_sender(40);
+        let before_tail = sender.send_payload(b"before tail", ntp, t);
+        sender.send_payload(b"tail", ntp, t);
+        sender.send_payload(b"next frame", ntp, t + ms(40));
+        assert_eq!(
+            sender
+                .retransmit_at(&[before_tail.sequence], t + ms(57))
+                .len(),
+            1
+        );
+
+        // Once even the newest packet is older than L + rtt + 5 ms
+        // (40 + 5 + 5), no receiver can use a repair: refused.
         let mut sender = frame_sender(40);
         let tail = sender.send_payload(b"tail", ntp, t);
         sender.send_payload(b"next frame", ntp, t + ms(40));
@@ -2749,8 +2769,8 @@ mod tests {
     fn sender_serves_retry_up_to_l_plus_two_rtt_min() {
         let t = Instant::now();
         let ntp = ntp_from_unix_duration(Duration::from_secs(1));
-        // A packet in the middle of a burst: successor sent at once. Up to
-        // L + 2 x rtt_min (50 ms) it is served whatever the successor says.
+        // A packet in the middle of a burst, the stream stopped after it:
+        // served up to L + 2 x rtt_min (50 ms).
         let mut sender = frame_sender(40);
         let packet = sender.send_payload(b"mid", ntp, t);
         sender.send_payload(b"next", ntp, t);
@@ -2764,12 +2784,11 @@ mod tests {
         assert!(sender
             .retransmit_at(&[packet.sequence], t + ms(51))
             .is_empty());
-        // The newest packet has no successor yet: nobody can have found it
-        // missing by sequence, so it is served at any age.
-        let mut sender = frame_sender(40);
-        let newest = sender.send_payload(b"newest", ntp, t);
+        // While the stream runs (a packet sent just now) it is served at
+        // any age: the receiver decides when a repair is too late.
+        sender.send_payload(b"now", ntp, t + ms(200));
         assert_eq!(
-            sender.retransmit_at(&[newest.sequence], t + ms(500)).len(),
+            sender.retransmit_at(&[packet.sequence], t + ms(201)).len(),
             1
         );
     }
