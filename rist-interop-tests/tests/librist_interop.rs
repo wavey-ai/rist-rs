@@ -529,12 +529,19 @@ fn librist_main_sender_sustains_4k_rate_through_16_bit_wrap_without_nacks() {
         .iter()
         .map(|stats| stats.feedback_packets)
         .sum::<u64>();
+    let stats_nack_packets = flow_stats
+        .iter()
+        .map(|stats| stats.nack_packets)
+        .sum::<u64>();
     let elapsed = started.elapsed();
     let payload_mbps =
         f64::from(PACKETS) * PAYLOAD_BYTES as f64 * 8.0 / elapsed.as_secs_f64() / 1_000_000.0;
+    // One receiver report per second plus one echo request (RTT
+    // measurement) per 100 ms, as librist's receiver sends them.
     let maximum_feedback_packets = elapsed
         .as_secs()
         .saturating_add(2)
+        .saturating_mul(11)
         .saturating_mul(flow_stats.len() as u64);
     assert_eq!(received_packets, PACKETS);
     assert_eq!(stats_received_packets, u64::from(PACKETS));
@@ -551,9 +558,10 @@ fn librist_main_sender_sustains_4k_rate_through_16_bit_wrap_without_nacks() {
         stats_recovered_packets, 0,
         "zero-loss run unexpectedly entered recovery"
     );
+    assert_eq!(stats_nack_packets, 0, "zero-loss run sent NACKs");
     assert!(
         stats_feedback_packets <= maximum_feedback_packets,
-        "zero-loss run generated {} feedback packets in {:.3}s; expected at most {maximum_feedback_packets} periodic reports",
+        "zero-loss run generated {} feedback packets in {:.3}s; expected at most {maximum_feedback_packets} periodic reports and echo requests",
         stats_feedback_packets,
         elapsed.as_secs_f64()
     );
@@ -667,6 +675,138 @@ fn librist_main_sender_recovers_every_injected_loss_for_pure_rust_receiver() {
         0,
         "C media flows retained missing packets: {flow_stats:?}"
     );
+    // librist marks its repairs (SSRC | 1); they recover holes instead of
+    // looking like a new flow, and give the receiver Karn RTT samples.
+    let sum = |field: fn(&rist_core::ReceiverStats) -> u64| {
+        flow_stats
+            .iter()
+            .map(|(_, stats)| field(stats))
+            .sum::<u64>()
+    };
+    assert!(
+        sum(|stats| stats.retry_packets_received) >= 4,
+        "librist repairs not seen as retries: {flow_stats:?}"
+    );
+    assert!(
+        sum(|stats| stats.rtt_samples_echo + stats.rtt_samples_karn) >= 1,
+        "no RTT measured against librist: {flow_stats:?}"
+    );
+}
+
+#[test]
+fn pure_rust_main_sender_recovers_every_injected_loss_for_librist_receiver() {
+    if !interop_enabled() {
+        return;
+    }
+    let _guard = lock_interop();
+
+    const PACKETS: u8 = 21;
+    const DROP_EVERY: u64 = 5;
+
+    let port = next_even_test_port_pair();
+    let receiver_url = format!("rist://@127.0.0.1:{port}");
+    let receiver_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+    let mut receiver = rist::Receiver::new(rist::Profile::Main).unwrap();
+    receiver.add_peer(&receiver_url).unwrap();
+    receiver.start().unwrap();
+    let mut proxy = LossProxy::bind(LossProxyConfig {
+        listen: loopback_any(),
+        upstream_bind: loopback_any(),
+        target: receiver_addr,
+        drop_every: DROP_EVERY,
+    })
+    .unwrap();
+    let mut sender = MainMioSender::connect(
+        loopback_any(),
+        proxy.listen_addr().unwrap(),
+        0x1122_3344,
+        64,
+    )
+    .unwrap();
+    send_main_session_probe(&mut sender);
+    proxy.poll().unwrap();
+
+    let mut sender_buf = vec![0; 65_536];
+    let mut serve = |sender: &mut MainMioSender, proxy: &mut LossProxy| {
+        proxy.poll().unwrap();
+        while sender.try_recv_event(&mut sender_buf).unwrap().is_some() {}
+        sender
+            .poll_rtcp_and_send(Instant::now(), ntp_now())
+            .unwrap();
+        proxy.poll().unwrap();
+    };
+    for index in 0..PACKETS {
+        let payload = mpegts_payload_7(&format!("PURE RUST LOSS {index:02}"));
+        sender
+            .send_payload(&payload, ntp_now(), Instant::now())
+            .unwrap();
+        serve(&mut sender, &mut proxy);
+        thread::sleep(Duration::from_millis(2));
+    }
+
+    // The librist receiver NACKs the dropped packets through the proxy and
+    // the rist-rs sender repairs them (marked SSRC | 1).
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut received = HashSet::new();
+    while received.len() < usize::from(PACKETS) {
+        serve(&mut sender, &mut proxy);
+        if let Some(block) = receiver.read(Duration::from_millis(2)).unwrap() {
+            let label = block
+                .payload()
+                .windows(17)
+                .find(|window| window.starts_with(b"PURE RUST LOSS "))
+                .map(|window| window[15..17].to_vec())
+                .expect("payload label");
+            received.insert(label);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out after receiving {} of {PACKETS} payloads; proxy={:?}, sender={:?}",
+            received.len(),
+            proxy.stats(),
+            sender.stats()
+        );
+    }
+    let stats = proxy.stats();
+    assert_eq!(stats.injected_drops, 4);
+    assert!(stats.all_injected_drops_recovered(), "{stats:?}");
+    assert!(sender.stats().retransmitted_packets >= 4);
+}
+
+#[test]
+fn librist_receiver_gets_echo_answers_from_pure_rust_sender() {
+    if !interop_enabled() {
+        return;
+    }
+    let _guard = lock_interop();
+
+    let port = next_even_test_port_pair();
+    let receiver_url = format!("rist://@127.0.0.1:{port}");
+    let receiver_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+    let mut receiver = rist::Receiver::new(rist::Profile::Main).unwrap();
+    receiver.add_peer(&receiver_url).unwrap();
+    receiver.start().unwrap();
+    let mut sender =
+        MainMioSender::connect(loopback_any(), receiver_addr, 0x1122_3344, 64).unwrap();
+    send_main_session_probe(&mut sender);
+
+    // librist's receiver sends an echo request with its periodic RTCP
+    // (every 100 ms); the rist-rs sender answers each one.
+    let payload = mpegts_payload_7("PURE RUST ECHO");
+    let mut sender_buf = vec![0; 65_536];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while sender.stats().echo_responses < 2 {
+        sender
+            .send_payload(&payload, ntp_now(), Instant::now())
+            .unwrap();
+        while sender.try_recv_event(&mut sender_buf).unwrap().is_some() {}
+        let _ = receiver.read(Duration::from_millis(5)).unwrap();
+        assert!(
+            Instant::now() < deadline,
+            "librist receiver sent no echo request: {:?}",
+            sender.stats()
+        );
+    }
 }
 
 #[test]
