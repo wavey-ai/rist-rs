@@ -936,8 +936,7 @@ impl SenderContext<'_> {
     ) -> Result<FeedbackOutcome> {
         state.stats.record_feedback();
         let mut echo_requests = Vec::new();
-        let sequences =
-            decode_sender_feedback(packet, now_ntp, self, state, &mut echo_requests)?;
+        let sequences = decode_sender_feedback(packet, now_ntp, self, state, &mut echo_requests)?;
         if !sequences.is_empty() {
             state.last_nack_at = Some(now);
         }
@@ -2926,6 +2925,38 @@ mod tests {
     }
 
     #[test]
+    fn history_stops_growing_at_the_16_bit_nack_horizon() {
+        let t = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        assert_eq!(
+            RecoveryTuning::default().max_history_packets,
+            crate::recovery::MAX_ADDRESSABLE_HISTORY
+        );
+        // Even when asked for more, 40 000 packets inside the retention
+        // grow the table to 2^15 only.
+        let mut sender = SimpleSenderCore::new(FLOW, 8).with_recovery_tuning(RecoveryTuning {
+            max_history_packets: 1 << 20,
+            ..RecoveryTuning::default()
+        });
+        for _ in 0..40_000 {
+            sender.send_payload(b"", ntp, t);
+        }
+        assert_eq!(sender.history_capacity(), 1 << 15);
+        // Everything a NACK can still name (32 767 behind the newest) is
+        // there; what is further back could not be requested anyway.
+        let newest = 39_999_u32;
+        let oldest_addressable = newest - 0x7fff;
+        assert_eq!(
+            extend_near(newest, oldest_addressable as u16),
+            oldest_addressable
+        );
+        assert_eq!(sender.retransmit_at(&[oldest_addressable], t).len(), 1);
+        // A fixed history asked for explicitly is never shrunk.
+        let large = SimpleSenderCore::new(FLOW, 1 << 16);
+        assert_eq!(large.history_capacity(), 1 << 16);
+    }
+
+    #[test]
     fn retry_spacing_survives_history_growth() {
         let t = Instant::now();
         let ntp = ntp_from_unix_duration(Duration::from_secs(1));
@@ -3726,8 +3757,14 @@ mod tests {
         assert!(receiver.accept_packet(&retry[0].bytes).unwrap().recovered);
         assert_eq!(receiver.stats().retry_packets_received, 1);
         // RTCP and stats name the even flow id too.
-        assert_eq!(&sender.build_sender_report(ntp)[4..8], &0x1122_3344u32.to_be_bytes());
-        assert_eq!(&sender.build_echo_request(ntp)[4..8], &0x1122_3344u32.to_be_bytes());
+        assert_eq!(
+            &sender.build_sender_report(ntp)[4..8],
+            &0x1122_3344u32.to_be_bytes()
+        );
+        assert_eq!(
+            &sender.build_echo_request(ntp)[4..8],
+            &0x1122_3344u32.to_be_bytes()
+        );
         assert_eq!(sender.stats().flow_id, 0x1122_3344);
     }
 
@@ -3738,9 +3775,8 @@ mod tests {
         // both carry the odd value.
         for ssrc in [0x1122_3344, 0x1122_3345] {
             let mut receiver = SimpleReceiverCore::new(0x1122_3344, "rust", NackMode::Range);
-            let data = |sequence| {
-                encode_packet(RtpHeader::new_mpegts(sequence, 90_000, ssrc), b"data")
-            };
+            let data =
+                |sequence| encode_packet(RtpHeader::new_mpegts(sequence, 90_000, ssrc), b"data");
             receiver.accept_packet(&data(0)).unwrap();
             receiver.accept_packet(&data(2)).unwrap();
             assert_eq!(receiver.missing_sequences(), vec![1], "{ssrc:#x}");

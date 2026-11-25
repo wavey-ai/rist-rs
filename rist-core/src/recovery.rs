@@ -19,6 +19,11 @@ pub struct SavedPacket {
     pub payload: Vec<u8>,
 }
 
+/// The most packets a sender history grows to by time: requests carry
+/// 16-bit sequences that the sender extends near the newest sequence sent,
+/// so nothing more than 2^15 behind it can ever be named.
+pub const MAX_ADDRESSABLE_HISTORY: usize = 1 << 15;
+
 #[derive(Debug, Clone)]
 pub struct SenderHistory {
     slots: Vec<Option<SavedPacket>>,
@@ -195,12 +200,17 @@ impl SenderHistory {
 
     /// Keeps every packet for at least `retention` after it was sent: an
     /// insert that would evict a younger packet doubles the history first,
-    /// up to `max_packets` (rounded up to a power of two). Zero retention
-    /// (the default) keeps the fixed packet count of [`Self::new`]. A
+    /// up to `max_packets` (rounded up to a power of two), and never past
+    /// [`MAX_ADDRESSABLE_HISTORY`]: a NACK names 16-bit sequences, so a
+    /// packet further behind the newest cannot be requested and a larger
+    /// table would only hold memory. Zero retention (the default) keeps the
+    /// fixed packet count of [`Self::new`], which is never shrunk. A
     /// history created with zero packets stays disabled.
     pub fn set_retention(&mut self, retention: Duration, max_packets: usize) {
         self.retention = retention;
-        self.max_packets = max_packets.max(self.slots.len());
+        self.max_packets = max_packets
+            .min(MAX_ADDRESSABLE_HISTORY)
+            .max(self.slots.len());
     }
 
     pub fn retention(&self) -> Duration {

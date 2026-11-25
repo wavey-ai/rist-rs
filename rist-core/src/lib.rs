@@ -45,6 +45,7 @@ pub use profile::Profile;
 pub use recovery::{
     HoleInfo, HoleStatus, MissingTracker, NackRepeat, NackSchedule, OrderedPayloadBuffer,
     OrderedPayloadBufferError, ReceiverObservation, RecoveredHole, SenderHistory, TrackerCounters,
+    MAX_ADDRESSABLE_HISTORY,
 };
 pub use rtt::RttEstimator;
 pub use sequence::SequenceExtender;

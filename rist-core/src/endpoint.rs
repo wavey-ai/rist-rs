@@ -97,7 +97,9 @@ pub struct RecoveryTuning {
     /// [`TailProbe::Auto`]: how long after the last NACK probes stay on.
     pub tail_probe_loss_window: Duration,
     /// Sender: keep packets for at least `L + 2 x rtt_max` by growing the
-    /// history (up to `max_history_packets`) instead of evicting by count.
+    /// history (up to `max_history_packets`, itself capped at
+    /// [`crate::recovery::MAX_ADDRESSABLE_HISTORY`], the 16-bit NACK
+    /// horizon) instead of evicting by count.
     pub history_by_time: bool,
     pub max_history_packets: usize,
 }
@@ -116,7 +118,7 @@ impl Default for RecoveryTuning {
             tail_probe_max_per_mille: 20,
             tail_probe_loss_window: Duration::from_secs(10),
             history_by_time: true,
-            max_history_packets: 1 << 19,
+            max_history_packets: crate::recovery::MAX_ADDRESSABLE_HISTORY,
         }
     }
 }
