@@ -709,10 +709,8 @@ impl SimpleReceiverCore {
             self.base_sequence = None;
             self.highest_sequence = None;
         }
-        // Extend relative to the highest sequence seen, not the last packet:
-        // a repair far behind must not shift the cycle of the next packet.
         let sequence = match self.highest_sequence {
-            Some(highest) => extend_near(highest, packet.header.sequence_number),
+            Some(highest) => self.extend_received(highest, packet.header.sequence_number),
             None => self.sequence_extender.extend(packet.header.sequence_number),
         };
         self.peer_ssrc = Some(packet.header.ssrc);
@@ -751,6 +749,30 @@ impl SimpleReceiverCore {
             newly_missing: observation.newly_missing,
             payload,
         })
+    }
+
+    /// Extends a received 16-bit sequence relative to the highest sequence
+    /// seen, not the last packet, so a repair far behind does not shift the
+    /// cycle of the next packet.
+    ///
+    /// A low-16 value up to 32767 behind the highest is read as behind only
+    /// when that reading can be a repair or a duplicate: it is within the
+    /// duplicate-detection ring, or an open (or recovered) hole is tracked
+    /// for it. Otherwise it is read forward, as the first packet after a gap
+    /// of more than 32767 (a long outage), so the tracker moves its highest
+    /// sequence on instead of refusing every later packet as a duplicate.
+    fn extend_received(&self, highest: u32, sequence: u16) -> u32 {
+        let near = extend_near(highest, sequence);
+        let behind = highest.wrapping_sub(near);
+        if behind == 0 || behind >= 1 << 31 {
+            return near;
+        }
+        if (behind as usize) < self.missing_tracker.capacity()
+            || (behind <= MAX_TRACKED_HOLE_DISTANCE && self.missing_tracker.hole(near).is_some())
+        {
+            return near;
+        }
+        highest.wrapping_add(u32::from(sequence.wrapping_sub(highest as u16)))
     }
 
     pub fn build_feedback(&self) -> Vec<u8> {
@@ -1613,6 +1635,56 @@ mod tests {
         assert_eq!(next.sequence, 42_000);
         assert!(!next.duplicate);
         assert_eq!(next.newly_missing.len(), 1_999);
+    }
+
+    #[test]
+    fn outage_longer_than_horizon_resyncs_without_dropping() {
+        let start = Instant::now();
+        let mut receiver = SimpleReceiverCore::new(1, "rust", NackMode::Range);
+        let packet =
+            |sequence: u32| encode_packet(RtpHeader::new_mpegts(sequence as u16, 0, 1), b"ts");
+        for sequence in 0..=1_000 {
+            receiver.accept_packet_at(&packet(sequence), start).unwrap();
+        }
+        // An outage of 40000 packets: the low 16 bits of the next packet lie
+        // 25535 "behind" the highest, beyond the duplicate ring, with no hole.
+        assert!(receiver.missing_tracker.capacity() < 25_535);
+        for sequence in 41_001..=41_100 {
+            let received = receiver.accept_packet_at(&packet(sequence), start).unwrap();
+            assert!(!received.duplicate, "{sequence} refused as a duplicate");
+            assert!(!received.recovered);
+            assert_eq!(received.sequence, sequence);
+        }
+        assert_eq!(receiver.highest_sequence, Some(41_100));
+        // Of the 40000 lost, those within the horizon of 41100 stay tracked.
+        let oldest = 41_100 - MAX_TRACKED_HOLE_DISTANCE;
+        let missing = receiver.missing_sequences();
+        assert_eq!(missing.first(), Some(&oldest));
+        assert_eq!(missing.last(), Some(&41_000));
+        let stats = receiver.stats();
+        assert_eq!(stats.duplicate_packets, 0);
+        assert_eq!(stats.holes_unaddressable, u64::from(oldest - 1_001));
+    }
+
+    #[test]
+    fn packets_behind_within_the_ring_or_on_a_hole_still_extend_backward() {
+        let start = Instant::now();
+        let mut receiver = SimpleReceiverCore::new(1, "rust", NackMode::Range);
+        let packet =
+            |sequence: u32| encode_packet(RtpHeader::new_mpegts(sequence as u16, 0, 1), b"ts");
+        receiver.accept_packet_at(&packet(65_530), start).unwrap();
+        // Forward across the 16-bit wrap, leaving 65531..=65535 missing.
+        let wrapped = receiver.accept_packet_at(&packet(65_536), start).unwrap();
+        assert_eq!(wrapped.sequence, 65_536);
+        assert_eq!(wrapped.newly_missing.len(), 5);
+        // A duplicate inside the ring stays a duplicate.
+        let duplicate = receiver.accept_packet_at(&packet(65_530), start).unwrap();
+        assert!(duplicate.duplicate);
+        assert_eq!(duplicate.sequence, 65_530);
+        // A repair of an open hole stays a repair.
+        let repair = receiver.accept_packet_at(&packet(65_533), start).unwrap();
+        assert!(repair.recovered);
+        assert_eq!(repair.sequence, 65_533);
     }
 
     #[test]
