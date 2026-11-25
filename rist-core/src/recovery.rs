@@ -24,6 +24,8 @@ pub struct SenderHistory {
     slots: Vec<Option<SavedPacket>>,
     mask: usize,
     len: usize,
+    retention: Duration,
+    max_packets: usize,
 }
 
 /// Restores wire order before a recovered RIST payload is exposed as bytes.
@@ -186,12 +188,31 @@ impl SenderHistory {
             slots: vec![None; capacity],
             mask: capacity.saturating_sub(1),
             len: 0,
+            retention: Duration::ZERO,
+            max_packets: capacity,
         }
+    }
+
+    /// Keeps every packet for at least `retention` after it was sent: an
+    /// insert that would evict a younger packet doubles the history first,
+    /// up to `max_packets` (rounded up to a power of two). Zero retention
+    /// (the default) keeps the fixed packet count of [`Self::new`]. A
+    /// history created with zero packets stays disabled.
+    pub fn set_retention(&mut self, retention: Duration, max_packets: usize) {
+        self.retention = retention;
+        self.max_packets = max_packets.max(self.slots.len());
+    }
+
+    pub fn retention(&self) -> Duration {
+        self.retention
     }
 
     pub fn insert(&mut self, sequence: u32, payload: impl Into<Vec<u8>>, now: Instant) {
         if self.slots.is_empty() {
             return;
+        }
+        while self.evicts_young(sequence, now) && self.slots.len() < self.max_packets {
+            self.grow();
         }
         let payload = payload.into();
         let slot = &mut self.slots[sequence as usize & self.mask];
@@ -206,6 +227,30 @@ impl SenderHistory {
             payload_len: payload.len(),
             payload,
         });
+    }
+
+    fn evicts_young(&self, sequence: u32, now: Instant) -> bool {
+        !self.retention.is_zero()
+            && self.slots[sequence as usize & self.mask]
+                .as_ref()
+                .is_some_and(|old| {
+                    old.sequence != sequence
+                        && now.saturating_duration_since(old.inserted_at) < self.retention
+                })
+    }
+
+    /// Doubles the slot table. Entries keep their low bits, so no two land
+    /// on the same new slot.
+    fn grow(&mut self) {
+        let capacity = self.slots.len() * 2;
+        let mask = capacity - 1;
+        let mut slots = vec![None; capacity];
+        for packet in self.slots.drain(..).flatten() {
+            let index = packet.sequence as usize & mask;
+            slots[index] = Some(packet);
+        }
+        self.slots = slots;
+        self.mask = mask;
     }
 
     pub fn get(&self, sequence: u32) -> Option<&SavedPacket> {

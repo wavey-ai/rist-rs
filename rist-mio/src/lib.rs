@@ -869,6 +869,10 @@ impl SimpleMioSender {
         self.core.set_recovery_config(recovery, congestion_control);
     }
 
+    pub fn set_recovery_tuning(&mut self, tuning: RecoveryTuning) {
+        self.core.set_recovery_tuning(tuning);
+    }
+
     pub fn stats(&self) -> SenderStats {
         self.core.stats()
     }
@@ -1803,6 +1807,10 @@ impl MainMioSender {
         self.core.set_recovery_config(recovery, congestion_control);
     }
 
+    pub fn set_recovery_tuning(&mut self, tuning: RecoveryTuning) {
+        self.core.set_recovery_tuning(tuning);
+    }
+
     pub fn session_config(&self) -> MainSessionConfig {
         self.timers.config()
     }
@@ -2580,6 +2588,10 @@ impl MainMioMultiSender {
         congestion_control: CongestionControlMode,
     ) {
         self.core.set_recovery_config(recovery, congestion_control);
+    }
+
+    pub fn set_recovery_tuning(&mut self, tuning: RecoveryTuning) {
+        self.core.set_recovery_tuning(tuning);
     }
 
     pub fn set_next_rtp_sequence(&mut self, sequence: u32) {

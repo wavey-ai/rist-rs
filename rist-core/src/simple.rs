@@ -9,7 +9,9 @@ use crate::packet::rtp::{
     encode_packet, encode_packet_with_extension, RistRtpExtension, RtpHeader, RtpPacket,
     RTP_PAYLOAD_TYPE_MPEGTS,
 };
-use crate::recovery::{NackRepeat, NackSchedule, SenderHistory, MAX_TRACKED_HOLE_DISTANCE};
+use crate::recovery::{
+    NackRepeat, NackSchedule, SavedPacket, SenderHistory, MAX_TRACKED_HOLE_DISTANCE,
+};
 use crate::rtt::RttEstimator;
 use crate::sequence::extend_near;
 use crate::stats::{ReceiverStats, SenderStats};
@@ -111,6 +113,30 @@ impl SimpleSenderPeerState {
 
     pub fn record_send(&mut self, bytes: usize) {
         self.stats.record_send(bytes);
+    }
+
+    /// Follows a send history that grew: retry slots are indexed like the
+    /// history, so spacing and retry limits stay per sequence.
+    fn grow_retry_slots(&mut self, capacity: usize) {
+        if self.retry_slots.len() >= capacity || self.retry_slots.is_empty() {
+            return;
+        }
+        let mask = capacity - 1;
+        let mut slots = vec![
+            SenderPeerRetrySlot {
+                sequence: 0,
+                retry_count: 0,
+                last_retry_at: None,
+            };
+            capacity
+        ];
+        for slot in self.retry_slots.drain(..) {
+            if slot.last_retry_at.is_some() {
+                slots[slot.sequence as usize & mask] = slot;
+            }
+        }
+        self.retry_slots = slots;
+        self.retry_mask = mask;
     }
 
     fn reset_bitrate_window(&mut self) {
@@ -244,6 +270,7 @@ pub struct SimpleSenderCore {
     stats: SenderStats,
     recovery: RecoveryConfig,
     congestion_control: CongestionControlMode,
+    tuning: RecoveryTuning,
     recovery_state: SimpleSenderPeerState,
 }
 
@@ -259,8 +286,10 @@ impl SimpleSenderCore {
             stats: SenderStats::new(ssrc),
             recovery: RecoveryConfig::default(),
             congestion_control: CongestionControlMode::default(),
+            tuning: RecoveryTuning::default(),
             recovery_state: SimpleSenderPeerState::new(ssrc, history_packets),
         }
+        .with_history_retention()
     }
 
     pub fn with_cname(mut self, cname: impl Into<String>) -> Self {
@@ -295,6 +324,51 @@ impl SimpleSenderCore {
         self.recovery = recovery;
         self.congestion_control = congestion_control;
         self.recovery_state.reset_bitrate_window();
+        self.apply_history_retention();
+    }
+
+    pub fn with_recovery_tuning(mut self, tuning: RecoveryTuning) -> Self {
+        self.set_recovery_tuning(tuning);
+        self
+    }
+
+    pub fn set_recovery_tuning(&mut self, tuning: RecoveryTuning) {
+        self.tuning = tuning;
+        self.apply_history_retention();
+    }
+
+    pub fn recovery_tuning(&self) -> RecoveryTuning {
+        self.tuning
+    }
+
+    /// Packets currently addressable in the send history (it grows with
+    /// [`RecoveryTuning::history_by_time`]).
+    pub fn history_capacity(&self) -> usize {
+        self.history.capacity()
+    }
+
+    fn with_history_retention(mut self) -> Self {
+        self.apply_history_retention();
+        self
+    }
+
+    /// With `history_by_time`, a packet stays in the history for at least
+    /// L + 2 x rtt_max: longer than any repair the age check below can
+    /// still allow, so a request is never refused for want of the packet
+    /// while the receiver could still use it.
+    fn apply_history_retention(&mut self) {
+        let retention = if self.tuning.history_by_time {
+            effective_recovery_age(&self.recovery)
+                + self
+                    .recovery
+                    .rtt_max
+                    .max(self.recovery.rtt_min)
+                    .saturating_mul(2)
+        } else {
+            Duration::ZERO
+        };
+        self.history
+            .set_retention(retention, self.tuning.max_history_packets);
     }
 
     pub fn enable_null_packet_suppression(&mut self) {
@@ -347,14 +421,8 @@ impl SimpleSenderCore {
     }
 
     pub fn retransmit_at(&mut self, sequences: &[u32], now: Instant) -> Vec<OutboundPacket> {
-        retransmit_from_history(
-            &self.history,
-            &self.recovery,
-            self.congestion_control,
-            sequences,
-            now,
-            &mut self.recovery_state,
-        )
+        let (context, state) = self.split();
+        context.retransmit(sequences, now, state)
     }
 
     pub fn new_peer_state(&self) -> SimpleSenderPeerState {
@@ -367,14 +435,7 @@ impl SimpleSenderCore {
         sequences: &[u32],
         now: Instant,
     ) -> Vec<OutboundPacket> {
-        retransmit_from_history(
-            &self.history,
-            &self.recovery,
-            self.congestion_control,
-            sequences,
-            now,
-            state,
-        )
+        self.context().retransmit(sequences, now, state)
     }
 
     /// Retransmissions for one feedback compound. Echo requests in it are
@@ -402,15 +463,8 @@ impl SimpleSenderCore {
         now_ntp: u64,
         now: Instant,
     ) -> Result<FeedbackOutcome> {
-        let context = SenderContext {
-            ssrc: self.ssrc,
-            cname: &self.cname,
-            reference: self.next_sequence.wrapping_sub(1),
-            history: &self.history,
-            recovery: &self.recovery,
-            congestion_control: self.congestion_control,
-        };
-        context.handle_feedback(&mut self.recovery_state, packet, now_ntp, now)
+        let (context, state) = self.split();
+        context.handle_feedback(state, packet, now_ntp, now)
     }
 
     pub fn handle_feedback_for_peer(
@@ -460,6 +514,21 @@ impl SimpleSenderCore {
             recovery: &self.recovery,
             congestion_control: self.congestion_control,
         }
+    }
+
+    /// The shared sender parts beside the single-peer recovery state.
+    fn split(&mut self) -> (SenderContext<'_>, &mut SimpleSenderPeerState) {
+        (
+            SenderContext {
+                ssrc: self.ssrc,
+                cname: &self.cname,
+                reference: self.next_sequence.wrapping_sub(1),
+                history: &self.history,
+                recovery: &self.recovery,
+                congestion_control: self.congestion_control,
+            },
+            &mut self.recovery_state,
+        )
     }
 
     pub fn next_sequence(&self) -> u32 {
@@ -558,13 +627,14 @@ impl SimpleSenderCore {
 }
 
 fn retransmit_from_history(
-    history: &SenderHistory,
-    recovery: &RecoveryConfig,
-    congestion_control: CongestionControlMode,
+    context: &SenderContext<'_>,
     sequences: &[u32],
     now: Instant,
     state: &mut SimpleSenderPeerState,
 ) -> Vec<OutboundPacket> {
+    let history = context.history;
+    let recovery = context.recovery;
+    let congestion_control = context.congestion_control;
     state.stats.nack_requests += sequences.len() as u64;
     if recovery.mode == RecoveryMode::Disabled {
         return Vec::new();
@@ -578,13 +648,17 @@ fn retransmit_from_history(
         .saturating_mul(1_000)
         .saturating_div(8);
     let mut packets = Vec::new();
-    let maximum_age = effective_recovery_age(recovery);
+    let rtt = state
+        .rtt
+        .for_renack()
+        .unwrap_or(recovery.rtt_min)
+        .clamp(recovery.rtt_min, recovery.rtt_max.max(recovery.rtt_min));
     for &sequence in sequences {
         let Some(packet) = history.get(sequence) else {
             state.stats.retransmit_refused_not_in_history += 1;
             continue;
         };
-        if now.saturating_duration_since(packet.inserted_at) > maximum_age {
+        if !context.repair_still_useful(packet, now, rtt) {
             state.stats.retransmit_refused_too_old += 1;
             continue;
         }
@@ -663,16 +737,61 @@ impl SenderContext<'_> {
             .map(|request| build_echo_response(self.ssrc, self.cname, request))
             .collect::<Vec<_>>();
         state.stats.echo_responses += responses.len() as u64;
-        let retries = retransmit_from_history(
-            self.history,
-            self.recovery,
-            self.congestion_control,
-            &sequences,
-            now,
-            state,
-        );
+        let retries = self.retransmit(&sequences, now, state);
         Ok(FeedbackOutcome { retries, responses })
     }
+
+    fn retransmit(
+        &self,
+        sequences: &[u32],
+        now: Instant,
+        state: &mut SimpleSenderPeerState,
+    ) -> Vec<OutboundPacket> {
+        state.grow_retry_slots(self.history.capacity());
+        retransmit_from_history(self, sequences, now, state)
+    }
+
+    /// Whether a repair of `packet` sent now can still be used.
+    ///
+    /// The receiver detects a hole when a later packet arrives and keeps
+    /// asking for L after that (rist-rs; librist about 1.1 x L after an
+    /// interpolated insertion time). So the useful age runs from the send
+    /// time of the successor, not of the packet: for the last packet of a
+    /// frame the successor is the next frame, a frame interval later. A
+    /// request is refused only when both
+    /// - the packet is older than L + 2 x rtt_min (librist's sender bound),
+    ///   and
+    /// - its successor was sent more than L + rtt + 5 ms ago (rtt =
+    ///   clamp(measured, rtt_min, rtt_max)).
+    ///
+    /// The newest packet (no successor sent) is always served: no receiver
+    /// can have found it missing by sequence.
+    fn repair_still_useful(&self, packet: &SavedPacket, now: Instant, rtt: Duration) -> bool {
+        let length = effective_recovery_age(self.recovery);
+        let age = now.saturating_duration_since(packet.inserted_at);
+        if age <= length + self.recovery.rtt_min.saturating_mul(2) {
+            return true;
+        }
+        if packet.sequence == self.reference {
+            return true;
+        }
+        let since_successor =
+            now.saturating_duration_since(successor_sent_at(self.history, packet));
+        since_successor <= length + rtt + REPAIR_AGE_SLACK
+    }
+}
+
+/// Slack on the sender's repair age for jitter between the paths.
+const REPAIR_AGE_SLACK: Duration = Duration::from_millis(5);
+
+/// When the packet after `packet` was first sent (`packet`'s own send time
+/// when the successor is not in the history).
+fn successor_sent_at(history: &SenderHistory, packet: &SavedPacket) -> Instant {
+    history
+        .get(packet.sequence.wrapping_add(1))
+        .map(|successor| successor.inserted_at)
+        .filter(|sent| *sent >= packet.inserted_at)
+        .unwrap_or(packet.inserted_at)
 }
 
 fn build_echo_response(ssrc: u32, cname: &str, request: Echo) -> Vec<u8> {
@@ -2003,8 +2122,11 @@ mod tests {
         let mut expired = SimpleSenderCore::new(1, 8)
             .with_recovery_config(recovery.clone(), CongestionControlMode::Off);
         let old = expired.send_payload(b"old", ntp, start);
+        expired.send_payload(b"successor", ntp, start);
+        // Older than L + 2 x rtt_min (120 ms) and its successor older than
+        // L + rtt + 5 ms (115 ms).
         assert!(expired
-            .retransmit_at(&[old.sequence], start + Duration::from_millis(101))
+            .retransmit_at(&[old.sequence], start + Duration::from_millis(121))
             .is_empty());
 
         // Every refusal is counted by reason.
@@ -2033,6 +2155,147 @@ mod tests {
         assert!(spaced.handle_feedback_at(&[0x80, 201, 0], ntp).is_err());
         assert_eq!(spaced.stats().feedback_decode_errors, 1);
         assert_eq!(spaced.stats().feedback_packets, 1);
+    }
+
+    fn frame_sender(length_ms: u64) -> SimpleSenderCore {
+        let recovery = RecoveryConfig {
+            length_min: ms(length_ms),
+            length_max: ms(length_ms),
+            ..RecoveryConfig::default()
+        };
+        SimpleSenderCore::new(FLOW, 64)
+            .with_recovery_config(recovery, CongestionControlMode::Normal)
+    }
+
+    #[test]
+    fn sender_age_by_successor_serves_frame_tail() {
+        let t = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        // L 40 ms, rtt_min 5: the tail of one frame, the next frame 40 ms
+        // later, the tail NACK 17 ms after that (reorder 15 + RTT 1 + poll).
+        let mut sender = frame_sender(40);
+        let tail = sender.send_payload(b"tail", ntp, t);
+        sender.send_payload(b"next frame", ntp, t + ms(40));
+        assert_eq!(sender.retransmit_at(&[tail.sequence], t + ms(57)).len(), 1);
+
+        // The same NACK once the successor is older than L + rtt + 5 ms
+        // (40 + 5 + 5): the receiver gave up on it, so it is refused.
+        let mut sender = frame_sender(40);
+        let tail = sender.send_payload(b"tail", ntp, t);
+        sender.send_payload(b"next frame", ntp, t + ms(40));
+        assert!(sender
+            .retransmit_at(&[tail.sequence], t + ms(40 + 40 + 5 + 6))
+            .is_empty());
+        assert_eq!(sender.stats().retransmit_refused_too_old, 1);
+    }
+
+    #[test]
+    fn sender_serves_retry_up_to_l_plus_two_rtt_min() {
+        let t = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        // A packet in the middle of a burst: successor sent at once. Up to
+        // L + 2 x rtt_min (50 ms) it is served whatever the successor says.
+        let mut sender = frame_sender(40);
+        let packet = sender.send_payload(b"mid", ntp, t);
+        sender.send_payload(b"next", ntp, t);
+        assert_eq!(
+            sender.retransmit_at(&[packet.sequence], t + ms(50)).len(),
+            1
+        );
+        let mut sender = frame_sender(40);
+        let packet = sender.send_payload(b"mid", ntp, t);
+        sender.send_payload(b"next", ntp, t);
+        assert!(sender
+            .retransmit_at(&[packet.sequence], t + ms(51))
+            .is_empty());
+        // The newest packet has no successor yet: nobody can have found it
+        // missing by sequence, so it is served at any age.
+        let mut sender = frame_sender(40);
+        let newest = sender.send_payload(b"newest", ntp, t);
+        assert_eq!(
+            sender.retransmit_at(&[newest.sequence], t + ms(500)).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn history_grows_to_keep_packets_for_l_plus_two_rtt_max() {
+        let t = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let recovery = RecoveryConfig {
+            length_min: ms(40),
+            length_max: ms(40),
+            rtt_max: ms(20),
+            ..RecoveryConfig::default()
+        };
+        // 8 slots, but 1000 packets sent within the 80 ms retention.
+        let mut sender = SimpleSenderCore::new(FLOW, 8)
+            .with_recovery_config(recovery.clone(), CongestionControlMode::Normal);
+        for index in 0..1_000_u32 {
+            sender.send_payload(
+                &index.to_be_bytes(),
+                ntp,
+                t + Duration::from_micros(u64::from(index) * 50),
+            );
+        }
+        assert_eq!(sender.history_capacity(), 1_024);
+        let now = t + ms(45);
+        assert_eq!(sender.retransmit_at(&[0, 500, 999], now).len(), 3);
+        // Beyond the retention the history evicts again instead of growing.
+        for index in 1_000..3_000_u32 {
+            sender.send_payload(
+                &index.to_be_bytes(),
+                ntp,
+                t + ms(200) + Duration::from_micros(u64::from(index)),
+            );
+        }
+        assert_eq!(sender.history_capacity(), 2_048);
+
+        // With history_by_time off the fixed count of 8 is kept.
+        let mut fixed = SimpleSenderCore::new(FLOW, 8)
+            .with_recovery_config(recovery.clone(), CongestionControlMode::Normal)
+            .with_recovery_tuning(RecoveryTuning {
+                history_by_time: false,
+                ..RecoveryTuning::default()
+            });
+        for index in 0..100_u32 {
+            fixed.send_payload(&index.to_be_bytes(), ntp, t);
+        }
+        assert_eq!(fixed.history_capacity(), 8);
+        assert!(fixed.retransmit_at(&[0], t).is_empty());
+        assert_eq!(fixed.stats().retransmit_refused_not_in_history, 1);
+
+        // And never beyond max_history_packets.
+        let mut capped = SimpleSenderCore::new(FLOW, 8)
+            .with_recovery_config(recovery, CongestionControlMode::Normal)
+            .with_recovery_tuning(RecoveryTuning {
+                max_history_packets: 100,
+                ..RecoveryTuning::default()
+            });
+        for index in 0..1_000_u32 {
+            capped.send_payload(&index.to_be_bytes(), ntp, t);
+        }
+        assert_eq!(capped.history_capacity(), 128);
+    }
+
+    #[test]
+    fn retry_spacing_survives_history_growth() {
+        let t = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut sender = SimpleSenderCore::new(FLOW, 8);
+        for index in 0..4_u32 {
+            sender.send_payload(&index.to_be_bytes(), ntp, t);
+        }
+        assert_eq!(sender.retransmit_at(&[1], t).len(), 1);
+        // The history grows to 16 while sequence 1 is spaced.
+        for index in 4..16_u32 {
+            sender.send_payload(&index.to_be_bytes(), ntp, t);
+        }
+        assert_eq!(sender.history_capacity(), 16);
+        assert!(sender.retransmit_at(&[1], t + ms(1)).is_empty());
+        assert_eq!(sender.stats().retransmit_refused_spacing, 1);
+        // 9 shared sequence 1's old slot; it has its own now.
+        assert_eq!(sender.retransmit_at(&[9], t + ms(1)).len(), 1);
     }
 
     #[test]

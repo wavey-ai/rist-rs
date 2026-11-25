@@ -281,6 +281,19 @@ impl MainSenderCore {
             .set_recovery_config(recovery, congestion_control);
     }
 
+    pub fn set_recovery_tuning(&mut self, tuning: RecoveryTuning) {
+        self.simple.set_recovery_tuning(tuning);
+    }
+
+    pub fn with_recovery_tuning(mut self, tuning: RecoveryTuning) -> Self {
+        self.set_recovery_tuning(tuning);
+        self
+    }
+
+    pub fn recovery_tuning(&self) -> RecoveryTuning {
+        self.simple.recovery_tuning()
+    }
+
     pub fn with_gre_version(mut self, gre_version: u8) -> Self {
         self.gre_version = gre_version;
         self
