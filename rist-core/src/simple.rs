@@ -557,10 +557,24 @@ fn retransmit_from_history(
         packets.push(OutboundPacket {
             sequence: packet.sequence,
             retry: true,
-            bytes: packet.payload.clone(),
+            bytes: retry_marked(&packet.payload),
         });
     }
     packets
+}
+
+/// Byte 11 of an RTP packet holds the SSRC's least significant bit.
+const RTP_SSRC_LSB_OFFSET: usize = 11;
+
+/// A copy of a stored RTP packet with the SSRC retry bit set, as librist
+/// marks retransmissions (`flow_id | 1`). Receivers clear the bit and use it
+/// to tell repairs from originals.
+fn retry_marked(rtp: &[u8]) -> Vec<u8> {
+    let mut bytes = rtp.to_vec();
+    if let Some(byte) = bytes.get_mut(RTP_SSRC_LSB_OFFSET) {
+        *byte |= 1;
+    }
+    bytes
 }
 
 /// Decodes one feedback compound for a sender: updates the RTT from echo
@@ -692,9 +706,27 @@ impl SimpleReceiverCore {
     /// [`Self::accept_rtp_packet`] with the caller's clock reading, so a
     /// transport that already read the clock for the datagram does not read
     /// it again.
+    ///
+    /// A set SSRC least significant bit marks a retransmission (librist, and
+    /// rist-rs senders since P7): it is cleared before the SSRC is compared,
+    /// so a repair never looks like a new sender.
     pub fn accept_rtp_packet_at(
         &mut self,
+        mut packet: RtpPacket<'_>,
+        now: Instant,
+    ) -> Result<ReceivedPayload> {
+        let retry = packet.header.ssrc & 1 == 1;
+        packet.header.ssrc &= !1;
+        self.accept_rtp_packet_with_retry_at(packet, retry, now)
+    }
+
+    /// [`Self::accept_rtp_packet_at`] for a transport that already read and
+    /// cleared the retry bit of the SSRC (the Main profile keys flows by
+    /// `ssrc & !1`). `retry` says whether the datagram was a retransmission.
+    pub fn accept_rtp_packet_with_retry_at(
+        &mut self,
         packet: RtpPacket<'_>,
+        retry: bool,
         now: Instant,
     ) -> Result<ReceivedPayload> {
         if packet.header.payload_type != RTP_PAYLOAD_TYPE_MPEGTS {
@@ -724,6 +756,9 @@ impl SimpleReceiverCore {
             _ => sequence,
         });
         let observation = self.missing_tracker.observe_at(sequence, now);
+        if retry {
+            self.stats.retry_packets_received += 1;
+        }
         let payload = if let Some(extension) = packet.extension {
             if extension.has_null_packet_deletion() {
                 // NPD is an optional transform. A malformed/sender-specific
@@ -1514,7 +1549,8 @@ mod tests {
     fn receiver_resets_sequence_window_when_the_sender_ssrc_restarts() {
         let mut receiver = SimpleReceiverCore::new(1, "rust", NackMode::Range);
         let old = encode_packet(RtpHeader::new_mpegts(40_000, 90_000, 10), b"old");
-        let restarted = encode_packet(RtpHeader::new_mpegts(0, 90_000, 11), b"restarted");
+        // 11 would be SSRC 10's retry bit; a restart picks a new flow id.
+        let restarted = encode_packet(RtpHeader::new_mpegts(0, 90_000, 12), b"restarted");
 
         assert_eq!(receiver.accept_packet(&old).unwrap().sequence, 40_000);
         let received = receiver.accept_packet(&restarted).unwrap();
@@ -1869,6 +1905,50 @@ mod tests {
         assert_eq!(report.highest_sequence, 2);
         // Expected u32::MAX-1 ..= 2 (5 packets), received 2.
         assert_eq!(report.cumulative_packet_loss, 3);
+    }
+
+    #[test]
+    fn retry_sets_ssrc_lsb_and_keeps_every_other_byte() {
+        let now = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut sender = SimpleSenderCore::new(0x1122_3344, 64);
+        let original = sender.send_payload(b"lost", ntp, now);
+        let retries = sender.retransmit_at(&[original.sequence], now);
+        assert_eq!(retries.len(), 1);
+        let retry = &retries[0].bytes;
+        assert_eq!(RtpPacket::decode(retry).unwrap().header.ssrc, 0x1122_3345);
+        let mut unmarked = retry.clone();
+        unmarked[11] &= !1;
+        assert_eq!(unmarked, original.bytes);
+    }
+
+    #[test]
+    fn simple_receiver_accepts_retry_marked_ssrc() {
+        let now = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut sender = SimpleSenderCore::new(0x1122_3344, 64);
+        let mut receiver = SimpleReceiverCore::new(0x1122_3344, "rust", NackMode::Range);
+        let packets = (0..6)
+            .map(|index| sender.send_payload(&[index], ntp, now))
+            .collect::<Vec<_>>();
+        receiver.accept_packet(&packets[0].bytes).unwrap();
+        receiver.accept_packet(&packets[3].bytes).unwrap();
+        receiver.accept_packet(&packets[5].bytes).unwrap();
+        assert_eq!(receiver.missing_sequences(), vec![1, 2, 4]);
+
+        // A librist (or rist-rs) retransmission carries SSRC | 1.
+        let retry = sender.retransmit_at(&[2], now);
+        let recovered = receiver.accept_packet(&retry[0].bytes).unwrap();
+        assert!(recovered.recovered);
+        assert!(!recovered.duplicate);
+        assert_eq!(recovered.payload, vec![2]);
+        // The other holes survive: the retry bit is not a new sender.
+        assert_eq!(receiver.missing_sequences(), vec![1, 4]);
+        assert_eq!(receiver.stats().retry_packets_received, 1);
+        assert_eq!(receiver.stats().holes_reset, 0);
+        // The receiver report names the flow, not the retry SSRC.
+        let report = receiver.build_receiver_report(ntp);
+        assert_eq!(&report[8..12], &0x1122_3344u32.to_be_bytes());
     }
 
     fn ts_packet(pid: u16, label: &[u8]) -> Vec<u8> {

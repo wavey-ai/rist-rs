@@ -103,6 +103,8 @@ pub struct ReceiverStats {
     pub retries_exhausted: u64,
     /// Holes not requested because a NACK could no longer arrive in time.
     pub nack_too_late: u64,
+    /// Data packets that carried the SSRC retry bit (retransmissions).
+    pub retry_packets_received: u64,
 }
 
 impl ReceiverStats {
@@ -126,6 +128,7 @@ impl ReceiverStats {
             late_packets: 0,
             retries_exhausted: 0,
             nack_too_late: 0,
+            retry_packets_received: 0,
         }
     }
 

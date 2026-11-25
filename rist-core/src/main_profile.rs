@@ -797,10 +797,12 @@ impl MainReceiverCore {
     ) -> Result<ReceivedPayload> {
         self.last_reduced = Some(reduced);
         let mut packet = RtpPacket::decode(payload)?;
+        let retry = packet.header.ssrc & 1 == 1;
         let flow_id = packet.header.ssrc & !1;
         packet.header.ssrc = flow_id;
         self.flow_reduced.insert(flow_id, reduced);
-        self.flow_mut(flow_id)?.accept_rtp_packet_at(packet, now)
+        self.flow_mut(flow_id)?
+            .accept_rtp_packet_with_retry_at(packet, retry, now)
     }
 
     pub fn build_feedback(&mut self) -> MainReceiverFeedback {
@@ -1416,6 +1418,32 @@ mod tests {
         assert_eq!(recovered.payload, b"lost");
         assert!(receiver.missing_sequences().is_empty());
         assert_eq!(receiver.stats().recovered_packets, 1);
+    }
+
+    #[test]
+    fn main_retransmission_carries_the_retry_bit_and_round_trips() {
+        let now = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut sender = MainSenderCore::new(0x1122_3344, 64);
+        let mut receiver = MainReceiverCore::new(0x1122_3344, "rust", NackMode::Range);
+
+        let first = sender.send_payload(b"first", ntp, now);
+        let _lost = sender.send_payload(b"lost", ntp, now);
+        let third = sender.send_payload(b"third", ntp, now);
+        receiver.accept_packet(&first.bytes).unwrap();
+        receiver.accept_packet(&third.bytes).unwrap();
+
+        let feedback = receiver.build_feedback();
+        let retries = sender.handle_feedback(&feedback.bytes).unwrap();
+        assert_eq!(retries.len(), 1);
+        let decoded = ReducedPacket::decode(&retries[0].bytes).unwrap();
+        let rtp = RtpPacket::decode(&decoded.payload).unwrap();
+        assert_eq!(rtp.header.ssrc, 0x1122_3345, "retries are marked SSRC | 1");
+
+        let recovered = receiver.accept_packet(&retries[0].bytes).unwrap();
+        assert!(recovered.recovered);
+        assert_eq!(receiver.flow_ids(), vec![0x1122_3344]);
+        assert_eq!(receiver.stats().retry_packets_received, 1);
     }
 
     #[test]
