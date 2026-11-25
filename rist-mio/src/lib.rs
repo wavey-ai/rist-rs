@@ -997,6 +997,9 @@ pub struct SimpleMioSender {
     spare: Vec<Vec<u8>>,
     /// When the SR/echo timer is next due (see [`MainMioSender`]).
     next_timer_at: Option<Instant>,
+    /// Feedback served from inside the send path (see
+    /// [`INLINE_SERVICE_EVERY`]).
+    inline: InlineService,
 }
 
 /// Readiness of a Simple sender covers both its sockets under one token
@@ -1078,6 +1081,7 @@ impl SimpleMioSender {
             rtcp_pending: VecDeque::with_capacity(PENDING_SEND_CAPACITY),
             spare: Vec::new(),
             next_timer_at: None,
+            inline: InlineService::default(),
         }
     }
 
@@ -1211,7 +1215,36 @@ impl SimpleMioSender {
                     .unwrap_or(now + std::time::Duration::from_millis(100)),
             );
         }
+        if self.inline.due() {
+            self.serve_inline(now);
+        }
         Ok(sequence)
+    }
+
+    /// The send path's own feedback service, as
+    /// [`MainMioSender`]'s: up to 64 waiting feedback datagrams served
+    /// (their retransmissions are not reported), then due repairs.
+    fn serve_inline(&mut self, now: Instant) {
+        let mut buf = self.inline.take_buf();
+        let mut drained = false;
+        for _ in 0..INLINE_READ_LIMIT {
+            if self.pending.len() >= PENDING_SEND_CAPACITY {
+                break;
+            }
+            match self.service_read(&mut buf) {
+                Ok(ServiceRead::Read) => {}
+                Ok(ServiceRead::Drained) => {
+                    drained = true;
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+        self.inline.buf = buf;
+        if !drained {
+            self.inline.wake(now);
+        }
+        let _ = self.poll_repairs_and_send(now);
     }
 
     /// The Simple-profile [`MainMioSender::service`]: flushes the queues,
@@ -1225,6 +1258,8 @@ impl SimpleMioSender {
         ntp_timestamp: u64,
         buf: &mut [u8],
     ) -> io::Result<Option<Instant>> {
+        self.inline.wake_at = None;
+        self.inline.sends = 0;
         self.flush_pending()?;
         let mut more_to_read = true;
         for _ in 0..SERVICE_READ_LIMIT {
@@ -1378,6 +1413,7 @@ impl SimpleMioSender {
         buf: &mut [u8],
     ) -> io::Result<Option<Vec<OutboundPacket>>> {
         let Some((from, feedback)) = self.rtcp_socket.recv_datagram(buf)? else {
+            self.inline.wake_at = None;
             self.poll_due_repairs()?;
             return Ok(None);
         };
@@ -1390,6 +1426,7 @@ impl SimpleMioSender {
         now_ntp: u64,
     ) -> io::Result<Option<Vec<OutboundPacket>>> {
         let Some((from, feedback)) = self.rtcp_socket.recv_datagram(buf)? else {
+            self.inline.wake_at = None;
             self.poll_due_repairs()?;
             return Ok(None);
         };
@@ -1444,12 +1481,17 @@ impl SimpleMioSender {
     }
 
     /// When the sender next has something to send on its own: an SR or
-    /// echo request ([`Self::poll_rtcp_and_send`]) or a scheduled repair.
+    /// echo request ([`Self::poll_rtcp_and_send`]) or a scheduled repair;
+    /// `now` when the send path left feedback unread.
     pub fn next_timeout(&self) -> Option<Instant> {
-        [self.core.next_rtcp_at(), self.core.next_repair_at()]
-            .into_iter()
-            .flatten()
-            .min()
+        [
+            self.core.next_rtcp_at(),
+            self.core.next_repair_at(),
+            self.inline.wake_at,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// Echo responses first (best effort: a full queue drops them, as a
@@ -1922,6 +1964,12 @@ pub struct MainMioSender {
     /// default) leaves keepalives to the caller's
     /// `poll_session_and_send_keepalive`.
     auto_keepalive: Option<KeepaliveTemplate>,
+    /// Feedback served from inside the send path (see
+    /// [`INLINE_SERVICE_EVERY`]).
+    inline: InlineService,
+    /// Events other than feedback read by the send path, returned first
+    /// by [`MainMioSender::try_recv_event`].
+    inline_events: VecDeque<MainSenderEvent>,
 }
 
 /// Readiness of a Main sender is its socket's: feedback to read (with
@@ -1953,6 +2001,56 @@ impl Source for MainMioSender {
 
 /// The most feedback datagrams one [`MainMioSender::service`] call reads.
 const SERVICE_READ_LIMIT: usize = 512;
+
+/// Every this many data packets the send path itself reads and serves
+/// waiting feedback (NACKs are repaired, echo requests answered) and sends
+/// due repairs: a repair never waits behind a large frame for the caller's
+/// next `service`. One non-blocking read when nothing waits.
+pub const INLINE_SERVICE_EVERY: u32 = 32;
+
+/// The most feedback datagrams one inline service reads.
+const INLINE_READ_LIMIT: usize = 64;
+
+/// The most events (other than feedback) the send path keeps for
+/// `try_recv_event`; the oldest is dropped past it.
+const INLINE_EVENT_LIMIT: usize = 64;
+
+/// State of the feedback service inside the send path.
+#[derive(Debug, Default)]
+struct InlineService {
+    /// Data packets sent since the last inline service.
+    sends: u32,
+    /// The receive buffer (allocated at the first inline read).
+    buf: Vec<u8>,
+    /// When the caller should come back: datagrams were left unread, or
+    /// events wait for `try_recv_event` (the socket's readiness may have
+    /// been consumed by the inline read).
+    wake_at: Option<Instant>,
+}
+
+impl InlineService {
+    /// Counts one data packet; true when the inline service is due.
+    fn due(&mut self) -> bool {
+        self.sends += 1;
+        if self.sends < INLINE_SERVICE_EVERY {
+            return false;
+        }
+        self.sends = 0;
+        true
+    }
+
+    fn take_buf(&mut self) -> Vec<u8> {
+        let mut buf = std::mem::take(&mut self.buf);
+        if buf.len() < SAFE_RECEIVE_CAPACITY {
+            buf.resize(SAFE_RECEIVE_CAPACITY, 0);
+        }
+        buf
+    }
+
+    fn wake(&mut self, at: Instant) {
+        self.wake_at = Some(self.wake_at.map_or(at, |wake| wake.min(at)));
+    }
+}
 
 /// How soon `service` asks to be called again while datagrams wait in the
 /// send queue.
@@ -2350,6 +2448,8 @@ impl MainMioSender {
             spare: Vec::new(),
             next_timer_at: None,
             auto_keepalive: None,
+            inline: InlineService::default(),
+            inline_events: VecDeque::new(),
         }
     }
 
@@ -2606,7 +2706,54 @@ impl MainMioSender {
             send_or_queue(socket, pending, spare, peer, head, body).map(|()| meta)
         })?;
         self.drive_timers(now, ntp_timestamp);
+        if self.inline.due() {
+            self.serve_inline(now);
+        }
         Ok(meta)
+    }
+
+    /// The send path's own feedback service (every
+    /// [`INLINE_SERVICE_EVERY`] data packets): reads up to 64 waiting
+    /// datagrams and handles them as [`Self::service`] does (feedback
+    /// repaired, echo requests answered; other events kept for
+    /// [`Self::try_recv_event`]), then sends due repairs. Errors are left
+    /// for `service`: the data packet already went out.
+    fn serve_inline(&mut self, now: Instant) {
+        if !self.srp_authenticated() {
+            return;
+        }
+        let mut buf = self.inline.take_buf();
+        let mut drained = false;
+        for _ in 0..INLINE_READ_LIMIT {
+            if self.pending.len() >= PENDING_SEND_CAPACITY {
+                break;
+            }
+            let (from, datagram) = match self.socket.recv_datagram(&mut buf) {
+                Ok(Some(received)) => received,
+                Ok(None) => {
+                    drained = true;
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::InvalidData => continue,
+                Err(_) => break,
+            };
+            match self.handle_datagram(from, datagram) {
+                Ok(MainSenderEvent::Feedback { .. }) => {}
+                Ok(event) => {
+                    if self.inline_events.len() >= INLINE_EVENT_LIMIT {
+                        self.inline_events.pop_front();
+                    }
+                    self.inline_events.push_back(event);
+                    self.inline.wake(now);
+                }
+                Err(_) => {}
+            }
+        }
+        self.inline.buf = buf;
+        if !drained {
+            self.inline.wake(now);
+        }
+        let _ = self.poll_repairs_and_send(now);
     }
 
     /// Sends the SR/echo request when due, and the keepalive when the
@@ -2666,6 +2813,11 @@ impl MainMioSender {
         ntp_timestamp: u64,
         buf: &mut [u8],
     ) -> io::Result<Option<Instant>> {
+        // Events the send path kept are dropped here, as `service` drops
+        // the events it reads itself.
+        self.inline_events.clear();
+        self.inline.wake_at = None;
+        self.inline.sends = 0;
         self.flush_pending()?;
         // Reads until the socket is empty or the queue cannot take repairs;
         // stopped at the limit, datagrams may still wait, and an
@@ -2782,6 +2934,10 @@ impl MainMioSender {
     /// Without a peer, or while SRP is not authenticated (say during a
     /// re-authentication), only keepalives go out, so only their timer
     /// counts: the others stay where they were until data may flow again.
+    ///
+    /// It is `now` (or earlier) when the send path read feedback on its own
+    /// and left datagrams or events waiting: the socket may not signal
+    /// readiness for them again.
     pub fn next_timeout(&self) -> Option<Instant> {
         let sending = self.peer.is_some() && self.srp_authenticated();
         let (rtcp, repair) = if sending {
@@ -2789,10 +2945,15 @@ impl MainMioSender {
         } else {
             (None, None)
         };
-        [rtcp, repair, self.timers.next_keepalive_at()]
-            .into_iter()
-            .flatten()
-            .min()
+        [
+            rtcp,
+            repair,
+            self.timers.next_keepalive_at(),
+            self.inline.wake_at,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     pub fn build_keepalive(&mut self, keepalive: GreKeepalive<'_>) -> MainControlPacket {
@@ -2871,8 +3032,15 @@ impl MainMioSender {
     /// retransmissions sent). When the socket is drained, sends the repairs
     /// due on the sender's own schedule (see [`Self::poll_repairs_and_send`])
     /// and returns `None`.
+    ///
+    /// Events the send path read on its own (see [`INLINE_SERVICE_EVERY`])
+    /// come first; feedback it served is not reported again.
     pub fn try_recv_event(&mut self, buf: &mut [u8]) -> io::Result<Option<MainSenderEvent>> {
+        if let Some(event) = self.inline_events.pop_front() {
+            return Ok(Some(event));
+        }
         let Some((from, datagram)) = self.socket.recv_datagram(buf)? else {
+            self.inline.wake_at = None;
             if self.core.next_repair_at().is_some() {
                 self.poll_repairs_and_send(Instant::now())?;
             }
@@ -3221,6 +3389,10 @@ pub struct MainMioMultiSender {
     /// The keepalive `send_payload` sends on its own (see
     /// [`MainMioSender`]); `None` leaves them to the caller.
     auto_keepalive: Option<KeepaliveTemplate>,
+    /// Feedback served from inside the send path, and the other events it
+    /// read (see [`MainMioSender`]).
+    inline: InlineService,
+    inline_events: VecDeque<MainSenderEvent>,
 }
 
 /// Readiness of a multi-peer sender is its socket's (feedback from every
@@ -3275,6 +3447,8 @@ impl MainMioMultiSender {
             pending: VecDeque::with_capacity(PENDING_SEND_CAPACITY),
             next_timer_at: None,
             auto_keepalive: None,
+            inline: InlineService::default(),
+            inline_events: VecDeque::new(),
         })
     }
 
@@ -3307,6 +3481,9 @@ impl MainMioMultiSender {
         ntp_timestamp: u64,
         buf: &mut [u8],
     ) -> io::Result<Option<Instant>> {
+        self.inline_events.clear();
+        self.inline.wake_at = None;
+        self.inline.sends = 0;
         self.flush_pending()?;
         let mut more_to_read = true;
         for _ in 0..SERVICE_READ_LIMIT {
@@ -3465,10 +3642,48 @@ impl MainMioMultiSender {
         {
             self.next_timer_at = Some(now + std::time::Duration::from_millis(100));
         }
+        if self.inline.due() {
+            self.serve_inline(now);
+        }
         Ok(MainMioMultiSend {
             peers,
             peer_packets,
         })
+    }
+
+    /// The send path's own feedback service; see [`MainMioSender`].
+    fn serve_inline(&mut self, now: Instant) {
+        let mut buf = self.inline.take_buf();
+        let mut drained = false;
+        for _ in 0..INLINE_READ_LIMIT {
+            if self.pending.len() >= PENDING_SEND_CAPACITY {
+                break;
+            }
+            let (from, datagram) = match self.socket.recv_datagram(&mut buf) {
+                Ok(Some(received)) => received,
+                Ok(None) => {
+                    drained = true;
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::InvalidData => continue,
+                Err(_) => break,
+            };
+            match self.handle_datagram(from, datagram) {
+                Ok(Some(MainSenderEvent::Feedback { .. })) | Ok(None) | Err(_) => {}
+                Ok(Some(event)) => {
+                    if self.inline_events.len() >= INLINE_EVENT_LIMIT {
+                        self.inline_events.pop_front();
+                    }
+                    self.inline_events.push_back(event);
+                    self.inline.wake(now);
+                }
+            }
+        }
+        self.inline.buf = buf;
+        if !drained {
+            self.inline.wake(now);
+        }
+        let _ = self.poll_repairs_and_send(now);
     }
 
     /// Sends the SR/echo request when due, to the peers the selector picks
@@ -3559,6 +3774,7 @@ impl MainMioMultiSender {
             self.next_rtcp_at(),
             self.next_repair_at(),
             self.next_keepalive_at(),
+            self.inline.wake_at,
         ]
         .into_iter()
         .flatten()
@@ -3790,7 +4006,11 @@ impl MainMioMultiSender {
     /// the repairs due on the sender's own schedule (see
     /// [`Self::poll_repairs_and_send`]) and returns `None`.
     pub fn try_recv_event(&mut self, buf: &mut [u8]) -> io::Result<Option<MainSenderEvent>> {
+        if let Some(event) = self.inline_events.pop_front() {
+            return Ok(Some(event));
+        }
         let Some((from, datagram)) = self.socket.recv_datagram(buf)? else {
+            self.inline.wake_at = None;
             if self.next_repair_at().is_some() {
                 self.poll_repairs_and_send(Instant::now())?;
             }
@@ -6209,6 +6429,7 @@ mod tests {
         let receiver_addr = receiver.local_addr().unwrap();
         let mut sender =
             MainMioSender::connect(loopback_any(), receiver_addr, flow_id, 64).unwrap();
+        sender.set_recovery_tuning(without_startup_copy());
 
         sender.send_payload(b"first", ntp, now).unwrap();
         sender.send_payload(b"second", ntp, now).unwrap();
@@ -7307,6 +7528,60 @@ mod tests {
     }
 
     #[test]
+    fn main_sender_serves_feedback_from_its_send_path() {
+        let flow_id = 0x1122_3344;
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut receiver =
+            MainMioReceiver::bind(loopback_any(), flow_id, "rust", NackMode::Range).unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+        let mut sender =
+            MainMioSender::connect(loopback_any(), receiver_addr, flow_id, 1_024).unwrap();
+        sender.set_recovery_tuning(without_startup_copy());
+        let sender_addr = sender.local_addr().unwrap();
+        let now = Instant::now();
+        let first = sender.build_payload(b"first", ntp, now);
+        let _lost = sender.build_payload(b"lost", ntp, now);
+        let third = sender.build_payload(b"third", ntp, now);
+        sender.send_outbound(&first).unwrap();
+        sender.send_outbound(&third).unwrap();
+        let mut rx_buf = [0u8; 1500];
+        recv_main_payload_eventually(&mut receiver, &mut rx_buf);
+        recv_main_payload_eventually(&mut receiver, &mut rx_buf);
+        // The NACK and an OOB packet reach the sender while it is in the
+        // middle of a long burst and never calls service().
+        receiver.send_feedback_to(sender_addr).unwrap();
+        receiver.send_oob_to(sender_addr, b"side channel").unwrap();
+        thread::sleep(Duration::from_millis(5));
+        for _ in 0..INLINE_SERVICE_EVERY {
+            sender
+                .send_payload_meta(b"burst", ntp, Instant::now())
+                .unwrap();
+        }
+        assert_eq!(sender.stats().retransmitted_packets, 1, "repaired inline");
+        // The OOB event waits for try_recv_event, and the sender asks to be
+        // called for it.
+        assert!(sender.next_timeout().unwrap() <= Instant::now());
+        let mut tx_buf = [0u8; 1500];
+        match sender.try_recv_event(&mut tx_buf).unwrap() {
+            Some(MainSenderEvent::Oob { packet, .. }) => {
+                assert_eq!(packet.payload, b"side channel")
+            }
+            other => panic!("expected the OOB event, got {other:?}"),
+        }
+        assert!(sender.try_recv_event(&mut tx_buf).unwrap().is_none());
+        let mut recovered = false;
+        for _ in 0..=INLINE_SERVICE_EVERY {
+            let payload = recv_main_payload_eventually(&mut receiver, &mut rx_buf);
+            if payload.recovered {
+                assert_eq!(payload.payload, b"lost");
+                recovered = true;
+                break;
+            }
+        }
+        assert!(recovered);
+    }
+
+    #[test]
     fn main_sender_sends_duplicate_repairs_when_drained_and_reports_its_deadline() {
         let flow_id = 0x1122_3344;
         let now = Instant::now();
@@ -7330,6 +7605,12 @@ mod tests {
         let mut rx_buf = [0u8; 1500];
         recv_main_payload_eventually(&mut receiver, &mut rx_buf);
         recv_main_payload_eventually(&mut receiver, &mut rx_buf);
+        // The first packet goes out a second time 1 ms later; the receiver
+        // has it already.
+        assert!(sender.next_timeout().unwrap() <= now + Duration::from_millis(1));
+        thread::sleep(Duration::from_millis(2));
+        assert_eq!(sender.poll_repairs_and_send(Instant::now()).unwrap(), 1);
+        assert!(recv_main_payload_eventually(&mut receiver, &mut rx_buf).duplicate);
 
         // Two requests for the same hole, beyond the sender's spacing: the
         // second repair is sent twice.
@@ -7350,7 +7631,7 @@ mod tests {
         thread::sleep(Duration::from_millis(2));
         // A drained receive sends it.
         assert!(sender.try_recv_event(&mut tx_buf).unwrap().is_none());
-        assert_eq!(sender.stats().duplicate_repairs, 1);
+        assert_eq!(sender.stats().duplicate_repairs, 2);
 
         let mut copies = Vec::new();
         while copies.len() < 3 {
@@ -7462,6 +7743,7 @@ mod tests {
 
         let mut sender =
             MainMioSender::connect(loopback_any(), receiver_addr, flow_id, 16_384).unwrap();
+        sender.set_recovery_tuning(without_startup_copy());
         for index in 0..PACKETS {
             sender.send_payload(&payload, ntp, Instant::now()).unwrap();
             if index % PACKETS_PER_BURST == PACKETS_PER_BURST - 1 {
@@ -7533,6 +7815,7 @@ mod tests {
 
         let mut sender =
             MainMioSender::connect(loopback_any(), receiver_addr, flow_id, 16_384).unwrap();
+        sender.set_recovery_tuning(without_startup_copy());
         let mut feedback = vec![0u8; 65_536];
         for index in 0..PACKETS {
             sender.send_payload(&payload, ntp, Instant::now()).unwrap();
@@ -8141,6 +8424,7 @@ mod tests {
         let mut sender =
             MainMioSender::connect(loopback_any(), receiver_addr, flow_id, 64).unwrap();
         sender.enable_srp_client("rist", b"old-password");
+        sender.set_recovery_tuning(without_startup_copy());
 
         sender.start_srp_authentication().unwrap();
         let mut sender_buf = [0u8; 1500];
@@ -8421,6 +8705,15 @@ mod tests {
             }
             assert!(Instant::now() < deadline, "timed out waiting for RTCP");
             thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Tuning without the startup copy of the first packet (nor B3
+    /// duplicates): for tests that count packets on a clean path.
+    fn without_startup_copy() -> RecoveryTuning {
+        RecoveryTuning {
+            duplicate_late_repairs: false,
+            ..RecoveryTuning::default()
         }
     }
 

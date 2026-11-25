@@ -1770,6 +1770,13 @@ mod tests {
         let third = sender.send_payload(b"third", ntp, t);
         receiver.accept_packet(&first.bytes).unwrap();
         receiver.accept_packet(&third.bytes).unwrap();
+        // The first packet goes out twice: the copy is wrapped and marked,
+        // and a receiver that has the original drops it.
+        assert_eq!(sender.next_repair_at(), Some(t + Duration::from_millis(1)));
+        let startup = sender.poll_repairs(t + Duration::from_millis(1));
+        assert_eq!(startup.len(), 1);
+        assert!(startup[0].retry);
+        assert!(receiver.accept_packet(&startup[0].bytes).unwrap().duplicate);
         let feedback = receiver.build_feedback();
         let reduced = ReducedHeader {
             src_port: DEFAULT_VIRT_DST_PORT,

@@ -125,6 +125,19 @@ pub struct ReceiverStats {
     /// Sequences requested again in NACK copies (not attempts; also
     /// counted in nack_packets, not in nack_entries_sent).
     pub nack_copies_sent: u64,
+    /// Times the highest sequence moved forward by more than half the
+    /// 16-bit NACK horizon at once (a long outage, a sender restart, or a
+    /// misread sequence: should stay near zero).
+    pub forward_jumps: u64,
+    /// Karn samples refused because they were under half the smallest
+    /// echo-measured RTT (a repair that cannot answer the NACK it seems to).
+    pub rtt_samples_karn_rejected: u64,
+    /// Originals far behind the highest sequence that the receiver read as
+    /// behind (stale) rather than as the first packet after a long gap.
+    pub stale_far_behind: u64,
+    /// Size of the duplicate-detection ring, in packets (it grows with the
+    /// observed packet rate).
+    pub duplicate_window_packets: u64,
 }
 
 impl ReceiverStats {
@@ -156,6 +169,10 @@ impl ReceiverStats {
             reorder_samples: 0,
             first_nack_delay_micros: 0,
             nack_copies_sent: 0,
+            forward_jumps: 0,
+            rtt_samples_karn_rejected: 0,
+            stale_far_behind: 0,
+            duplicate_window_packets: 0,
         }
     }
 
