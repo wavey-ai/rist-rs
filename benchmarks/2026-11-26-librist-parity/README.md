@@ -85,12 +85,17 @@ On run b (`cbf19d8`), against librist:
   most about one every 8.5 minutes from any number of them. An established peer changes
   nonce under its own per-session limit only, so such a flood cannot stall its nonce
   rotation; it can delay a new peer's first packets. Sessions the flood creates derive no
-  key until they send, so its CPU cost stays at 64 derivations a second for its nonces.
+  key until they send, and a keyed endpoint sends nothing to a session whose data or RTCP
+  never passed the checks, so its CPU cost stays at 64 derivations a second for its nonces
+  and nothing is reflected to forged addresses.
   Keepalives, buffer negotiation and out-of-band data can hardly be checked: a wrong key's or
   a forger's out-of-band packet is delivered with garbage bytes. A keyed listening rist-rs
   sender therefore chooses its receiver only by RTCP that passed the checks (a forger
   succeeds about once in 2^22 tries, about a day of flooding at 64 tries a second), and once
-  it has, ignores other sources without decrypting them. An on-path attacker can flip
+  it has, ignores other sources without decrypting them. A keyed listening rist-rs receiver
+  likewise takes as its peer (where its NACKs, reports and keepalives go) only a source whose
+  data or RTCP passed the checks, never one that sent only keepalives, buffer negotiation,
+  out-of-band data or EAPOL short of a completed SRP handshake. An on-path attacker can flip
   bits in an encrypted payload undetected. SRP authenticates the peers at session setup and
   adds no per-packet integrity. Since this report, a keyed rist-rs Main receiver drops clear
   packets other than EAPOL, a keyed rist-rs sender never sends them, and a keyed

@@ -165,11 +165,13 @@ authentication tag. What that means:
   can fill a listening receiver's session capacity. Each forged packet
   from a new address and port still creates a session (up to the
   endpoint's session capacity), but a session derives its own transmit key
-  only when it first sends, which a session that never passed the checks
-  does not, so the flood costs at most 64 derivations a second of CPU for
+  only when it first sends, and a keyed endpoint sends nothing (no
+  keepalive, RTCP or feedback) to a session whose data or RTCP never passed
+  the checks, so the flood costs at most 64 derivations a second of CPU for
   its nonces (128 if it replays captured packets of a correct peer),
   however many sessions it creates and the caller evicts, plus at most 8 a
-  second for each established peer.
+  second for each established peer. Nor does it reflect anything to the
+  addresses it forges.
 - **Keepalives, buffer negotiation and out-of-band data are barely
   checked.** They carry too little structure to tell a wrong key: one of
   valid form neither proves a nonce nor counts against it. One that is
@@ -211,6 +213,17 @@ authentication tag. What that means:
   average, and only before the real receiver has been chosen, since the
   sender keeps the peer it chose. An unkeyed listening sender takes the
   first source that sends it anything, as before.
+- **A keyed listening receiver takes as its peer only a source whose data
+  or RTCP passed the checks.** Its peer is the source `poll_rtcp_and_send`,
+  `send_feedback` and `poll_session_and_send_keepalive` serve. A keepalive,
+  buffer negotiation or out-of-band packet, which a host without the key
+  can forge, is still returned as an event but neither makes its source the
+  peer nor counts as that source's activity until the source's data or RTCP
+  has passed (`MainReceiverCore::rx_peer_proven`). Nor does a clear EAPOL
+  packet, until its source has completed SRP. `poll_keepalive_all` and
+  `poll_all_rtcp_and_send` likewise send nothing to such a session. A
+  forger whose data passes by chance (about one nonce in 32,600, see above)
+  can still become the peer.
 - **SRP does not change this.** EAP-SRP authenticates the peers to each
   other when a session is set up; it adds no per-packet integrity.
 
