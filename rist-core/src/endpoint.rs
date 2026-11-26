@@ -79,6 +79,12 @@ pub struct RecoveryTuning {
     /// first_nack_floor, reorder_buffer)` instead of always `reorder_buffer`.
     pub adaptive_first_nack: bool,
     pub first_nack_floor: Duration,
+    /// Receiver: delay the re-NACK of a hole by the time the sender needs to
+    /// send the repairs NACKed ahead of it in the same batch (its place in
+    /// the batch x the packet gap measured inside bursts, at most twice the
+    /// re-NACK interval), so the holes at the back of a large batch are not
+    /// asked for again while their first repair is still queued.
+    pub renack_drain: bool,
     /// Receiver: send every NACK attempt a second time a few milliseconds
     /// later (not counted as an attempt), unless congestion control is off.
     /// The sender's spacing check discards the copy when the first arrived.
@@ -90,7 +96,10 @@ pub struct RecoveryTuning {
     pub duplicate_gap: Duration,
     /// Sender: resend the last packet of a burst once the sender has been
     /// idle for a few packet gaps, so a lost frame tail is repaired without
-    /// waiting for the next frame.
+    /// waiting for the next frame. While the sender stays idle the probe is
+    /// repeated with backoff (idle, 2 x idle, 4 x idle after the last
+    /// packet, three at most), so a short outage that takes the first probe
+    /// does not hide the tail until the next burst.
     pub tail_probe: TailProbe,
     /// Upper bound of tail probes, per mille of the data packets sent.
     pub tail_probe_max_per_mille: u32,
@@ -111,6 +120,7 @@ impl Default for RecoveryTuning {
             renack_margin: Duration::from_millis(1),
             adaptive_first_nack: true,
             first_nack_floor: Duration::from_millis(2),
+            renack_drain: true,
             redundant_nacks: true,
             duplicate_late_repairs: true,
             duplicate_gap: Duration::from_millis(1),
@@ -125,10 +135,12 @@ impl Default for RecoveryTuning {
 
 impl RecoveryTuning {
     /// RTT measurement and history by time stay on; the extras (adaptive
-    /// first NACK, NACK copies, duplicate repairs, tail probes) are off.
+    /// first NACK, re-NACK drain, NACK copies, duplicate repairs, tail
+    /// probes) are off.
     pub fn librist_like() -> Self {
         Self {
             adaptive_first_nack: false,
+            renack_drain: false,
             redundant_nacks: false,
             duplicate_late_repairs: false,
             tail_probe: TailProbe::Off,

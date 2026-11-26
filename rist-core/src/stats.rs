@@ -27,6 +27,10 @@ pub struct SenderStats {
     pub duplicate_repairs: u64,
     /// Tail-loss probes sent (also in retransmitted_packets).
     pub tail_probes: u64,
+    /// Repairs (retransmissions, second copies, tail probes) that were due
+    /// but not sent because the socket would block with the send queue
+    /// full. Not in retransmitted_packets, duplicate_repairs or tail_probes.
+    pub repairs_dropped_queue_full: u64,
 }
 
 impl SenderStats {
@@ -49,6 +53,7 @@ impl SenderStats {
             echo_responses: 0,
             duplicate_repairs: 0,
             tail_probes: 0,
+            repairs_dropped_queue_full: 0,
         }
     }
 
@@ -71,6 +76,14 @@ impl SenderStats {
     pub(crate) fn record_retransmit(&mut self, bytes: usize) {
         self.retransmitted_packets += 1;
         self.retransmitted_bytes += bytes as u64;
+    }
+
+    /// Takes back a retransmission that was counted but never reached the
+    /// socket (see `repairs_dropped_queue_full`).
+    pub(crate) fn record_unsent_retransmit(&mut self, bytes: usize) {
+        self.retransmitted_packets = self.retransmitted_packets.saturating_sub(1);
+        self.retransmitted_bytes = self.retransmitted_bytes.saturating_sub(bytes as u64);
+        self.repairs_dropped_queue_full += 1;
     }
 
     pub(crate) fn record_feedback(&mut self) {

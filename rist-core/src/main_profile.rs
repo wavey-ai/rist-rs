@@ -576,17 +576,65 @@ impl MainSenderCore {
             .collect()
     }
 
+    /// [`Self::poll_repairs`], at most `limit` of them (see
+    /// [`SimpleSenderCore::poll_repairs_limited_at`]).
+    pub fn poll_repairs_limited(&mut self, now: Instant, limit: usize) -> Vec<MainOutboundPacket> {
+        self.simple
+            .poll_repairs_limited_at(now, limit)
+            .into_iter()
+            .map(|repair| self.wrap_rtp(repair.sequence, true, &repair.bytes))
+            .collect()
+    }
+
+    /// Drops the repairs due at `now` unsent (see
+    /// [`SimpleSenderCore::discard_due_repairs_at`]).
+    pub fn discard_due_repairs(&mut self, now: Instant) -> usize {
+        self.simple.discard_due_repairs_at(now)
+    }
+
+    /// Takes back a retransmission of RTP sequence `rtp_sequence` that
+    /// could not be sent (see [`SimpleSenderCore::retransmit_not_sent`]).
+    pub fn retransmit_not_sent(&mut self, rtp_sequence: u32) {
+        self.simple.retransmit_not_sent(rtp_sequence);
+    }
+
+    /// [`Self::retransmit_not_sent`] for one peer of a multi-peer sender.
+    pub fn retransmit_not_sent_for_peer(&self, state: &mut MainSenderPeerState, rtp_sequence: u32) {
+        self.simple
+            .retransmit_not_sent_for_peer(&mut state.simple, rtp_sequence);
+    }
+
     /// [`Self::poll_repairs`] for one peer of a multi-peer sender.
     pub fn poll_repairs_for_peer(
         &self,
         state: &mut MainSenderPeerState,
         now: Instant,
     ) -> Vec<MainOutboundPacket> {
+        self.poll_repairs_for_peer_limited(state, now, usize::MAX)
+    }
+
+    /// [`Self::poll_repairs_limited`] for one peer of a multi-peer sender.
+    pub fn poll_repairs_for_peer_limited(
+        &self,
+        state: &mut MainSenderPeerState,
+        now: Instant,
+        limit: usize,
+    ) -> Vec<MainOutboundPacket> {
         self.simple
-            .poll_repairs_for_peer_at(&mut state.simple, now)
+            .poll_repairs_for_peer_limited_at(&mut state.simple, now, limit)
             .into_iter()
             .map(|repair| self.wrap_rtp_for_peer(state, repair.sequence, true, &repair.bytes))
             .collect()
+    }
+
+    /// [`Self::discard_due_repairs`] for one peer of a multi-peer sender.
+    pub fn discard_due_repairs_for_peer(
+        &self,
+        state: &mut MainSenderPeerState,
+        now: Instant,
+    ) -> usize {
+        self.simple
+            .discard_due_repairs_for_peer_at(&mut state.simple, now)
     }
 
     pub fn next_repair_at(&self) -> Option<Instant> {

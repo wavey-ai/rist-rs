@@ -1330,13 +1330,6 @@ impl SimpleMioSender {
         }
     }
 
-    fn enqueue_packet(&mut self, packet: &[u8]) -> io::Result<()> {
-        self.ensure_pending_capacity()?;
-        let peer = self.peer.ok_or_else(no_remote_peer_error)?;
-        queue_datagram(&mut self.pending, &mut self.spare, peer, packet, &[]);
-        Ok(())
-    }
-
     pub fn set_multicast_loop_v4(&self, on: bool) -> io::Result<()> {
         self.rtp_socket.set_multicast_loop_v4(on)?;
         self.rtcp_socket.set_multicast_loop_v4(on)
@@ -1455,18 +1448,44 @@ impl SimpleMioSender {
     /// Sends the repairs the sender owes on its own schedule that are due at
     /// `now`: second copies of late repairs (and tail probes). The receive
     /// calls and [`Self::poll_rtcp_and_send`] call this; a caller that
-    /// sleeps can wake at [`Self::next_timeout`]. A full send queue drops
-    /// the rest (they are extra copies). Returns the repairs queued.
+    /// sleeps can wake at [`Self::next_timeout`]. Repairs go out at once
+    /// or queue; the core hands over only what the queue has room for, and
+    /// the queue is flushed whenever it fills. Only when the socket itself
+    /// would block with the queue full are the rest dropped (they are extra
+    /// copies), counted in `repairs_dropped_queue_full`. Returns the
+    /// repairs sent or queued.
     pub fn poll_repairs_and_send(&mut self, now: Instant) -> io::Result<usize> {
-        if self.peer.is_none() || self.core.next_repair_at().map_or(true, |at| at > now) {
+        let Some(peer) = self.peer else {
+            return Ok(0);
+        };
+        if self.core.next_repair_at().map_or(true, |at| at > now) {
             return Ok(0);
         }
         let mut queued = 0;
-        for repair in self.core.poll_repairs_at(now) {
-            match self.enqueue_packet(&repair.bytes) {
-                Ok(()) => queued += 1,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                Err(error) => return Err(error),
+        loop {
+            let mut room = PENDING_SEND_CAPACITY.saturating_sub(self.pending.len());
+            if room == 0 {
+                flush_queue(&mut self.rtp_socket, &mut self.pending, &mut self.spare)?;
+                room = PENDING_SEND_CAPACITY.saturating_sub(self.pending.len());
+            }
+            if room == 0 {
+                self.core.discard_due_repairs_at(now);
+                break;
+            }
+            let repairs = self.core.poll_repairs_limited_at(now, room);
+            if repairs.is_empty() {
+                break;
+            }
+            for repair in &repairs {
+                send_or_queue(
+                    &mut self.rtp_socket,
+                    &mut self.pending,
+                    &mut self.spare,
+                    peer,
+                    &repair.bytes,
+                    &[],
+                )?;
+                queued += 1;
             }
         }
         self.flush_pending()?;
@@ -1504,8 +1523,19 @@ impl SimpleMioSender {
                 Err(error) => return Err(error),
             }
         }
-        for retry in &outcome.retries {
-            self.send_outbound(retry)?;
+        for (index, retry) in outcome.retries.iter().enumerate() {
+            match self.send_outbound(retry) {
+                Ok(_) => {}
+                // The socket would block with the queue full: the rest are
+                // not sent, and not counted as sent. The receiver asks again.
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    for unsent in &outcome.retries[index..] {
+                        self.core.retransmit_not_sent(unsent.sequence);
+                    }
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
         }
         Ok(())
     }
@@ -2907,21 +2937,37 @@ impl MainMioSender {
     /// Sends the repairs the sender owes on its own schedule that are due at
     /// `now`: second copies of late repairs (and tail probes). The receive
     /// calls and [`Self::poll_rtcp_and_send`] call this; a caller that
-    /// sleeps can wake at [`Self::next_timeout`]. A full send queue drops
-    /// the rest (they are extra copies). Returns the repairs queued.
+    /// sleeps can wake at [`Self::next_timeout`]. Repairs go out at once
+    /// or queue; the core hands over only what the queue has room for, and
+    /// the queue is flushed whenever it fills. Only when the socket itself
+    /// would block with the queue full are the rest dropped (they are extra
+    /// copies), counted in `repairs_dropped_queue_full`. Returns the
+    /// repairs sent or queued.
     pub fn poll_repairs_and_send(&mut self, now: Instant) -> io::Result<usize> {
-        if self.peer.is_none()
-            || !self.srp_authenticated()
-            || self.core.next_repair_at().map_or(true, |at| at > now)
-        {
+        let Some(peer) = self.peer else {
+            return Ok(0);
+        };
+        if !self.srp_authenticated() || self.core.next_repair_at().map_or(true, |at| at > now) {
             return Ok(0);
         }
         let mut queued = 0;
-        for repair in self.core.poll_repairs(now) {
-            match self.enqueue_packet(&repair.bytes) {
-                Ok(()) => queued += 1,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                Err(error) => return Err(error),
+        loop {
+            let mut room = PENDING_SEND_CAPACITY.saturating_sub(self.pending.len());
+            if room == 0 {
+                self.flush_pending()?;
+                room = PENDING_SEND_CAPACITY.saturating_sub(self.pending.len());
+            }
+            if room == 0 {
+                self.core.discard_due_repairs(now);
+                break;
+            }
+            let repairs = self.core.poll_repairs_limited(now, room);
+            if repairs.is_empty() {
+                break;
+            }
+            for repair in &repairs {
+                self.send_or_queue(peer, &repair.bytes, &[])?;
+                queued += 1;
             }
         }
         self.flush_pending()?;
@@ -3099,8 +3145,20 @@ impl MainMioSender {
                         Err(error) => return Err(error),
                     }
                 }
-                for retry in &outcome.retries {
-                    self.send_outbound(retry)?;
+                for (index, retry) in outcome.retries.iter().enumerate() {
+                    match self.send_outbound(retry) {
+                        Ok(_) => {}
+                        // The socket would block with the queue full: the
+                        // rest are not sent, and not counted as sent. The
+                        // receiver asks again.
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            for unsent in &outcome.retries[index..] {
+                                self.core.retransmit_not_sent(unsent.rtp_sequence);
+                            }
+                            break;
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
                 if outcome.retries.is_empty() && !outcome.responses.is_empty() {
                     self.flush_pending()?;
@@ -3730,8 +3788,11 @@ impl MainMioMultiSender {
     }
 
     /// Sends every authenticated peer's repairs due at `now` (second copies
-    /// of late repairs). A full send queue drops the rest. Returns the
-    /// repairs queued.
+    /// of late repairs). The core hands over only what the send queue has
+    /// room for, and the queue is flushed whenever it fills; only when the
+    /// socket itself would block with the queue full are a peer's due
+    /// repairs dropped, counted in `repairs_dropped_queue_full`. Returns
+    /// the repairs queued.
     pub fn poll_repairs_and_send(&mut self, now: Instant) -> io::Result<usize> {
         if self.next_repair_at().map_or(true, |at| at > now) {
             return Ok(0);
@@ -3741,19 +3802,38 @@ impl MainMioMultiSender {
             if !peer_authenticated(&self.peer_runtime[peer]) {
                 continue;
             }
-            let repairs = self
-                .core
-                .poll_repairs_for_peer(&mut self.peer_runtime[peer].sender, now);
-            for repair in repairs {
-                match self.enqueue_datagram(&repair.bytes, vec![self.peers[peer].addr]) {
-                    Ok(()) => queued += 1,
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(error) => return Err(error),
+            loop {
+                let room = self.pending_room()?;
+                if room == 0 {
+                    self.core
+                        .discard_due_repairs_for_peer(&mut self.peer_runtime[peer].sender, now);
+                    break;
+                }
+                let repairs = self.core.poll_repairs_for_peer_limited(
+                    &mut self.peer_runtime[peer].sender,
+                    now,
+                    room,
+                );
+                if repairs.is_empty() {
+                    break;
+                }
+                for repair in repairs {
+                    self.enqueue_datagram(&repair.bytes, vec![self.peers[peer].addr])?;
+                    queued += 1;
                 }
             }
         }
         self.flush_pending()?;
         Ok(queued)
+    }
+
+    /// Room left in the send queue, flushing it first when it is full; zero
+    /// only when the socket would block with the queue full.
+    fn pending_room(&mut self) -> io::Result<usize> {
+        if self.pending.len() >= PENDING_SEND_CAPACITY {
+            self.flush_pending()?;
+        }
+        Ok(PENDING_SEND_CAPACITY.saturating_sub(self.pending.len()))
     }
 
     /// The next repair due to an authenticated peer (the others get none
@@ -4079,7 +4159,20 @@ impl MainMioMultiSender {
                         Err(error) => return Err(error),
                     }
                 }
-                for retry in &outcome.retries {
+                for (index, retry) in outcome.retries.iter().enumerate() {
+                    // Flushed whenever the queue fills, so a NACK of more
+                    // than the queue holds is served in full; the rest are
+                    // dropped (and not counted as sent) only when the
+                    // socket would block with the queue full.
+                    if self.pending_room()? == 0 {
+                        for unsent in &outcome.retries[index..] {
+                            self.core.retransmit_not_sent_for_peer(
+                                &mut self.peer_runtime[peer].sender,
+                                unsent.rtp_sequence,
+                            );
+                        }
+                        break;
+                    }
                     self.enqueue_datagram(&retry.bytes, vec![self.peers[peer].addr])?;
                 }
                 let retries = outcome.retries;
@@ -8030,6 +8123,178 @@ mod tests {
         assert_eq!(stats_b.feedback_packets, 1);
         assert!(sender.peer_last_activity(peer_a).is_some());
         assert!(sender.peer_last_activity(peer_b).is_some());
+    }
+
+    /// Sends 402 payloads from a Main sender to `rx` (with `send`) and
+    /// feeds a receiver core every data packet except 1 to 400 (lost), so
+    /// its feedback NACKs those 400.
+    fn main_feedback_for_400_lost(
+        rx: &StdUdpSocket,
+        flow_id: u32,
+        mut send: impl FnMut(u32),
+    ) -> MainReceiverFeedback {
+        let mut receiver = MainReceiverCore::new(flow_id, "rx", NackMode::Range);
+        let mut seen_last = false;
+        let mut index = 0;
+        while !seen_last {
+            if index < 402 {
+                send(index);
+                index += 1;
+            }
+            let datagram = recv_raw_datagram(rx);
+            let reduced = ReducedPacket::decode(&datagram).unwrap();
+            if looks_like_rtcp(reduced.payload) {
+                continue;
+            }
+            let sequence = RtpPacket::decode(reduced.payload)
+                .unwrap()
+                .header
+                .sequence_number;
+            if !(1..=400).contains(&sequence) {
+                receiver.accept_packet(&datagram).unwrap();
+            }
+            seen_last |= sequence == 401;
+        }
+        receiver.build_feedback()
+    }
+
+    #[test]
+    fn simple_sender_sends_every_due_repair_beyond_the_queue_capacity() {
+        let flow_id = 0x1122_3344;
+        let t = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let receiver =
+            SimpleMioReceiver::bind(loopback_any(), flow_id, "receiver", NackMode::Range).unwrap();
+        let mut sender = SimpleMioSender::connect(
+            loopback_any(),
+            receiver.local_addr().unwrap(),
+            flow_id,
+            1_024,
+        )
+        .unwrap();
+        for index in 0..600_u32 {
+            sender.build_payload(&index.to_be_bytes(), ntp, t);
+        }
+        // Every packet asked for twice: the second repairs are sent twice,
+        // so 600 copies (and the first packet's own copy) come due at once,
+        // more than the send queue holds.
+        let sequences = (0..600).collect::<Vec<u32>>();
+        assert_eq!(sender.core.retransmit_at(&sequences, t).len(), 600);
+        assert_eq!(
+            sender
+                .core
+                .retransmit_at(&sequences, t + Duration::from_millis(10))
+                .len(),
+            600
+        );
+        let queued = sender
+            .poll_repairs_and_send(t + Duration::from_millis(11))
+            .unwrap();
+        let stats = sender.stats();
+        assert_eq!(queued, 601);
+        assert_eq!(stats.duplicate_repairs, 601);
+        assert_eq!(stats.retransmitted_packets, 1_801);
+        assert_eq!(stats.repairs_dropped_queue_full, 0);
+        assert_eq!(sender.core.next_repair_at(), None);
+    }
+
+    #[test]
+    fn main_sender_sends_every_due_repair_beyond_the_queue_capacity() {
+        let flow_id = 0x1122_3344;
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let rx = StdUdpSocket::bind(loopback_any()).unwrap();
+        rx.set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let mut sender =
+            MainMioSender::connect(loopback_any(), rx.local_addr().unwrap(), flow_id, 1_024)
+                .unwrap();
+        let sender_addr = sender.local_addr().unwrap();
+        let feedback = main_feedback_for_400_lost(&rx, flow_id, |index| {
+            sender
+                .send_payload(&index.to_be_bytes(), ntp, Instant::now())
+                .unwrap();
+        });
+        let mut buf = [0u8; 1500];
+        rx.send_to(&feedback.bytes, sender_addr).unwrap();
+        assert_eq!(
+            recv_main_feedback_eventually(&mut sender, &mut buf).len(),
+            400
+        );
+        // Asked again after the spacing: each second repair is sent twice.
+        thread::sleep(Duration::from_millis(15));
+        rx.send_to(&feedback.bytes, sender_addr).unwrap();
+        assert_eq!(
+            recv_main_feedback_eventually(&mut sender, &mut buf).len(),
+            400
+        );
+        thread::sleep(Duration::from_millis(3));
+        let before = sender.stats();
+        let now = Instant::now();
+        let queued = sender.poll_repairs_and_send(now).unwrap();
+        let stats = sender.stats();
+        // The copies (and a tail probe, on since the NACK) all go out.
+        assert!(queued >= 400, "{queued}");
+        assert_eq!(
+            stats.duplicate_repairs + stats.tail_probes,
+            before.duplicate_repairs + before.tail_probes + queued as u64
+        );
+        assert_eq!(
+            stats.retransmitted_packets,
+            before.retransmitted_packets + queued as u64
+        );
+        assert_eq!(stats.repairs_dropped_queue_full, 0);
+        assert!(sender.core.next_repair_at().map_or(true, |at| at > now));
+    }
+
+    #[test]
+    fn main_profile_multi_sender_serves_a_nack_larger_than_its_queue() {
+        let flow_id = 0x1122_3344;
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let rx = StdUdpSocket::bind(loopback_any()).unwrap();
+        rx.set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let mut sender = MainMioMultiSender::bind(loopback_any(), flow_id, 1_024).unwrap();
+        let peer = sender.add_peer(rx.local_addr().unwrap(), 0).unwrap();
+        let sender_addr = sender.local_addr().unwrap();
+        let feedback = main_feedback_for_400_lost(&rx, flow_id, |index| {
+            sender
+                .send_payload(&index.to_be_bytes(), ntp, Instant::now())
+                .unwrap();
+        });
+        let mut buf = [0u8; 1500];
+        rx.send_to(&feedback.bytes, sender_addr).unwrap();
+        // 400 retransmissions for one NACK: the queue (256) is flushed as
+        // it fills instead of failing the rest.
+        assert_eq!(
+            recv_multi_feedback_eventually(&mut sender, &mut buf).len(),
+            400
+        );
+        let stats = sender.peer_stats(peer).unwrap();
+        assert_eq!(stats.retransmitted_packets, 400);
+        assert_eq!(stats.repairs_dropped_queue_full, 0);
+        assert_eq!(sender.pending_send_len(), 0);
+
+        // Asked again: the copies of the second repairs, 400 at once.
+        thread::sleep(Duration::from_millis(15));
+        rx.send_to(&feedback.bytes, sender_addr).unwrap();
+        assert_eq!(
+            recv_multi_feedback_eventually(&mut sender, &mut buf).len(),
+            400
+        );
+        thread::sleep(Duration::from_millis(3));
+        let before = sender.peer_stats(peer).unwrap();
+        let queued = sender.poll_repairs_and_send(Instant::now()).unwrap();
+        let stats = sender.peer_stats(peer).unwrap();
+        assert!(queued >= 400, "{queued}");
+        assert_eq!(
+            stats.duplicate_repairs,
+            before.duplicate_repairs + queued as u64
+        );
+        assert_eq!(
+            stats.retransmitted_packets,
+            before.retransmitted_packets + queued as u64
+        );
+        assert_eq!(stats.repairs_dropped_queue_full, 0);
     }
 
     #[test]
