@@ -219,8 +219,10 @@ authentication tag. What that means:
   buffer negotiation or out-of-band packet, which a host without the key
   can forge, is still returned as an event but neither makes its source the
   peer nor counts as that source's activity until the source's data or RTCP
-  has passed (`MainReceiverCore::rx_peer_proven`). Nor does a clear EAPOL
-  packet, until its source has completed SRP. `poll_keepalive_all` and
+  has passed (`MainReceiverCore::rx_peer_proven`). A clear EAPOL packet
+  does not make its source the peer until that source has completed SRP,
+  but it does count as the session's activity, so a handshake in progress
+  is not evicted as idle. `poll_keepalive_all` and
   `poll_all_rtcp_and_send` likewise send nothing to such a session. A
   forger whose data passes by chance (about one nonce in 32,600, see above)
   can still become the peer.
