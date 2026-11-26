@@ -72,6 +72,8 @@ A red cross means that required work or verification remains.
 
 - ✅ Workspace, build, CI, interoperability, and toolchain controls
 - ✅ Security, SRP, EAP, PSK, parser bounds, and resource limits
+  - A keyed endpoint drops clear packets other than EAPOL and never sends
+    them; PSK itself has no authentication tag (see the security note below).
 - ✅ Bounded Simple and Main recovery, NACKs, retries, rollover, and backpressure
 - ✅ Typed one-pass Main datagram dispatch with bounded queues
 - ✅ Per-peer authentication, liveness, RTT, recovery, and feedback state
@@ -99,6 +101,45 @@ A red cross means that required work or verification remains.
 - ❌ Advanced profile data, control, recovery, encryption, and negotiation
 - ❌ Complete public API and URL-option parity
 - ❌ Measured throughput, latency, memory, and recovery parity
+
+### Security note: RIST Main PSK has no authentication tag
+
+RIST Main profile PSK encryption (AES-CTR with a key derived from the
+passphrase by PBKDF2, as in librist) encrypts each packet but adds no
+authentication tag. What that means:
+
+- **Confidentiality, not integrity.** Without the passphrase nobody can read
+  the media or control payloads (the GRE header, with the nonce and sequence,
+  stays clear). There is no cryptographic integrity check and no sender
+  authentication of data packets.
+- **Wrong keys and forgeries are caught by header checks only.** After
+  decryption rist-rs checks what librist checks (RTP version 2, VSF protocol
+  and subtype) and more: no RTP padding or CSRC, MPEG-TS payload type, the
+  RIST header extension when flagged, well-formed RTCP compounds and lengths.
+  A nonce that fails the checks is shut out (at its first failure until it
+  has passed them, at the seventh in a row after, as librist does). These
+  checks reject a wrong key or a forged packet with high probability but not
+  with cryptographic strength: random data passes the data-packet checks
+  about once in 2^15 tries. Keepalives, buffer negotiation and out-of-band
+  data carry too little structure to check.
+- **Bit flips go undetected.** AES-CTR is malleable: an on-path attacker can
+  change bits of an encrypted payload, for example media bytes, and the
+  receiver cannot tell as long as the headers still pass.
+- **A spoofed packet can stall a stream.** Packets forged with a sender's
+  nonce can get that nonce shut out until the sender's nonce rotates, as
+  with librist.
+- **SRP does not change this.** EAP-SRP authenticates the peers to each
+  other when a session is set up; it adds no per-packet integrity.
+
+What rist-rs does with a key: a receiver drops every unencrypted packet
+except EAPOL (which SRP needs) and counts it in `clear_packets_dropped`;
+encrypted packets that fail the checks count in `decrypt_rejected`, packets
+of a shut-out nonce in `decrypt_latched` (receiver and sender stats). An
+endpoint with a key sends nothing clear but EAPOL: given only a receive key
+it encrypts with the same passphrase, and given only a transmit key it also
+drops clear packets from its peer. Where integrity
+matters, carry RIST over an authenticated transport such as WireGuard or
+IPsec.
 
 ### Needletail Readiness
 
