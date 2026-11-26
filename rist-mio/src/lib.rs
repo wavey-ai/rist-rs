@@ -10,7 +10,7 @@ use mio::event::Source;
 use mio::net::UdpSocket;
 use mio::{Interest, Registry, Token};
 use rist_core::auth::{EapSrpAuthenticatorSession, EapSrpClientSession, EapolFrame, SrpUserRecord};
-use rist_core::crypto::PskKey;
+use rist_core::crypto::{PskKey, PskReceiveCounters};
 use rist_core::packet::gre::{
     BufferNegotiation, GreKeepalive, OwnedBufferNegotiationPacket, OwnedKeepalivePacket,
     OwnedOobPacket, ReducedPacket,
@@ -4275,8 +4275,17 @@ impl MainMioMultiSender {
         Ok(())
     }
 
+    /// The sender's statistics; the PSK counters are summed over peers.
     pub fn stats(&self) -> SenderStats {
-        self.core.stats()
+        let mut stats = self.core.stats();
+        for runtime in &self.peer_runtime {
+            let peer = runtime.sender.stats();
+            stats.clear_packets_dropped += peer.clear_packets_dropped;
+            stats.decrypt_rejected += peer.decrypt_rejected;
+            stats.decrypt_latched += peer.decrypt_latched;
+            stats.nonce_latches += peer.nonce_latches;
+        }
+        stats
     }
 
     pub fn peer_stats(&self, peer: usize) -> Option<SenderStats> {
@@ -4515,6 +4524,11 @@ impl MainMioReceiver {
         if self.configured_peer.is_some_and(|peer| peer != from) {
             return Ok(None);
         }
+        // With a key, a clear packet (other than EAPOL) is dropped and
+        // counted before any session is made for its source.
+        self.core
+            .screen_clear_datagram(datagram)
+            .map_err(core_to_io_error)?;
         let peers = self.peer_runtime.len();
         let runtime = match self.peer_runtime.entry(from) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
@@ -4534,8 +4548,12 @@ impl MainMioReceiver {
             }
         };
         // Data path: a clear reduced data packet is parsed in place, so its
-        // payload is copied once, into the `ReceivedPayload`.
-        if let Ok(packet) = ReducedPacket::decode(datagram) {
+        // payload is copied once, into the `ReceivedPayload`. Never with a
+        // key: then every packet is decrypted and checked below.
+        if let Some(packet) = (!runtime.core.has_rx_key())
+            .then(|| ReducedPacket::decode(datagram).ok())
+            .flatten()
+        {
             if !looks_like_rtcp(packet.payload) && receiver_runtime_authenticated(runtime) {
                 let now = Instant::now();
                 let payload = runtime
@@ -5313,11 +5331,30 @@ impl MainMioReceiver {
             .unwrap_or_else(|| self.core.missing_sequences())
     }
 
+    /// The last peer's statistics. The PSK counters
+    /// (`clear_packets_dropped`, `decrypt_rejected`, `decrypt_latched`,
+    /// `nonce_latches`) are the receiver's: every source's, summed.
     pub fn stats(&self) -> ReceiverStats {
-        self.last_peer
+        let mut stats = self
+            .last_peer
             .and_then(|peer| self.peer_runtime.get(&peer))
             .map(|runtime| runtime.core.stats())
-            .unwrap_or_else(|| self.core.stats())
+            .unwrap_or_else(|| self.core.stats());
+        let counters = self.psk_receive_counters();
+        stats.clear_packets_dropped = counters.clear_packets_dropped;
+        stats.decrypt_rejected = counters.decrypt_rejected;
+        stats.decrypt_latched = counters.decrypt_latched;
+        stats.nonce_latches = counters.nonce_latches;
+        stats
+    }
+
+    /// What the receive key turned away, over every source.
+    pub fn psk_receive_counters(&self) -> PskReceiveCounters {
+        let mut counters = self.core.psk_receive_counters();
+        for runtime in self.peer_runtime.values() {
+            counters.add(runtime.core.psk_receive_counters());
+        }
+        counters
     }
 
     fn ensure_peer_authenticated(&self, peer: SocketAddr) -> io::Result<()> {
@@ -5701,6 +5738,259 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Every datagram waiting on a raw socket.
+    fn drain_raw(socket: &StdUdpSocket) -> Vec<Vec<u8>> {
+        let mut buf = [0u8; 2_048];
+        let mut datagrams = Vec::new();
+        while let Ok((len, _)) = socket.recv_from(&mut buf) {
+            datagrams.push(buf[..len].to_vec());
+        }
+        datagrams
+    }
+
+    /// Asserts that every datagram is GRE with the key (nonce) and
+    /// sequence fields: encrypted, never clear.
+    fn assert_all_encrypted(datagrams: &[Vec<u8>]) {
+        for datagram in datagrams {
+            let (gre, _) = GreHeader::decode(datagram).unwrap();
+            assert!(
+                gre.key.is_some() && gre.sequence.is_some(),
+                "clear datagram from a keyed endpoint: {:02x?}",
+                &datagram[..datagram.len().min(16)]
+            );
+        }
+    }
+
+    /// A keyed Main receiver drops every clear packet a peer without the
+    /// key sends (data, SR, keepalive, buffer negotiation, out-of-band),
+    /// on the mio fast path too, counts them, delivers nothing, and makes
+    /// no session for the source.
+    #[test]
+    fn keyed_main_receiver_drops_clear_datagrams_before_making_a_session() {
+        let flow_id = 0x1122_3344;
+        let ntp = ntp_now();
+        let mut receiver =
+            MainMioReceiver::bind(loopback_any(), flow_id, "rust", NackMode::Range).unwrap();
+        receiver.set_rx_key(PskKey::receiver(128, b"secret").unwrap());
+        let receiver_addr = receiver.local_addr().unwrap();
+        let mut sender =
+            MainMioSender::connect(loopback_any(), receiver_addr, flow_id, 64).unwrap();
+        sender.set_recovery_tuning(RecoveryTuning::librist_like());
+        let start = Instant::now();
+        sender.poll_rtcp_and_send(start, ntp).unwrap();
+        for index in 0..3u8 {
+            sender.send_payload(&[index; 188], ntp, start).unwrap();
+        }
+        sender
+            .poll_rtcp_and_send(start + Duration::from_secs(1), ntp)
+            .unwrap();
+        sender
+            .send_keepalive(GreKeepalive::librist_default([1, 2, 3, 4, 5, 6]))
+            .unwrap();
+        sender
+            .send_buffer_negotiation(BufferNegotiation::session(1000, 0))
+            .unwrap();
+        sender.send_oob(b"out of band").unwrap();
+
+        let mut buf = [0u8; 2_048];
+        let mut dropped = 0;
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            match receiver.try_recv_event(&mut buf) {
+                Ok(Some(event)) => panic!("keyed receiver took a clear packet: {event:?}"),
+                Ok(None) => thread::sleep(Duration::from_millis(1)),
+                Err(error) => {
+                    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                    dropped += 1;
+                }
+            }
+        }
+        assert!(dropped >= 7, "{dropped} clear datagrams dropped");
+        let stats = receiver.stats();
+        assert_eq!(stats.clear_packets_dropped, dropped);
+        assert_eq!(stats.received_packets, 0);
+        assert_eq!(receiver.peer_count(), 0);
+        assert_eq!(
+            receiver.psk_receive_counters().clear_packets_dropped,
+            dropped
+        );
+    }
+
+    /// A keyed Main sender puts nothing clear on the wire on any send path:
+    /// data, the startup copies of the first packet, SR and echo requests,
+    /// keepalives, buffer negotiation, out-of-band data, retransmissions,
+    /// duplicate repairs, echo responses and tail probes. Its peer is a
+    /// keyed receiver core on a raw socket, which reads every datagram
+    /// through the PSK checks.
+    #[test]
+    fn keyed_main_sender_sends_nothing_clear_on_any_path() {
+        let flow_id = 0x1122_3344;
+        let ntp = ntp_now();
+        let sink = raw_sink();
+        sink.set_read_timeout(Some(Duration::from_millis(30)))
+            .unwrap();
+        let sink_addr = sink.local_addr().unwrap();
+        let mut sender = MainMioSender::connect(loopback_any(), sink_addr, flow_id, 64).unwrap();
+        sender.set_tx_key(PskKey::new(128, b"secret").unwrap());
+        sender.set_rx_key(PskKey::receiver(128, b"secret").unwrap());
+        sender.set_recovery_tuning(RecoveryTuning {
+            tail_probe: rist_core::TailProbe::On,
+            // Six data packets would allow no probe at the default cap.
+            tail_probe_max_per_mille: 1_000,
+            ..RecoveryTuning::default()
+        });
+        let sender_addr = sender.local_addr().unwrap();
+        let mut peer = MainReceiverCore::new(flow_id, "peer", NackMode::Range)
+            .with_rx_key(PskKey::receiver(128, b"secret").unwrap());
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 2_048];
+        // Reads what the sender sent; the peer takes everything but RTP
+        // sequence 2 (a hole to NACK).
+        let absorb = |peer: &mut MainReceiverCore, seen: &mut Vec<Vec<u8>>| {
+            for datagram in drain_raw(&sink) {
+                match peer.decode_datagram(&datagram).unwrap() {
+                    MainPacket::Reduced(packet) if looks_like_rtcp(&packet.payload) => {
+                        peer.handle_reduced_rtcp(packet.reduced, &packet.payload, ntp_now())
+                            .unwrap();
+                    }
+                    MainPacket::Reduced(packet) => {
+                        let rtp = RtpPacket::decode(&packet.payload).unwrap();
+                        if rtp.header.sequence_number != 2 {
+                            peer.accept_reduced_at(packet.reduced, &packet.payload, Instant::now())
+                                .unwrap();
+                        }
+                    }
+                    _ => {}
+                }
+                seen.push(datagram);
+            }
+        };
+        let mut serve = |sender: &mut MainMioSender, for_ms: u64| {
+            let until = Instant::now() + Duration::from_millis(for_ms);
+            while Instant::now() < until {
+                let _ = sender.try_recv_event(&mut buf);
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
+
+        let start = Instant::now();
+        sender.poll_rtcp_and_send(start, ntp).unwrap();
+        sender
+            .send_keepalive(GreKeepalive::librist_default([1, 2, 3, 4, 5, 6]))
+            .unwrap();
+        sender
+            .send_buffer_negotiation(BufferNegotiation::session(1000, 0))
+            .unwrap();
+        sender.send_oob(b"out of band").unwrap();
+        for index in 0..6u8 {
+            sender
+                .send_payload(&[index; 188], ntp, Instant::now())
+                .unwrap();
+        }
+        thread::sleep(Duration::from_millis(15));
+        // The startup copies of the first packet.
+        sender.poll_repairs_and_send(Instant::now()).unwrap();
+        sender
+            .poll_rtcp_and_send(Instant::now() + Duration::from_secs(1), ntp)
+            .unwrap();
+        absorb(&mut peer, &mut seen);
+
+        // The peer's NACK for the hole, twice beyond the sender's spacing
+        // (retransmission, then a duplicate repair), and its echo request.
+        for _ in 0..2 {
+            let feedback = peer.build_feedback();
+            sink.send_to(&feedback.bytes, sender_addr).unwrap();
+            serve(&mut sender, 12);
+        }
+        if let Some(report) = peer.poll_rtcp(Instant::now() + Duration::from_secs(1), ntp_now()) {
+            sink.send_to(&report.bytes, sender_addr).unwrap();
+        }
+        serve(&mut sender, 10);
+        // Idle after the burst: tail probes.
+        for _ in 0..4 {
+            thread::sleep(Duration::from_millis(20));
+            sender.poll_repairs_and_send(Instant::now()).unwrap();
+        }
+        absorb(&mut peer, &mut seen);
+
+        let stats = sender.stats();
+        assert!(stats.retransmitted_packets >= 1, "{stats:?}");
+        assert!(stats.duplicate_repairs >= 1, "{stats:?}");
+        assert!(stats.echo_responses >= 1, "{stats:?}");
+        assert!(stats.tail_probes >= 1, "{stats:?}");
+        assert_eq!(stats.clear_packets_dropped, 0);
+        assert_eq!(stats.decrypt_rejected, 0);
+        assert!(seen.len() >= 12, "{} datagrams", seen.len());
+        assert_all_encrypted(&seen);
+        let peer_stats = peer.stats();
+        assert_eq!(peer_stats.decrypt_rejected, 0);
+        assert_eq!(peer_stats.decrypt_latched, 0);
+        assert!(peer_stats.retry_packets_received >= 3, "{peer_stats:?}");
+    }
+
+    /// A Main receiver given only a receive key sends its NACKs, reports,
+    /// echo requests and responses, keepalives, buffer negotiation and
+    /// out-of-band data encrypted.
+    #[test]
+    fn main_receiver_with_only_a_receive_key_sends_nothing_clear() {
+        let flow_id = 0x1122_3344;
+        let ntp = ntp_now();
+        let mut receiver =
+            MainMioReceiver::bind(loopback_any(), flow_id, "rust", NackMode::Range).unwrap();
+        receiver.set_rx_key(PskKey::receiver(128, b"secret").unwrap());
+        let receiver_addr = receiver.local_addr().unwrap();
+        let peer_socket = raw_sink();
+        peer_socket
+            .set_read_timeout(Some(Duration::from_millis(30)))
+            .unwrap();
+        let peer_addr = peer_socket.local_addr().unwrap();
+        let mut sender = MainSenderCore::new(flow_id, 64)
+            .with_tx_key(PskKey::new(128, b"secret").unwrap())
+            .with_rx_key(PskKey::receiver(128, b"secret").unwrap());
+        let now = Instant::now();
+        assert_eq!(sender.poll_rtcp(now, ntp), None);
+        let report = sender.poll_rtcp(now + Duration::from_secs(1), ntp).unwrap();
+        peer_socket.send_to(&report.bytes, receiver_addr).unwrap();
+        for index in 0..5u8 {
+            let packet = sender.send_payload(&[index; 188], ntp, now);
+            if index != 2 {
+                peer_socket.send_to(&packet.bytes, receiver_addr).unwrap();
+            }
+        }
+        let mut buf = [0u8; 2_048];
+        let mut payloads = 0;
+        let deadline = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < deadline {
+            match receiver.try_recv_event(&mut buf).unwrap() {
+                Some(MainReceiverEvent::Payload { .. }) => payloads += 1,
+                Some(_) => {}
+                None => thread::sleep(Duration::from_millis(1)),
+            }
+        }
+        assert_eq!(payloads, 4);
+        receiver
+            .poll_all_rtcp_and_send(Instant::now() + Duration::from_secs(1), ntp_now())
+            .unwrap();
+        receiver
+            .send_keepalive_to(peer_addr, GreKeepalive::librist_default([6, 5, 4, 3, 2, 1]))
+            .unwrap();
+        receiver
+            .send_buffer_negotiation_to(peer_addr, BufferNegotiation::session(0, 500))
+            .unwrap();
+        receiver.send_oob_to(peer_addr, b"out of band").unwrap();
+        thread::sleep(Duration::from_millis(10));
+        let datagrams = drain_raw(&peer_socket);
+        assert!(datagrams.len() >= 4, "{} datagrams", datagrams.len());
+        assert_all_encrypted(&datagrams);
+        for datagram in &datagrams {
+            sender.decode_datagram(datagram).unwrap();
+        }
+        let stats = receiver.stats();
+        assert_eq!(stats.clear_packets_dropped, 0);
+        assert_eq!(stats.decrypt_rejected, 0);
+        assert_eq!(sender.stats().decrypt_rejected, 0);
     }
 
     fn raw_sink() -> StdUdpSocket {
