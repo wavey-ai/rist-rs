@@ -145,16 +145,31 @@ authentication tag. What that means:
   can put a new nonce on every packet, and each new nonce is another try at
   about 1 in 32,600 (3.1e-5). The limit is how fast rist-rs takes new
   nonces, each a PBKDF2 derivation: at most 8 a second for one session (one
-  source address and port) and at most 64 a second for all sessions of a
+  source address and port), and at most 64 a second for all sessions of a
   keyed endpoint together (`MAX_SHARED_RECEIVE_REKEYS_PER_SECOND`, shared by
-  every copy of the configured key). A sustained flood therefore gets about
-  one garbage data packet delivered every 68 minutes from a single source
-  address and port, and at most about one every 8.5 minutes (2e-3 a second)
-  however many addresses and ports it uses, and costs at most 64
-  derivations a second of CPU. The same budget means such a flood can
-  delay a correct peer's first packets or its nonce change: they are
-  dropped (counted in `decrypt_rejected`) until the budget allows them, as
-  a flood can already fill a listening receiver's session capacity.
+  every copy of the configured key) while a session's current nonce has
+  not passed the checks: new sessions and candidate sources, and any
+  session whose last nonce failed. A forger gets no more tries than that
+  shared budget: a session whose nonce passed (by chance, or with a
+  replayed packet of a correct peer) gets one change outside it, but only
+  after spending one inside it on the nonce that passed. A sustained flood therefore gets about one garbage data
+  packet delivered every 68 minutes from a single source address and port,
+  and at most about one every 8.5 minutes (2e-3 a second) however many
+  addresses and ports it uses.
+- **What a flood costs and whom it delays.** A session whose current nonce
+  passed the checks (an established peer with the right passphrase)
+  changes nonce under its own limit of 8 a second only, so a flood from
+  other addresses cannot hold up its nonce rotation. It can delay a new
+  peer's first packets: until the shared budget allows the new peer's
+  nonce, they are dropped (counted in `decrypt_rejected`), much as a flood
+  can fill a listening receiver's session capacity. Each forged packet
+  from a new address and port still creates a session (up to the
+  endpoint's session capacity), but a session derives its own transmit key
+  only when it first sends, which a session that never passed the checks
+  does not, so the flood costs at most 64 derivations a second of CPU for
+  its nonces (128 if it replays captured packets of a correct peer),
+  however many sessions it creates and the caller evicts, plus at most 8 a
+  second for each established peer.
 - **Keepalives, buffer negotiation and out-of-band data are barely
   checked.** They carry too little structure to tell a wrong key: one of
   valid form neither proves a nonce nor counts against it. One that is

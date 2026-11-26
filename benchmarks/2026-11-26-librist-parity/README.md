@@ -79,9 +79,13 @@ On run b (`cbf19d8`), against librist:
   random data passes the data-packet checks about once in 2^15 tries, and about one
   wrong-key nonce in 32,600 gets a garbage packet delivered before it is shut out. A forger
   needs no key and may use a new nonce on every packet, so each new nonce is another try:
-  rist-rs takes at most 8 new nonces a second per session and 64 a second per endpoint, so a
-  sustained flood gets about one garbage data packet through every 68 minutes from one
-  source address and port, and at most about one every 8.5 minutes from any number of them.
+  rist-rs takes at most 8 new nonces a second per session and, for sessions whose nonce has
+  not passed the checks, 64 a second per endpoint, so a sustained flood gets about one
+  garbage data packet through every 68 minutes from one source address and port, and at
+  most about one every 8.5 minutes from any number of them. An established peer changes
+  nonce under its own per-session limit only, so such a flood cannot stall its nonce
+  rotation; it can delay a new peer's first packets. Sessions the flood creates derive no
+  key until they send, so its CPU cost stays at 64 derivations a second for its nonces.
   Keepalives, buffer negotiation and out-of-band data can hardly be checked: a wrong key's or
   a forger's out-of-band packet is delivered with garbage bytes. A keyed listening rist-rs
   sender therefore chooses its receiver only by RTCP that passed the checks (a forger
