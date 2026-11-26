@@ -10,9 +10,9 @@ use mio::event::Source;
 use mio::net::UdpSocket;
 use mio::{Interest, Registry, Token};
 use rist_core::auth::{EapSrpAuthenticatorSession, EapSrpClientSession, EapolFrame, SrpUserRecord};
-use rist_core::crypto::PskKey;
+use rist_core::crypto::{PskKey, PskReceiveCounters};
 use rist_core::packet::gre::{
-    BufferNegotiation, GreKeepalive, OwnedBufferNegotiationPacket, OwnedKeepalivePacket,
+    BufferNegotiation, GreHeader, GreKeepalive, OwnedBufferNegotiationPacket, OwnedKeepalivePacket,
     OwnedOobPacket, ReducedPacket,
 };
 use rist_core::packet::rtp::{encode_packet, RtpHeader, RtpPacket};
@@ -38,6 +38,10 @@ pub const MAX_RIST_DATAGRAM_SIZE: usize = 10_000;
 const SAFE_RECEIVE_CAPACITY: usize = MAX_RIST_DATAGRAM_SIZE + 1;
 pub const DEFAULT_MAIN_EVENT_QUEUE_CAPACITY: usize = 256;
 pub const DEFAULT_MAIN_PEER_CAPACITY: usize = 256;
+/// Candidate sources whose own copy of the receive key a keyed listening
+/// [`MainMioSender`] keeps until it has chosen its peer (the least recently
+/// heard one makes room).
+pub const MAIN_LISTENER_KEY_CANDIDATES: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkInterface {
@@ -1981,6 +1985,10 @@ pub struct MainMioSender {
     srp: Option<EapSrpClientSession>,
     srp_authenticator: Option<EapSrpAuthenticatorSession>,
     srp_candidates: HashMap<SocketAddr, EapSrpAuthenticatorSession>,
+    /// With a receive key, until a listening sender has chosen its peer:
+    /// each candidate source's own copy of the key (least recently heard
+    /// first), so one source's packets never touch another's nonce state.
+    rx_candidates: VecDeque<(SocketAddr, PskKey)>,
     peer: Option<SocketAddr>,
     listening: bool,
     last_reauthentication: Option<Instant>,
@@ -2471,6 +2479,7 @@ impl MainMioSender {
             srp: None,
             srp_authenticator: None,
             srp_candidates: HashMap::new(),
+            rx_candidates: VecDeque::new(),
             peer,
             listening: peer.is_none(),
             last_reauthentication: None,
@@ -2582,10 +2591,12 @@ impl MainMioSender {
 
     pub fn set_tx_key(&mut self, key: PskKey) {
         self.core.set_tx_key(key);
+        self.rx_candidates.clear();
     }
 
     pub fn set_rx_key(&mut self, key: PskKey) {
         self.core.set_rx_key(key);
+        self.rx_candidates.clear();
     }
 
     pub fn enable_srp_client(&mut self, username: impl Into<String>, password: impl AsRef<[u8]>) {
@@ -2661,8 +2672,18 @@ impl MainMioSender {
         self.peer
     }
 
+    /// The sender's statistics, with the PSK counters of candidate sources
+    /// not chosen yet (see [`MAIN_LISTENER_KEY_CANDIDATES`]).
     pub fn stats(&self) -> SenderStats {
-        self.core.stats()
+        let mut stats = self.core.stats();
+        for (_, key) in &self.rx_candidates {
+            let counters = key.receive_counters();
+            stats.clear_packets_dropped += counters.clear_packets_dropped;
+            stats.decrypt_rejected += counters.decrypt_rejected;
+            stats.decrypt_latched += counters.decrypt_latched;
+            stats.nonce_latches += counters.nonce_latches;
+        }
+        stats
     }
 
     pub fn send_outbound(&mut self, packet: &MainOutboundPacket) -> io::Result<usize> {
@@ -3101,13 +3122,15 @@ impl MainMioSender {
         from: SocketAddr,
         datagram: &[u8],
     ) -> io::Result<MainSenderEvent> {
-        let packet = self
-            .core
-            .decode_datagram(datagram)
-            .map_err(core_to_io_error)?;
         if self.peer.is_some_and(|peer| peer != from) {
-            return Ok(MainSenderEvent::Unhandled { from, packet });
+            return self.foreign_datagram(from, datagram);
         }
+        let packet = if self.listening && self.peer.is_none() && self.core.has_rx_key() {
+            self.decode_candidate_datagram(from, datagram)
+        } else {
+            self.core.decode_datagram(datagram)
+        }
+        .map_err(core_to_io_error)?;
         let event = match packet {
             MainPacket::Eapol(eapol) => {
                 if self.handle_eapol_frame_from(from, &eapol.frame)? {
@@ -3135,7 +3158,15 @@ impl MainMioSender {
                         now,
                     )
                     .map_err(core_to_io_error)?;
-                self.select_unsecured_listener_peer(from);
+                // With a key only RTCP that passed the checks (a structure
+                // a forger without the key reproduces about once in 2^22)
+                // chooses the peer: keepalives, buffer negotiation and
+                // out-of-band data prove nothing.
+                if self.select_unsecured_listener_peer(from) && self.core.has_rx_key() {
+                    self.adopt_candidate_rx_key(from);
+                    self.core.upgrade_gre_version(packet.gre.version);
+                    self.send_keepalive(GreKeepalive::librist_default([0; 6]))?;
+                }
                 for response in &outcome.responses {
                     // Best effort: a full queue drops an echo response as a
                     // lost datagram would.
@@ -3170,25 +3201,24 @@ impl MainMioSender {
                 }
             }
             MainPacket::Keepalive(packet) => {
-                let discovered = self.listening && self.peer.is_none();
-                self.select_unsecured_listener_peer(from);
+                let discovered = self.select_listener_peer_without_key(from);
                 if self.listening && self.peer == Some(from) {
                     self.core.upgrade_gre_version(packet.gre.version);
                 }
-                if discovered && self.peer == Some(from) {
+                if discovered {
                     self.send_keepalive(GreKeepalive::librist_default([0; 6]))?;
                 }
-                self.timers.observe_peer_activity(Instant::now());
+                self.observe_activity_from(from);
                 MainSenderEvent::Keepalive { from, packet }
             }
             MainPacket::BufferNegotiation(packet) => {
-                self.select_unsecured_listener_peer(from);
-                self.timers.observe_peer_activity(Instant::now());
+                self.select_listener_peer_without_key(from);
+                self.observe_activity_from(from);
                 MainSenderEvent::BufferNegotiation { from, packet }
             }
             MainPacket::Oob(packet) => {
-                self.select_unsecured_listener_peer(from);
-                self.timers.observe_peer_activity(Instant::now());
+                self.select_listener_peer_without_key(from);
+                self.observe_activity_from(from);
                 MainSenderEvent::Oob { from, packet }
             }
             packet => MainSenderEvent::Unhandled { from, packet },
@@ -3366,13 +3396,109 @@ impl MainMioSender {
         }
         if completed && self.peer.is_none() {
             self.peer = Some(from);
+            self.adopt_candidate_rx_key(from);
         }
         Ok(accepted)
     }
 
-    fn select_unsecured_listener_peer(&mut self, from: SocketAddr) {
+    /// Chooses `from` as the listening sender's peer if none is chosen and
+    /// SRP does not choose it. Returns whether it was chosen now.
+    fn select_unsecured_listener_peer(&mut self, from: SocketAddr) -> bool {
         if self.listening && self.peer.is_none() && self.srp_authenticator.is_none() {
             self.peer = Some(from);
+            return true;
+        }
+        false
+    }
+
+    /// [`Self::select_unsecured_listener_peer`] on a keepalive, buffer
+    /// negotiation or out-of-band packet: only without a receive key. With
+    /// one, such a packet chooses nothing: a host without the key can make
+    /// one that passes (they carry too little structure to check).
+    fn select_listener_peer_without_key(&mut self, from: SocketAddr) -> bool {
+        !self.core.has_rx_key() && self.select_unsecured_listener_peer(from)
+    }
+
+    /// Valid traffic from the chosen peer keeps the session alive; a keyed
+    /// listening sender's candidates do not.
+    fn observe_activity_from(&mut self, from: SocketAddr) {
+        if self.peer == Some(from) {
+            self.timers.observe_peer_activity(Instant::now());
+        }
+    }
+
+    /// A datagram from a source other than the chosen peer. With a receive
+    /// key it is not decrypted, so it cannot touch the peer's nonce state
+    /// (librist, too, picks the peer by address before it picks a key): it
+    /// is returned as `Unhandled`, `MainPacket::Unknown` with its GRE header
+    /// and its payload as it arrived. Without a key it is decoded as before.
+    fn foreign_datagram(
+        &mut self,
+        from: SocketAddr,
+        datagram: &[u8],
+    ) -> io::Result<MainSenderEvent> {
+        let packet = if self.core.has_rx_key() {
+            let (gre, offset) = GreHeader::decode(datagram).map_err(core_to_io_error)?;
+            MainPacket::Unknown {
+                gre,
+                vsf: None,
+                payload: datagram[offset..].to_vec(),
+            }
+        } else {
+            self.core
+                .decode_datagram(datagram)
+                .map_err(core_to_io_error)?
+        };
+        Ok(MainSenderEvent::Unhandled { from, packet })
+    }
+
+    /// Decodes a datagram for a keyed listening sender that has not chosen
+    /// its peer, with the source's own copy of the receive key.
+    fn decode_candidate_datagram(
+        &mut self,
+        from: SocketAddr,
+        datagram: &[u8],
+    ) -> rist_core::Result<MainPacket> {
+        let entry = match self
+            .rx_candidates
+            .iter()
+            .position(|(addr, _)| *addr == from)
+        {
+            Some(index) => self
+                .rx_candidates
+                .remove(index)
+                .expect("candidate index was just found"),
+            None => {
+                let Some(key) = self.core.fresh_rx_key() else {
+                    return self.core.decode_datagram(datagram);
+                };
+                if self.rx_candidates.len() >= MAIN_LISTENER_KEY_CANDIDATES {
+                    if let Some((_, evicted)) = self.rx_candidates.pop_front() {
+                        self.core.absorb_psk_counters(evicted.receive_counters());
+                    }
+                }
+                (from, key)
+            }
+        };
+        // Most recently heard last.
+        self.rx_candidates.push_back(entry);
+        let (_, key) = self
+            .rx_candidates
+            .back_mut()
+            .expect("candidate was just pushed");
+        self.core.decode_datagram_with_rx_key(key, datagram)
+    }
+
+    /// The peer is chosen: its candidate copy of the receive key becomes
+    /// the receive key (its nonce state goes on), and the other candidates'
+    /// copies are dropped, their counters kept.
+    fn adopt_candidate_rx_key(&mut self, peer: SocketAddr) {
+        for (addr, key) in self.rx_candidates.drain(..) {
+            if addr == peer {
+                self.core.adopt_rx_key(key);
+            } else {
+                self.core.absorb_psk_counters(key.receive_counters());
+            }
         }
     }
 
@@ -3962,9 +4088,12 @@ impl MainMioMultiSender {
         self.core.disable_null_packet_suppression();
     }
 
+    /// Every peer gets its own copy of the key with a fresh nonce: peers'
+    /// GRE sequences run separately, so a shared nonce would reuse the
+    /// AES-CTR keystream across peers.
     pub fn set_tx_key(&mut self, key: PskKey) {
         for runtime in &mut self.peer_runtime {
-            runtime.sender.set_tx_key(key.clone());
+            runtime.sender.set_tx_key(key.fresh_sender_copy());
         }
         self.core.set_tx_key(key);
     }
@@ -4275,8 +4404,17 @@ impl MainMioMultiSender {
         Ok(())
     }
 
+    /// The sender's statistics; the PSK counters are summed over peers.
     pub fn stats(&self) -> SenderStats {
-        self.core.stats()
+        let mut stats = self.core.stats();
+        for runtime in &self.peer_runtime {
+            let peer = runtime.sender.stats();
+            stats.clear_packets_dropped += peer.clear_packets_dropped;
+            stats.decrypt_rejected += peer.decrypt_rejected;
+            stats.decrypt_latched += peer.decrypt_latched;
+            stats.nonce_latches += peer.nonce_latches;
+        }
+        stats
     }
 
     pub fn peer_stats(&self, peer: usize) -> Option<SenderStats> {
@@ -4515,6 +4653,11 @@ impl MainMioReceiver {
         if self.configured_peer.is_some_and(|peer| peer != from) {
             return Ok(None);
         }
+        // With a key, a clear packet (other than EAPOL) is dropped and
+        // counted before any session is made for its source.
+        self.core
+            .screen_clear_datagram(datagram)
+            .map_err(core_to_io_error)?;
         let peers = self.peer_runtime.len();
         let runtime = match self.peer_runtime.entry(from) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
@@ -4534,8 +4677,12 @@ impl MainMioReceiver {
             }
         };
         // Data path: a clear reduced data packet is parsed in place, so its
-        // payload is copied once, into the `ReceivedPayload`.
-        if let Ok(packet) = ReducedPacket::decode(datagram) {
+        // payload is copied once, into the `ReceivedPayload`. Never with a
+        // key: then every packet is decrypted and checked below.
+        if let Some(packet) = (!runtime.core.has_rx_key())
+            .then(|| ReducedPacket::decode(datagram).ok())
+            .flatten()
+        {
             if !looks_like_rtcp(packet.payload) && receiver_runtime_authenticated(runtime) {
                 let now = Instant::now();
                 let payload = runtime
@@ -4568,7 +4715,16 @@ impl MainMioReceiver {
                 }
                 if accepted {
                     runtime.timers.observe_peer_activity(now);
-                    self.last_peer = Some(from);
+                    // EAPOL is clear, so with a key any host can send it:
+                    // it makes its source the peer only once the source
+                    // completed SRP or its data or RTCP passed the checks.
+                    if self.configured_peer.is_some()
+                        || !runtime.core.has_rx_key()
+                        || receiver_runtime_authenticated(runtime)
+                        || runtime.core.rx_peer_proven()
+                    {
+                        self.last_peer = Some(from);
+                    }
                 }
                 MainReceiverEvent::Eapol {
                     from,
@@ -4599,19 +4755,30 @@ impl MainMioReceiver {
                 runtime.timers.observe_peer_activity(now);
                 MainReceiverEvent::Payload { from, payload }
             }
+            // With a key, these pass with a weak verdict that a host with
+            // no key gets every time: they make a source the peer (the one
+            // feedback and keepalives go to) and count as its activity only
+            // once its data or RTCP has proven it holds the passphrase. A
+            // configured peer's address is fixed already.
             MainPacket::Keepalive(packet) => {
-                self.last_peer = Some(from);
-                runtime.timers.observe_peer_activity(now);
+                if self.configured_peer.is_some() || runtime.core.rx_peer_proven() {
+                    self.last_peer = Some(from);
+                    runtime.timers.observe_peer_activity(now);
+                }
                 MainReceiverEvent::Keepalive { from, packet }
             }
             MainPacket::BufferNegotiation(packet) => {
-                self.last_peer = Some(from);
-                runtime.timers.observe_peer_activity(now);
+                if self.configured_peer.is_some() || runtime.core.rx_peer_proven() {
+                    self.last_peer = Some(from);
+                    runtime.timers.observe_peer_activity(now);
+                }
                 MainReceiverEvent::BufferNegotiation { from, packet }
             }
             MainPacket::Oob(packet) => {
-                self.last_peer = Some(from);
-                runtime.timers.observe_peer_activity(now);
+                if self.configured_peer.is_some() || runtime.core.rx_peer_proven() {
+                    self.last_peer = Some(from);
+                    runtime.timers.observe_peer_activity(now);
+                }
                 MainReceiverEvent::Oob { from, packet }
             }
             packet => MainReceiverEvent::Unhandled { from, packet },
@@ -4666,12 +4833,14 @@ impl MainMioReceiver {
                 .min();
         }
         self.peer_runtime
-            .values()
-            .flat_map(|runtime| {
-                [
-                    runtime.core.next_poll_at(),
-                    runtime.timers.next_keepalive_at(),
-                ]
+            .iter()
+            .flat_map(|(&peer, runtime)| {
+                // A session that is not a peer is sent no RTCP, so its
+                // report timer would stay due.
+                let rtcp = receiver_runtime_proven(runtime, peer, self.configured_peer)
+                    .then(|| runtime.core.next_poll_at())
+                    .flatten();
+                [rtcp, runtime.timers.next_keepalive_at()]
             })
             .flatten()
             .min()
@@ -4679,15 +4848,19 @@ impl MainMioReceiver {
 
     /// [`Self::poll_rtcp_and_send`] for every authenticated peer, not only
     /// the last one heard from, so two contributors on one port both get
-    /// NACKs. Returns the number of RTCP packets sent. On a send error the
-    /// rest of that peer's batch stays due; the error is returned when
-    /// nothing went out.
+    /// NACKs. With a receive key, a session whose data or RTCP never passed
+    /// the checks is not a peer and is sent nothing. Returns the number of
+    /// RTCP packets sent. On a send error the rest of that peer's batch
+    /// stays due; the error is returned when nothing went out.
     pub fn poll_all_rtcp_and_send(&mut self, now: Instant, now_ntp: u64) -> io::Result<usize> {
         let socket = &mut self.socket;
+        let configured_peer = self.configured_peer;
         let mut sent = 0;
         let mut error = None;
         for (&peer, runtime) in self.peer_runtime.iter_mut() {
-            if !receiver_runtime_authenticated(runtime) {
+            if !receiver_runtime_authenticated(runtime)
+                || !receiver_runtime_proven(runtime, peer, configured_peer)
+            {
                 continue;
             }
             sent += runtime
@@ -4715,7 +4888,10 @@ impl MainMioReceiver {
     }
 
     /// Sends a keepalive to every authenticated peer whose keepalive timer
-    /// is due (each peer keeps its own schedule). Returns the keepalives
+    /// is due (each peer keeps its own schedule). With a receive key, a
+    /// session whose data or RTCP never passed the checks is not a peer: it
+    /// is sent no keepalive, so it never derives a transmit key and a
+    /// forged (or spoofed) source gets nothing back. Returns the keepalives
     /// sent. On a send error the other peers are still served; the error is
     /// returned when nothing went out.
     pub fn poll_keepalive_all(
@@ -4724,10 +4900,17 @@ impl MainMioReceiver {
         keepalive: GreKeepalive<'_>,
     ) -> io::Result<usize> {
         let socket = &mut self.socket;
+        let configured_peer = self.configured_peer;
         let mut sent = 0;
         let mut error = None;
         for (&peer, runtime) in self.peer_runtime.iter_mut() {
-            if !receiver_runtime_authenticated(runtime) || !runtime.timers.poll(now).keepalive_due {
+            // The timer is polled (so kept moving) before the proof is
+            // checked: a session that loses its proof (its nonce shut out)
+            // must not leave a due timer behind for `next_timeout`.
+            if !receiver_runtime_authenticated(runtime)
+                || !runtime.timers.poll(now).keepalive_due
+                || !receiver_runtime_proven(runtime, peer, configured_peer)
+            {
                 continue;
             }
             let packet = runtime.core.build_keepalive(keepalive);
@@ -4771,11 +4954,14 @@ impl MainMioReceiver {
         before - self.peer_runtime.len()
     }
 
+    /// Every session gets its own copy of the key with a fresh nonce:
+    /// sessions' GRE sequences run separately, so a shared nonce would
+    /// reuse the AES-CTR keystream across sessions.
     pub fn set_tx_key(&mut self, key: PskKey) {
-        self.core.set_tx_key(key.clone());
         for runtime in self.peer_runtime.values_mut() {
-            runtime.core.set_tx_key(key.clone());
+            runtime.core.set_tx_key(key.fresh_sender_copy());
         }
+        self.core.set_tx_key(key);
     }
 
     pub fn set_rx_key(&mut self, key: PskKey) {
@@ -5313,11 +5499,30 @@ impl MainMioReceiver {
             .unwrap_or_else(|| self.core.missing_sequences())
     }
 
+    /// The last peer's statistics. The PSK counters
+    /// (`clear_packets_dropped`, `decrypt_rejected`, `decrypt_latched`,
+    /// `nonce_latches`) are the receiver's: every source's, summed.
     pub fn stats(&self) -> ReceiverStats {
-        self.last_peer
+        let mut stats = self
+            .last_peer
             .and_then(|peer| self.peer_runtime.get(&peer))
             .map(|runtime| runtime.core.stats())
-            .unwrap_or_else(|| self.core.stats())
+            .unwrap_or_else(|| self.core.stats());
+        let counters = self.psk_receive_counters();
+        stats.clear_packets_dropped = counters.clear_packets_dropped;
+        stats.decrypt_rejected = counters.decrypt_rejected;
+        stats.decrypt_latched = counters.decrypt_latched;
+        stats.nonce_latches = counters.nonce_latches;
+        stats
+    }
+
+    /// What the receive key turned away, over every source.
+    pub fn psk_receive_counters(&self) -> PskReceiveCounters {
+        let mut counters = self.core.psk_receive_counters();
+        for runtime in self.peer_runtime.values() {
+            counters.add(runtime.core.psk_receive_counters());
+        }
+        counters
     }
 
     fn ensure_peer_authenticated(&self, peer: SocketAddr) -> io::Result<()> {
@@ -5332,6 +5537,17 @@ impl MainMioReceiver {
             Err(srp_not_authenticated_error())
         }
     }
+}
+
+/// Whether a receiver session counts as a peer under the receive key: a
+/// configured peer always does (its address is fixed), any other only once
+/// its data or RTCP passed the checks ([`MainReceiverCore::rx_peer_proven`]).
+fn receiver_runtime_proven(
+    runtime: &MainReceiverPeerRuntime,
+    peer: SocketAddr,
+    configured_peer: Option<SocketAddr>,
+) -> bool {
+    configured_peer == Some(peer) || runtime.core.rx_peer_proven()
 }
 
 fn receiver_runtime_authenticated(runtime: &MainReceiverPeerRuntime) -> bool {
@@ -5701,6 +5917,361 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Every datagram waiting on a raw socket.
+    fn drain_raw(socket: &StdUdpSocket) -> Vec<Vec<u8>> {
+        let mut buf = [0u8; 2_048];
+        let mut datagrams = Vec::new();
+        while let Ok((len, _)) = socket.recv_from(&mut buf) {
+            datagrams.push(buf[..len].to_vec());
+        }
+        datagrams
+    }
+
+    /// Asserts that every datagram is GRE with the key (nonce) and
+    /// sequence fields: encrypted, never clear.
+    fn assert_all_encrypted(datagrams: &[Vec<u8>]) {
+        for datagram in datagrams {
+            let (gre, _) = GreHeader::decode(datagram).unwrap();
+            assert!(
+                gre.key.is_some() && gre.sequence.is_some(),
+                "clear datagram from a keyed endpoint: {:02x?}",
+                &datagram[..datagram.len().min(16)]
+            );
+        }
+    }
+
+    /// A keyed Main receiver drops every clear packet a peer without the
+    /// key sends (data, SR, keepalive, buffer negotiation, out-of-band),
+    /// on the mio fast path too, counts them, delivers nothing, and makes
+    /// no session for the source.
+    #[test]
+    fn keyed_main_receiver_drops_clear_datagrams_before_making_a_session() {
+        let flow_id = 0x1122_3344;
+        let ntp = ntp_now();
+        let mut receiver =
+            MainMioReceiver::bind(loopback_any(), flow_id, "rust", NackMode::Range).unwrap();
+        receiver.set_rx_key(PskKey::receiver(128, b"secret").unwrap());
+        let receiver_addr = receiver.local_addr().unwrap();
+        let mut sender =
+            MainMioSender::connect(loopback_any(), receiver_addr, flow_id, 64).unwrap();
+        sender.set_recovery_tuning(RecoveryTuning::librist_like());
+        let start = Instant::now();
+        sender.poll_rtcp_and_send(start, ntp).unwrap();
+        for index in 0..3u8 {
+            sender.send_payload(&[index; 188], ntp, start).unwrap();
+        }
+        sender
+            .poll_rtcp_and_send(start + Duration::from_secs(1), ntp)
+            .unwrap();
+        sender
+            .send_keepalive(GreKeepalive::librist_default([1, 2, 3, 4, 5, 6]))
+            .unwrap();
+        sender
+            .send_buffer_negotiation(BufferNegotiation::session(1000, 0))
+            .unwrap();
+        sender.send_oob(b"out of band").unwrap();
+
+        let mut buf = [0u8; 2_048];
+        let mut dropped = 0;
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            match receiver.try_recv_event(&mut buf) {
+                Ok(Some(event)) => panic!("keyed receiver took a clear packet: {event:?}"),
+                Ok(None) => thread::sleep(Duration::from_millis(1)),
+                Err(error) => {
+                    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                    dropped += 1;
+                }
+            }
+        }
+        assert!(dropped >= 7, "{dropped} clear datagrams dropped");
+        let stats = receiver.stats();
+        assert_eq!(stats.clear_packets_dropped, dropped);
+        assert_eq!(stats.received_packets, 0);
+        assert_eq!(receiver.peer_count(), 0);
+        assert_eq!(
+            receiver.psk_receive_counters().clear_packets_dropped,
+            dropped
+        );
+    }
+
+    fn wire_nonce(datagram: &[u8]) -> ([u8; 4], u32) {
+        let (gre, _) = GreHeader::decode(datagram).unwrap();
+        (
+            gre.key.expect("encrypted").to_be_bytes(),
+            gre.sequence.expect("encrypted"),
+        )
+    }
+
+    /// A keyed multi-peer sender encrypts for each peer with its own nonce,
+    /// for peers added before and after the key: with weights each peer
+    /// gets different packets at the same GRE sequence, which a shared
+    /// nonce would put under one AES-CTR keystream.
+    #[test]
+    fn keyed_multi_sender_gives_every_peer_its_own_nonce() {
+        let ntp = ntp_now();
+        let sinks = [raw_sink(), raw_sink(), raw_sink()];
+        for weighted in [false, true] {
+            let weight = u32::from(weighted);
+            let mut sender = MainMioMultiSender::bind(loopback_any(), 0x1122_3344, 64).unwrap();
+            sender
+                .add_peer(sinks[0].local_addr().unwrap(), weight)
+                .unwrap();
+            sender.set_tx_key(PskKey::new(128, b"secret").unwrap());
+            sender.set_rx_key(PskKey::receiver(128, b"secret").unwrap());
+            sender
+                .add_peer(sinks[1].local_addr().unwrap(), weight)
+                .unwrap();
+            sender
+                .add_peer(sinks[2].local_addr().unwrap(), weight)
+                .unwrap();
+            let mut by_peer: HashMap<usize, ([u8; 4], u32)> = HashMap::new();
+            for index in 0..6u8 {
+                let sent = sender
+                    .send_payload(&[index; 188], ntp, Instant::now())
+                    .unwrap();
+                for packet in sent.peer_packets {
+                    by_peer
+                        .entry(packet.peer)
+                        .or_insert_with(|| wire_nonce(&packet.packet.bytes));
+                }
+            }
+            assert_eq!(by_peer.len(), 3, "weighted={weighted}: {by_peer:?}");
+            let nonces: std::collections::HashSet<[u8; 4]> =
+                by_peer.values().map(|(nonce, _)| *nonce).collect();
+            assert_eq!(nonces.len(), 3, "weighted={weighted}: peers share a nonce");
+            // Every peer's first packet carried GRE sequence 0.
+            assert!(by_peer.values().all(|(_, sequence)| *sequence == 0));
+            for sink in &sinks {
+                drain_raw(sink);
+            }
+        }
+    }
+
+    /// A keyed Main receiver answers each sender's session with its own
+    /// nonce, also after the key is set again while the sessions exist.
+    #[test]
+    fn keyed_main_receiver_gives_every_session_its_own_nonce() {
+        let flow_id = 0x1122_3344;
+        let ntp = ntp_now();
+        let mut receiver =
+            MainMioReceiver::bind(loopback_any(), flow_id, "rust", NackMode::Range).unwrap();
+        receiver.set_rx_key(PskKey::receiver(128, b"secret").unwrap());
+        let receiver_addr = receiver.local_addr().unwrap();
+        let peers = [raw_sink(), raw_sink()];
+        for peer in &peers {
+            let mut core =
+                MainSenderCore::new(flow_id, 64).with_tx_key(PskKey::new(128, b"secret").unwrap());
+            let packet = core.send_payload(&[0x47; 188], ntp, Instant::now());
+            peer.send_to(&packet.bytes, receiver_addr).unwrap();
+        }
+        let mut buf = [0u8; 2_048];
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while receiver.peer_count() < 2 {
+            let _ = receiver.try_recv_event(&mut buf);
+            assert!(Instant::now() < deadline, "sessions not made");
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(receiver.psk_receive_counters().decrypt_rejected, 0);
+        let read_feedback_nonces = |receiver: &mut MainMioReceiver| {
+            peers
+                .iter()
+                .map(|peer| {
+                    receiver
+                        .send_feedback_to(peer.local_addr().unwrap())
+                        .unwrap();
+                    let mut buf = [0u8; 2_048];
+                    let (len, _) = peer.recv_from(&mut buf).unwrap();
+                    wire_nonce(&buf[..len])
+                })
+                .collect::<Vec<_>>()
+        };
+        let first = read_feedback_nonces(&mut receiver);
+        assert_ne!(first[0].0, first[1].0, "sessions share a nonce: {first:?}");
+        receiver.set_tx_key(PskKey::new(128, b"secret").unwrap());
+        let second = read_feedback_nonces(&mut receiver);
+        assert_ne!(
+            second[0].0, second[1].0,
+            "sessions share a nonce: {second:?}"
+        );
+        assert_eq!(second[0].1, second[1].1);
+    }
+
+    /// A keyed Main sender puts nothing clear on the wire on any send path:
+    /// data, the startup copies of the first packet, SR and echo requests,
+    /// keepalives, buffer negotiation, out-of-band data, retransmissions,
+    /// duplicate repairs, echo responses and tail probes. Its peer is a
+    /// keyed receiver core on a raw socket, which reads every datagram
+    /// through the PSK checks.
+    #[test]
+    fn keyed_main_sender_sends_nothing_clear_on_any_path() {
+        let flow_id = 0x1122_3344;
+        let ntp = ntp_now();
+        let sink = raw_sink();
+        sink.set_read_timeout(Some(Duration::from_millis(30)))
+            .unwrap();
+        let sink_addr = sink.local_addr().unwrap();
+        let mut sender = MainMioSender::connect(loopback_any(), sink_addr, flow_id, 64).unwrap();
+        sender.set_tx_key(PskKey::new(128, b"secret").unwrap());
+        sender.set_rx_key(PskKey::receiver(128, b"secret").unwrap());
+        sender.set_recovery_tuning(RecoveryTuning {
+            tail_probe: rist_core::TailProbe::On,
+            // Six data packets would allow no probe at the default cap.
+            tail_probe_max_per_mille: 1_000,
+            ..RecoveryTuning::default()
+        });
+        let sender_addr = sender.local_addr().unwrap();
+        let mut peer = MainReceiverCore::new(flow_id, "peer", NackMode::Range)
+            .with_rx_key(PskKey::receiver(128, b"secret").unwrap());
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 2_048];
+        // Reads what the sender sent; the peer takes everything but RTP
+        // sequence 2 (a hole to NACK).
+        let absorb = |peer: &mut MainReceiverCore, seen: &mut Vec<Vec<u8>>| {
+            for datagram in drain_raw(&sink) {
+                match peer.decode_datagram(&datagram).unwrap() {
+                    MainPacket::Reduced(packet) if looks_like_rtcp(&packet.payload) => {
+                        peer.handle_reduced_rtcp(packet.reduced, &packet.payload, ntp_now())
+                            .unwrap();
+                    }
+                    MainPacket::Reduced(packet) => {
+                        let rtp = RtpPacket::decode(&packet.payload).unwrap();
+                        if rtp.header.sequence_number != 2 {
+                            peer.accept_reduced_at(packet.reduced, &packet.payload, Instant::now())
+                                .unwrap();
+                        }
+                    }
+                    _ => {}
+                }
+                seen.push(datagram);
+            }
+        };
+        let mut serve = |sender: &mut MainMioSender, for_ms: u64| {
+            let until = Instant::now() + Duration::from_millis(for_ms);
+            while Instant::now() < until {
+                let _ = sender.try_recv_event(&mut buf);
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
+
+        let start = Instant::now();
+        sender.poll_rtcp_and_send(start, ntp).unwrap();
+        sender
+            .send_keepalive(GreKeepalive::librist_default([1, 2, 3, 4, 5, 6]))
+            .unwrap();
+        sender
+            .send_buffer_negotiation(BufferNegotiation::session(1000, 0))
+            .unwrap();
+        sender.send_oob(b"out of band").unwrap();
+        for index in 0..6u8 {
+            sender
+                .send_payload(&[index; 188], ntp, Instant::now())
+                .unwrap();
+        }
+        thread::sleep(Duration::from_millis(15));
+        // The startup copies of the first packet.
+        sender.poll_repairs_and_send(Instant::now()).unwrap();
+        sender
+            .poll_rtcp_and_send(Instant::now() + Duration::from_secs(1), ntp)
+            .unwrap();
+        absorb(&mut peer, &mut seen);
+
+        // The peer's NACK for the hole, twice beyond the sender's spacing
+        // (retransmission, then a duplicate repair), and its echo request.
+        for _ in 0..2 {
+            let feedback = peer.build_feedback();
+            sink.send_to(&feedback.bytes, sender_addr).unwrap();
+            serve(&mut sender, 12);
+        }
+        if let Some(report) = peer.poll_rtcp(Instant::now() + Duration::from_secs(1), ntp_now()) {
+            sink.send_to(&report.bytes, sender_addr).unwrap();
+        }
+        serve(&mut sender, 10);
+        // Idle after the burst: tail probes.
+        for _ in 0..4 {
+            thread::sleep(Duration::from_millis(20));
+            sender.poll_repairs_and_send(Instant::now()).unwrap();
+        }
+        absorb(&mut peer, &mut seen);
+
+        let stats = sender.stats();
+        assert!(stats.retransmitted_packets >= 1, "{stats:?}");
+        assert!(stats.duplicate_repairs >= 1, "{stats:?}");
+        assert!(stats.echo_responses >= 1, "{stats:?}");
+        assert!(stats.tail_probes >= 1, "{stats:?}");
+        assert_eq!(stats.clear_packets_dropped, 0);
+        assert_eq!(stats.decrypt_rejected, 0);
+        assert!(seen.len() >= 12, "{} datagrams", seen.len());
+        assert_all_encrypted(&seen);
+        let peer_stats = peer.stats();
+        assert_eq!(peer_stats.decrypt_rejected, 0);
+        assert_eq!(peer_stats.decrypt_latched, 0);
+        assert!(peer_stats.retry_packets_received >= 3, "{peer_stats:?}");
+    }
+
+    /// A Main receiver given only a receive key sends its NACKs, reports,
+    /// echo requests and responses, keepalives, buffer negotiation and
+    /// out-of-band data encrypted.
+    #[test]
+    fn main_receiver_with_only_a_receive_key_sends_nothing_clear() {
+        let flow_id = 0x1122_3344;
+        let ntp = ntp_now();
+        let mut receiver =
+            MainMioReceiver::bind(loopback_any(), flow_id, "rust", NackMode::Range).unwrap();
+        receiver.set_rx_key(PskKey::receiver(128, b"secret").unwrap());
+        let receiver_addr = receiver.local_addr().unwrap();
+        let peer_socket = raw_sink();
+        peer_socket
+            .set_read_timeout(Some(Duration::from_millis(30)))
+            .unwrap();
+        let peer_addr = peer_socket.local_addr().unwrap();
+        let mut sender = MainSenderCore::new(flow_id, 64)
+            .with_tx_key(PskKey::new(128, b"secret").unwrap())
+            .with_rx_key(PskKey::receiver(128, b"secret").unwrap());
+        let now = Instant::now();
+        assert_eq!(sender.poll_rtcp(now, ntp), None);
+        let report = sender.poll_rtcp(now + Duration::from_secs(1), ntp).unwrap();
+        peer_socket.send_to(&report.bytes, receiver_addr).unwrap();
+        for index in 0..5u8 {
+            let packet = sender.send_payload(&[index; 188], ntp, now);
+            if index != 2 {
+                peer_socket.send_to(&packet.bytes, receiver_addr).unwrap();
+            }
+        }
+        let mut buf = [0u8; 2_048];
+        let mut payloads = 0;
+        let deadline = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < deadline {
+            match receiver.try_recv_event(&mut buf).unwrap() {
+                Some(MainReceiverEvent::Payload { .. }) => payloads += 1,
+                Some(_) => {}
+                None => thread::sleep(Duration::from_millis(1)),
+            }
+        }
+        assert_eq!(payloads, 4);
+        receiver
+            .poll_all_rtcp_and_send(Instant::now() + Duration::from_secs(1), ntp_now())
+            .unwrap();
+        receiver
+            .send_keepalive_to(peer_addr, GreKeepalive::librist_default([6, 5, 4, 3, 2, 1]))
+            .unwrap();
+        receiver
+            .send_buffer_negotiation_to(peer_addr, BufferNegotiation::session(0, 500))
+            .unwrap();
+        receiver.send_oob_to(peer_addr, b"out of band").unwrap();
+        thread::sleep(Duration::from_millis(10));
+        let datagrams = drain_raw(&peer_socket);
+        assert!(datagrams.len() >= 4, "{} datagrams", datagrams.len());
+        assert_all_encrypted(&datagrams);
+        for datagram in &datagrams {
+            sender.decode_datagram(datagram).unwrap();
+        }
+        let stats = receiver.stats();
+        assert_eq!(stats.clear_packets_dropped, 0);
+        assert_eq!(stats.decrypt_rejected, 0);
+        assert_eq!(sender.stats().decrypt_rejected, 0);
     }
 
     fn raw_sink() -> StdUdpSocket {
@@ -8741,6 +9312,75 @@ mod tests {
         sender.send_payload(b"after-rollover", ntp, now).unwrap();
         let received = recv_main_payload_eventually(&mut receiver, &mut receiver_buf);
         assert_eq!(received.payload, b"after-rollover");
+    }
+
+    /// EAPOL is clear, so with a key any host can send it: a keyed SRP
+    /// receiver takes a source as its peer from EAPOL only once that source
+    /// completed SRP. A host that only starts a handshake does not become
+    /// the peer feedback and keepalives go to.
+    #[test]
+    fn keyed_srp_receiver_does_not_take_a_handshake_starter_as_its_peer() {
+        let _srp_test = lock_srp_test();
+        let flow_id = 0x1122_3344;
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut receiver =
+            MainMioReceiver::bind(loopback_any(), flow_id, "receiver", NackMode::Range).unwrap();
+        receiver.set_rx_key(PskKey::receiver(128, b"secret").unwrap());
+        let mut store = SrpCredentialStore::new();
+        store.stage_password("rist", b"right").unwrap();
+        receiver.enable_srp_authenticator(store);
+        let receiver_addr = receiver.local_addr().unwrap();
+
+        let mut sender =
+            MainMioSender::connect(loopback_any(), receiver_addr, flow_id, 64).unwrap();
+        sender.set_tx_key(PskKey::new(128, b"secret").unwrap());
+        sender.enable_srp_client("rist", b"right");
+        let sender_addr = sender.local_addr().unwrap();
+        let mut sender_buf = [0u8; 2048];
+        let mut receiver_buf = [0u8; 2048];
+        sender.start_srp_authentication().unwrap();
+        drive_main_srp_authentication(
+            &mut sender,
+            &mut receiver,
+            &mut sender_buf,
+            &mut receiver_buf,
+        );
+        assert_eq!(receiver.peer_addr(), Some(sender_addr));
+        sender.send_payload(b"proven", ntp, Instant::now()).unwrap();
+        let received = recv_main_payload_eventually(&mut receiver, &mut receiver_buf);
+        assert_eq!(received.payload, b"proven");
+
+        // A host with neither the passphrase nor the SRP password starts
+        // handshakes; the receiver answers them, but its peer stays put.
+        let mut intruder =
+            MainMioSender::connect(loopback_any(), receiver_addr, flow_id, 64).unwrap();
+        intruder.enable_srp_client("rist", b"wrong");
+        let intruder_addr = intruder.local_addr().unwrap();
+        let mut eapol_seen = 0;
+        for _ in 0..4 {
+            intruder.start_srp_authentication().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                match receiver.try_recv_event(&mut receiver_buf) {
+                    Ok(Some(MainReceiverEvent::Eapol { from, .. })) if from == intruder_addr => {
+                        eapol_seen += 1;
+                        break;
+                    }
+                    Ok(Some(_)) | Err(_) => {}
+                    Ok(None) => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "the intruder's EAPOL never arrived"
+                        );
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            }
+            let _ = intruder.try_recv_eapol_and_respond(&mut sender_buf);
+        }
+        assert_eq!(eapol_seen, 4);
+        assert_eq!(receiver.peer_addr(), Some(sender_addr));
+        assert!(receiver.srp_authenticated());
     }
 
     #[test]

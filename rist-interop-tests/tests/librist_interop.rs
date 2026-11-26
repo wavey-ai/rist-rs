@@ -7,7 +7,9 @@ use rist_core::packet::rtcp::{
 };
 use rist_core::time::ntp_now;
 use rist_core::{PskKey, SrpCredentialStore};
-use rist_mio::{MainMioReceiver, MainMioSender, SimpleMioReceiver, SimpleMioSender};
+use rist_mio::{
+    MainMioReceiver, MainMioSender, MainSenderEvent, SimpleMioReceiver, SimpleMioSender,
+};
 use rist_tools::{LossProxy, LossProxyConfig};
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket};
@@ -1298,6 +1300,82 @@ fn librist_main_receiver_caller_from_pure_rust_sender_listener() {
     }
 }
 
+/// A keyed listening Rust sender chooses its peer only from RTCP that
+/// passed the PSK checks: librist's encrypted RTCP does, so a librist
+/// receiver caller with the right secret is chosen and gets the media.
+#[test]
+fn librist_main_aes_receiver_caller_from_pure_rust_sender_listener() {
+    if !interop_enabled() {
+        return;
+    }
+    let _guard = lock_interop();
+
+    let flow_id = 0x1122_3344;
+    let sender_port = next_even_test_port_pair();
+    let sender_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, sender_port));
+    let mut sender = MainMioSender::listen(sender_addr, flow_id, 64).unwrap();
+    sender.set_tx_key(PskKey::new(128, b"12345678").unwrap());
+    sender.set_rx_key(PskKey::receiver(128, b"12345678").unwrap());
+    let receiver_url = format!("rist://127.0.0.1:{sender_port}?secret=12345678&aes-type=128");
+    let mut receiver = rist::Receiver::new(rist::Profile::Main).unwrap();
+    receiver.add_peer(&receiver_url).unwrap();
+    receiver.start().unwrap();
+
+    let mut control_buf = [0u8; 1500];
+    let mut saw_feedback = false;
+    let discovery_deadline = Instant::now() + Duration::from_secs(10);
+    while sender.peer_addr().is_none() {
+        match sender.try_recv_event(&mut control_buf) {
+            Ok(Some(MainSenderEvent::Feedback { .. })) => saw_feedback = true,
+            Ok(_) => thread::sleep(Duration::from_millis(1)),
+            Err(error) => panic!("Rust sender refused librist's packet: {error}"),
+        }
+        assert!(
+            Instant::now() < discovery_deadline,
+            "timed out waiting for the encrypted librist Main receiver caller"
+        );
+    }
+    assert!(saw_feedback, "the peer was chosen without RTCP");
+    send_main_session_probe(&mut sender);
+
+    let label = b"LIBRIST AES CALLER FROM RUST LISTENER";
+    let payload = mpegts_payload_7("LIBRIST AES CALLER FROM RUST LISTENER");
+    for _ in 0..20 {
+        sender
+            .send_payload(&payload, ntp_now(), Instant::now())
+            .unwrap();
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(block) = receiver.read(Duration::from_millis(50)).unwrap() {
+            assert!(block.payload().starts_with(&[0x47]));
+            assert!(block
+                .payload()
+                .windows(label.len())
+                .any(|window| window == label));
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the encrypted librist Main receiver caller"
+        );
+    }
+    let deadline = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < deadline {
+        match sender.try_recv_event(&mut control_buf) {
+            Ok(Some(_)) => {}
+            Ok(None) => thread::sleep(Duration::from_millis(1)),
+            Err(error) => panic!("Rust sender refused librist's packet: {error}"),
+        }
+    }
+    let stats = sender.stats();
+    assert_eq!(stats.clear_packets_dropped, 0);
+    assert_eq!(stats.decrypt_rejected, 0);
+    assert_eq!(stats.decrypt_latched, 0);
+}
+
 #[test]
 fn pure_rust_main_receiver_caller_from_librist_sender_listener() {
     if !interop_enabled() {
@@ -1510,13 +1588,33 @@ fn pure_rust_main_aes_sender_to_librist_receiver() {
                 .payload()
                 .windows(b"PURE RUST AES TO LIBRIST".len())
                 .any(|window| window == b"PURE RUST AES TO LIBRIST"));
-            return;
+            break;
         }
         assert!(
             Instant::now() < deadline,
             "timed out waiting for encrypted librist Main receiver"
         );
     }
+    // librist's encrypted RTCP and keepalives back to the Rust sender pass
+    // the PSK checks, and none come clear.
+    let mut buf = [0; 1500];
+    let mut events = 0;
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        match sender.try_recv_event(&mut buf) {
+            Ok(Some(_)) => events += 1,
+            Ok(None) => thread::sleep(Duration::from_millis(1)),
+            Err(error) => panic!("Rust sender refused librist's packet: {error}"),
+        }
+    }
+    let stats = sender.stats();
+    assert!(
+        events > 0 || stats.feedback_packets > 0,
+        "no packet from the librist receiver"
+    );
+    assert_eq!(stats.clear_packets_dropped, 0);
+    assert_eq!(stats.decrypt_rejected, 0);
+    assert_eq!(stats.decrypt_latched, 0);
 }
 
 #[test]
@@ -1558,7 +1656,7 @@ fn librist_main_aes_sender_to_pure_rust_receiver() {
                 .payload
                 .windows(b"LIBRIST AES TO PURE RUST".len())
                 .any(|window| window == b"LIBRIST AES TO PURE RUST"));
-            return;
+            break;
         }
         assert!(
             Instant::now() < deadline,
@@ -1566,6 +1664,19 @@ fn librist_main_aes_sender_to_pure_rust_receiver() {
         );
         thread::sleep(Duration::from_millis(1));
     }
+    // Every encrypted packet librist sent (data, RTCP, keepalives) passed
+    // the PSK checks, and none came clear.
+    let mut payloads = 1;
+    let deadline = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < deadline {
+        match receiver.try_recv_event(&mut buf).unwrap() {
+            Some(rist_mio::MainReceiverEvent::Payload { .. }) => payloads += 1,
+            Some(_) => {}
+            None => thread::sleep(Duration::from_millis(1)),
+        }
+    }
+    assert!(payloads >= 10, "{payloads} payloads");
+    assert_eq!(receiver.psk_receive_counters(), Default::default());
 }
 
 #[test]
@@ -1652,10 +1763,92 @@ fn librist_main_aes_sender_wrong_secret_does_not_reach_pure_rust_receiver() {
             Err(err) => panic!("unexpected receive error: {err}"),
         }
         if Instant::now() >= deadline {
-            return;
+            break;
         }
         thread::sleep(Duration::from_millis(1));
     }
+    let counters = receiver.psk_receive_counters();
+    assert!(counters.decrypt_rejected >= 1, "{counters:?}");
+    assert_eq!(counters.clear_packets_dropped, 0, "{counters:?}");
+}
+
+/// The wrong-secret case above, many times (librist senders with fresh
+/// nonces, each its own session at the Rust receiver): no payload gets
+/// through. Run with RIST_INTEROP=1 RIST_INTEROP_STRESS=1 (iterations:
+/// RIST_INTEROP_STRESS_ITERATIONS, default 500).
+#[test]
+fn librist_main_aes_sender_wrong_secret_stress_delivers_nothing() {
+    if !interop_enabled() || std::env::var_os("RIST_INTEROP_STRESS").is_none() {
+        return;
+    }
+    let _guard = lock_interop();
+    let iterations: usize = std::env::var("RIST_INTEROP_STRESS_ITERATIONS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(500);
+    let flow_id = 0x1122_3344;
+    let payload = mpegts_payload_7("LIBRIST WRONG SECRET");
+    let mut buf = [0; 1500];
+    let mut delivered = Vec::new();
+    let mut other_events = 0u64;
+    let mut quiet_iterations = 0usize;
+    let mut total = rist_core::PskReceiveCounters::default();
+    let started = Instant::now();
+    for iteration in 0..iterations {
+        let receiver_port = next_even_test_port_pair();
+        let receiver_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, receiver_port));
+        let mut receiver =
+            MainMioReceiver::bind(receiver_addr, flow_id, "rust", NackMode::Range).unwrap();
+        receiver.set_rx_key(PskKey::receiver(128, b"wrongpass").unwrap());
+        let sender_url = format!("rist://127.0.0.1:{receiver_port}?secret=12345678&aes-type=128");
+        let mut sender = rist::Sender::new(rist::Profile::Main).unwrap();
+        sender.add_peer(&sender_url).unwrap();
+        sender.start().unwrap();
+        for _ in 0..5 {
+            sender.send(&payload).unwrap();
+            thread::sleep(Duration::from_millis(10));
+        }
+        let deadline = Instant::now() + Duration::from_millis(150);
+        while Instant::now() < deadline {
+            match receiver.try_recv_event(&mut buf) {
+                Ok(Some(rist_mio::MainReceiverEvent::Payload { payload, .. })) => {
+                    delivered.push((
+                        iteration,
+                        payload.payload[..payload.payload.len().min(16)].to_vec(),
+                    ));
+                }
+                Ok(Some(_)) => other_events += 1,
+                Ok(None) => thread::sleep(Duration::from_millis(1)),
+                Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {}
+                Err(err) => panic!("unexpected receive error: {err}"),
+            }
+        }
+        let counters = receiver.psk_receive_counters();
+        if counters.decrypt_rejected + counters.decrypt_latched == 0 {
+            quiet_iterations += 1;
+        }
+        total.add(counters);
+        drop(sender);
+    }
+    eprintln!(
+        "wrong-secret stress: {iterations} librist sessions in {:.1} s, {} payloads delivered, \
+         {other_events} other events (keepalives), {} packets rejected after decryption, {} \
+         dropped by the nonce latch, {} nonces latched, {} clear packets, {quiet_iterations} \
+         sessions with no encrypted packet seen",
+        started.elapsed().as_secs_f64(),
+        delivered.len(),
+        total.decrypt_rejected,
+        total.decrypt_latched,
+        total.nonce_latches,
+        total.clear_packets_dropped,
+    );
+    assert!(
+        delivered.is_empty(),
+        "wrong-secret payloads delivered: {delivered:02x?}"
+    );
+    assert_eq!(total.clear_packets_dropped, 0);
+    assert_eq!(quiet_iterations, 0, "sessions that sent nothing encrypted");
+    assert!(total.nonce_latches >= iterations as u64);
 }
 
 #[test]

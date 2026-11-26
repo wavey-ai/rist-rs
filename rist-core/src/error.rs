@@ -50,6 +50,26 @@ pub enum Error {
     #[error("PSK nonce changes exceeded the allowed derivation rate")]
     PskRekeyRateLimited,
 
+    #[error("clear packet dropped: a PSK is configured, so only EAPOL may arrive unencrypted")]
+    ClearPacketWithPsk,
+
+    #[error(
+        "encrypted packet failed the RIST Main PSK checks (wrong passphrase, forged or damaged)"
+    )]
+    PskCheckFailed,
+
+    #[error("encrypted packet dropped: its PSK nonce is shut out after failed checks")]
+    PskNonceLatched,
+
+    #[error(
+        "encrypted packet dropped: a RIST control packet this endpoint does not use \
+         (no verdict on the key)"
+    )]
+    PskPacketIgnored,
+
+    #[error("non-conformant GRE header: routing bit or reserved flags set")]
+    NonConformantGre,
+
     #[error("invalid recovery configuration: {0}")]
     InvalidRecoveryConfig(&'static str),
 

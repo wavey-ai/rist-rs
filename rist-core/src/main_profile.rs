@@ -1,5 +1,5 @@
 use crate::auth::EapolFrame;
-use crate::crypto::PskKey;
+use crate::crypto::{PskKey, PskReceiveCounters};
 use crate::endpoint::{CongestionControlMode, RecoveryConfig, RecoveryTuning};
 use crate::packet::gre::{
     decode_eapol_payload, decode_encrypted_buffer_negotiation_packet,
@@ -238,7 +238,9 @@ pub struct MainSenderPeerState {
 
 impl MainSenderPeerState {
     pub fn stats(&self) -> SenderStats {
-        self.simple.stats()
+        let mut stats = self.simple.stats();
+        add_psk_counters_to_sender(&mut stats, self.rx_key.as_ref());
+        stats
     }
 
     /// When a duplicate repair for this peer is next due.
@@ -246,11 +248,21 @@ impl MainSenderPeerState {
         self.simple.next_repair_at()
     }
 
+    /// Also installs a receive key for the same passphrase when there is
+    /// none, so clear packets from the peer are dropped.
     pub fn set_tx_key(&mut self, key: PskKey) {
+        if self.rx_key.is_none() {
+            self.rx_key = rx_key_for(&key);
+        }
         self.tx_key = Some(key);
     }
 
+    /// Also installs a transmit key for the same passphrase when there is
+    /// none, so the peer state never sends clear.
     pub fn set_rx_key(&mut self, key: PskKey) {
+        if self.tx_key.is_none() {
+            self.tx_key = tx_key_for(&key);
+        }
         self.rx_key = Some(key);
     }
 }
@@ -325,13 +337,17 @@ impl MainSenderCore {
         self
     }
 
+    /// Also installs a receive key for the same passphrase when there is
+    /// none, so clear packets from the peer are dropped.
     pub fn with_tx_key(mut self, key: PskKey) -> Self {
-        self.tx_key = Some(key);
+        self.set_tx_key(key);
         self
     }
 
+    /// Also installs a transmit key for the same passphrase when there is
+    /// none, so the endpoint never sends clear.
     pub fn with_rx_key(mut self, key: PskKey) -> Self {
-        self.rx_key = Some(key);
+        self.set_rx_key(key);
         self
     }
 
@@ -341,11 +357,21 @@ impl MainSenderCore {
         self
     }
 
+    /// Also installs a receive key for the same passphrase when there is
+    /// none, so clear packets from the peer are dropped.
     pub fn set_tx_key(&mut self, key: PskKey) {
+        if self.rx_key.is_none() {
+            self.rx_key = rx_key_for(&key);
+        }
         self.tx_key = Some(key);
     }
 
+    /// Also installs a transmit key for the same passphrase when there is
+    /// none, so the endpoint never sends clear.
     pub fn set_rx_key(&mut self, key: PskKey) {
+        if self.tx_key.is_none() {
+            self.tx_key = tx_key_for(&key);
+        }
         self.rx_key = Some(key);
     }
 
@@ -463,8 +489,9 @@ impl MainSenderCore {
         MainSenderPeerState {
             simple: self.simple.new_peer_state(),
             next_gre_sequence: 0,
-            tx_key: self.tx_key.clone(),
-            rx_key: self.rx_key.clone(),
+            // Its own nonce: this peer's GRE sequence also starts at 0.
+            tx_key: self.tx_key.as_ref().map(PskKey::fresh_sender_copy),
+            rx_key: self.rx_key.as_ref().map(PskKey::fresh_copy),
         }
     }
 
@@ -763,28 +790,14 @@ impl MainSenderCore {
     }
 
     pub fn accept_keepalive(&mut self, packet: &[u8]) -> Result<OwnedKeepalivePacket> {
-        let (gre, _) = GreHeader::decode(packet)?;
-        if gre.key.is_some() {
-            let Some(key) = &mut self.rx_key else {
-                return Err(crate::Error::UnsupportedGreProtocol(gre.protocol_type));
-            };
-            return decode_encrypted_keepalive_packet(packet, key);
-        }
-        Ok(KeepalivePacket::decode(packet)?.into_owned())
+        accept_keepalive_with(self.rx_key.as_mut(), packet)
     }
 
     pub fn accept_buffer_negotiation(
         &mut self,
         packet: &[u8],
     ) -> Result<OwnedBufferNegotiationPacket> {
-        let (gre, _) = GreHeader::decode(packet)?;
-        if gre.key.is_some() {
-            let Some(key) = &mut self.rx_key else {
-                return Err(crate::Error::UnsupportedGreProtocol(gre.protocol_type));
-            };
-            return decode_encrypted_buffer_negotiation_packet(packet, key);
-        }
-        Ok(BufferNegotiationPacket::decode(packet)?.into_owned())
+        accept_buffer_negotiation_with(self.rx_key.as_mut(), packet)
     }
 
     pub fn accept_eapol(&mut self, packet: &[u8]) -> Result<EapolFrame> {
@@ -795,8 +808,53 @@ impl MainSenderCore {
         decode_main_packet(packet, self.rx_key.as_mut())
     }
 
+    /// Whether a receive key is configured (then every packet but EAPOL
+    /// must arrive encrypted).
+    pub fn has_rx_key(&self) -> bool {
+        self.rx_key.is_some()
+    }
+
+    /// A copy of the receive key with no history, for one candidate
+    /// source: a listening sender decrypts each source's packets with its
+    /// own copy until it has chosen its peer, so packets from one source
+    /// can never shut out another's nonce. Copies share one budget of
+    /// nonce changes ([`crate::crypto::MAX_SHARED_RECEIVE_REKEYS_PER_SECOND`]).
+    pub fn fresh_rx_key(&self) -> Option<PskKey> {
+        self.rx_key.as_ref().map(PskKey::fresh_copy)
+    }
+
+    /// [`Self::decode_datagram`] with a receive key of the caller's (one
+    /// from [`Self::fresh_rx_key`]).
+    pub fn decode_datagram_with_rx_key(
+        &self,
+        key: &mut PskKey,
+        packet: &[u8],
+    ) -> Result<MainPacket> {
+        decode_main_packet(packet, Some(key))
+    }
+
+    /// Makes `key` (a candidate's copy from [`Self::fresh_rx_key`]) the
+    /// receive key, keeping the counters of the one it replaces. Does
+    /// nothing without a receive key.
+    pub fn adopt_rx_key(&mut self, mut key: PskKey) {
+        if let Some(current) = &self.rx_key {
+            key.absorb_counters(current.receive_counters());
+            self.rx_key = Some(key);
+        }
+    }
+
+    /// Adds the counters of a receive-key copy that is being dropped to
+    /// the receive key's, so stats keep them.
+    pub fn absorb_psk_counters(&mut self, counters: PskReceiveCounters) {
+        if let Some(key) = &mut self.rx_key {
+            key.absorb_counters(counters);
+        }
+    }
+
     pub fn stats(&self) -> SenderStats {
-        self.simple.stats()
+        let mut stats = self.simple.stats();
+        add_psk_counters_to_sender(&mut stats, self.rx_key.as_ref());
+        stats
     }
 
     fn wrap_rtp_for_peer(
@@ -884,16 +942,7 @@ impl MainSenderCore {
     }
 
     fn decode_reduced<'a>(&mut self, packet: &'a [u8]) -> Result<DecodedReduced<'a>> {
-        let (gre, _) = GreHeader::decode(packet)?;
-        if gre.key.is_some() {
-            let Some(key) = &mut self.rx_key else {
-                return Err(crate::Error::UnsupportedGreProtocol(gre.protocol_type));
-            };
-            return Ok(DecodedReduced::Owned(decode_encrypted_reduced_packet(
-                packet, key,
-            )?));
-        }
-        Ok(DecodedReduced::Borrowed(ReducedPacket::decode(packet)?))
+        decode_reduced_with(self.rx_key.as_mut(), packet)
     }
 }
 
@@ -907,16 +956,88 @@ fn decode_reduced_for_peer<'a>(
     state: &mut MainSenderPeerState,
     packet: &'a [u8],
 ) -> Result<DecodedReduced<'a>> {
-    let (gre, _) = GreHeader::decode(packet)?;
-    if gre.key.is_some() {
-        let Some(key) = &mut state.rx_key else {
-            return Err(crate::Error::UnsupportedGreProtocol(gre.protocol_type));
-        };
+    decode_reduced_with(state.rx_key.as_mut(), packet)
+}
+
+/// Decodes a reduced packet. With a receive key it must be encrypted and
+/// pass the PSK checks (a clear one is dropped and counted); without one
+/// an encrypted packet cannot be read.
+fn decode_reduced_with<'a>(
+    rx_key: Option<&mut PskKey>,
+    packet: &'a [u8],
+) -> Result<DecodedReduced<'a>> {
+    if let Some(key) = rx_key {
         return Ok(DecodedReduced::Owned(decode_encrypted_reduced_packet(
             packet, key,
         )?));
     }
+    let (gre, _) = GreHeader::decode(packet)?;
+    if gre.key.is_some() {
+        return Err(crate::Error::UnsupportedGreProtocol(gre.protocol_type));
+    }
     Ok(DecodedReduced::Borrowed(ReducedPacket::decode(packet)?))
+}
+
+/// [`decode_reduced_with`] for keepalives.
+fn accept_keepalive_with(
+    rx_key: Option<&mut PskKey>,
+    packet: &[u8],
+) -> Result<OwnedKeepalivePacket> {
+    if let Some(key) = rx_key {
+        return decode_encrypted_keepalive_packet(packet, key);
+    }
+    let (gre, _) = GreHeader::decode(packet)?;
+    if gre.key.is_some() {
+        return Err(crate::Error::UnsupportedGreProtocol(gre.protocol_type));
+    }
+    Ok(KeepalivePacket::decode(packet)?.into_owned())
+}
+
+/// [`decode_reduced_with`] for buffer negotiation.
+fn accept_buffer_negotiation_with(
+    rx_key: Option<&mut PskKey>,
+    packet: &[u8],
+) -> Result<OwnedBufferNegotiationPacket> {
+    if let Some(key) = rx_key {
+        return decode_encrypted_buffer_negotiation_packet(packet, key);
+    }
+    let (gre, _) = GreHeader::decode(packet)?;
+    if gre.key.is_some() {
+        return Err(crate::Error::UnsupportedGreProtocol(gre.protocol_type));
+    }
+    Ok(BufferNegotiationPacket::decode(packet)?.into_owned())
+}
+
+/// The transmit key an endpoint uses when it was given only a receive key:
+/// one for the same passphrase, so nothing but EAPOL goes out clear.
+fn tx_key_for(rx_key: &PskKey) -> Option<PskKey> {
+    Some(rx_key.sender_for())
+}
+
+/// The receive key an endpoint uses when it was given only a transmit key:
+/// one for the same passphrase, so it drops clear packets from its peer.
+fn rx_key_for(tx_key: &PskKey) -> Option<PskKey> {
+    Some(tx_key.receiver_for())
+}
+
+fn add_psk_counters_to_receiver(stats: &mut ReceiverStats, key: Option<&PskKey>) {
+    if let Some(key) = key {
+        let counters = key.receive_counters();
+        stats.clear_packets_dropped += counters.clear_packets_dropped;
+        stats.decrypt_rejected += counters.decrypt_rejected;
+        stats.decrypt_latched += counters.decrypt_latched;
+        stats.nonce_latches += counters.nonce_latches;
+    }
+}
+
+fn add_psk_counters_to_sender(stats: &mut SenderStats, key: Option<&PskKey>) {
+    if let Some(key) = key {
+        let counters = key.receive_counters();
+        stats.clear_packets_dropped += counters.clear_packets_dropped;
+        stats.decrypt_rejected += counters.decrypt_rejected;
+        stats.decrypt_latched += counters.decrypt_latched;
+        stats.nonce_latches += counters.nonce_latches;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1008,13 +1129,17 @@ impl MainReceiverCore {
             .min()
     }
 
+    /// Also installs a receive key for the same passphrase when there is
+    /// none, so clear packets from the peer are dropped.
     pub fn with_tx_key(mut self, key: PskKey) -> Self {
-        self.tx_key = Some(key);
+        self.set_tx_key(key);
         self
     }
 
+    /// Also installs a transmit key for the same passphrase when there is
+    /// none, so the endpoint never sends clear.
     pub fn with_rx_key(mut self, key: PskKey) -> Self {
-        self.rx_key = Some(key);
+        self.set_rx_key(key);
         self
     }
 
@@ -1024,11 +1149,21 @@ impl MainReceiverCore {
         self
     }
 
+    /// Also installs a receive key for the same passphrase when there is
+    /// none, so clear packets from the peer are dropped.
     pub fn set_tx_key(&mut self, key: PskKey) {
+        if self.rx_key.is_none() {
+            self.rx_key = rx_key_for(&key);
+        }
         self.tx_key = Some(key);
     }
 
+    /// Also installs a transmit key for the same passphrase when there is
+    /// none, so the endpoint never sends clear.
     pub fn set_rx_key(&mut self, key: PskKey) {
+        if self.tx_key.is_none() {
+            self.tx_key = tx_key_for(&key);
+        }
         self.rx_key = Some(key);
     }
 
@@ -1043,12 +1178,49 @@ impl MainReceiverCore {
         session.set_recovery_tuning(self.tuning);
         session.max_flows = self.max_flows;
         if let Some(key) = &self.tx_key {
-            session.set_tx_key(key.clone());
+            // Its own nonce: the session's GRE sequence also starts at 0.
+            session.set_tx_key(key.fresh_sender_copy());
         }
         if let Some(key) = &self.rx_key {
-            session.set_rx_key(key.clone());
+            session.set_rx_key(key.fresh_copy());
         }
         session
+    }
+
+    /// Whether a receive key is configured (then every packet but EAPOL
+    /// must arrive encrypted).
+    pub fn has_rx_key(&self) -> bool {
+        self.rx_key.is_some()
+    }
+
+    /// With a receive key, drops (and counts) a datagram that arrived
+    /// clear, other than EAPOL, before any session state is made for it.
+    pub fn screen_clear_datagram(&mut self, packet: &[u8]) -> Result<()> {
+        match &mut self.rx_key {
+            Some(key) => crate::packet::gre::screen_clear_datagram(packet, key),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether this session's source has shown it holds the passphrase:
+    /// always true without a receive key; with one, true once a packet
+    /// passed the checks with a strong verdict (RTP data or RTCP) under a
+    /// nonce that is still tracked and not shut out
+    /// ([`PskKey::receive_proven`]). Keepalives, buffer negotiation and
+    /// out-of-band packets pass with a weak verdict that a host with no key
+    /// gets every time, so a session that has sent only those is not
+    /// proven: an endpoint should not take it as its peer (send it
+    /// feedback or keepalives) or count its packets as peer activity.
+    pub fn rx_peer_proven(&self) -> bool {
+        self.rx_key.as_ref().map_or(true, PskKey::receive_proven)
+    }
+
+    /// What the receive key turned away (zero without a key).
+    pub fn psk_receive_counters(&self) -> PskReceiveCounters {
+        self.rx_key
+            .as_ref()
+            .map(PskKey::receive_counters)
+            .unwrap_or_default()
     }
 
     pub fn accept_packet(&mut self, packet: &[u8]) -> Result<ReceivedPayload> {
@@ -1263,28 +1435,14 @@ impl MainReceiverCore {
     }
 
     pub fn accept_keepalive(&mut self, packet: &[u8]) -> Result<OwnedKeepalivePacket> {
-        let (gre, _) = GreHeader::decode(packet)?;
-        if gre.key.is_some() {
-            let Some(key) = &mut self.rx_key else {
-                return Err(crate::Error::UnsupportedGreProtocol(gre.protocol_type));
-            };
-            return decode_encrypted_keepalive_packet(packet, key);
-        }
-        Ok(KeepalivePacket::decode(packet)?.into_owned())
+        accept_keepalive_with(self.rx_key.as_mut(), packet)
     }
 
     pub fn accept_buffer_negotiation(
         &mut self,
         packet: &[u8],
     ) -> Result<OwnedBufferNegotiationPacket> {
-        let (gre, _) = GreHeader::decode(packet)?;
-        if gre.key.is_some() {
-            let Some(key) = &mut self.rx_key else {
-                return Err(crate::Error::UnsupportedGreProtocol(gre.protocol_type));
-            };
-            return decode_encrypted_buffer_negotiation_packet(packet, key);
-        }
-        Ok(BufferNegotiationPacket::decode(packet)?.into_owned())
+        accept_buffer_negotiation_with(self.rx_key.as_mut(), packet)
     }
 
     pub fn accept_eapol(&mut self, packet: &[u8]) -> Result<EapolFrame> {
@@ -1298,11 +1456,15 @@ impl MainReceiverCore {
             .missing_sequences()
     }
 
+    /// The primary flow's statistics, with the session's PSK counters.
     pub fn stats(&self) -> ReceiverStats {
-        self.flows
+        let mut stats = self
+            .flows
             .get(&self.primary_flow_id)
             .expect("primary Main receiver flow must exist")
-            .stats()
+            .stats();
+        add_psk_counters_to_receiver(&mut stats, self.rx_key.as_ref());
+        stats
     }
 
     pub fn flow_count(&self) -> usize {
@@ -1363,16 +1525,7 @@ impl MainReceiverCore {
     }
 
     fn decode_reduced<'a>(&mut self, packet: &'a [u8]) -> Result<DecodedReduced<'a>> {
-        let (gre, _) = GreHeader::decode(packet)?;
-        if gre.key.is_some() {
-            let Some(key) = &mut self.rx_key else {
-                return Err(crate::Error::UnsupportedGreProtocol(gre.protocol_type));
-            };
-            return Ok(DecodedReduced::Owned(decode_encrypted_reduced_packet(
-                packet, key,
-            )?));
-        }
-        Ok(DecodedReduced::Borrowed(ReducedPacket::decode(packet)?))
+        decode_reduced_with(self.rx_key.as_mut(), packet)
     }
 }
 
@@ -2105,6 +2258,277 @@ mod tests {
         assert_eq!(recovered.payload, b"lost");
     }
 
+    /// A Main receiver with a key drops clear data, RTCP, keepalives and
+    /// buffer negotiation on every entry point, counts them, delivers
+    /// nothing, and still takes EAPOL in clear.
+    #[test]
+    fn keyed_main_receiver_drops_clear_packets_on_every_entry_point() {
+        let now = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut clear_sender = MainSenderCore::new(0x1122_3344, 64);
+        let mut receiver = MainReceiverCore::new(0x1122_3344, "rust", NackMode::Range)
+            .with_rx_key(PskKey::receiver(128, b"secret").unwrap());
+
+        // The first poll arms the report timer.
+        assert_eq!(clear_sender.poll_rtcp(now, ntp), None);
+        let rtcp = clear_sender
+            .poll_rtcp(now + Duration::from_secs(1), ntp)
+            .unwrap();
+        let data = clear_sender.send_payload(b"clear", ntp, now + Duration::from_secs(1));
+        let keepalive =
+            clear_sender.build_keepalive(GreKeepalive::librist_default([1, 2, 3, 4, 5, 6]));
+        let negotiation =
+            clear_sender.build_buffer_negotiation(BufferNegotiation::session(1000, 0));
+
+        let clear = crate::Error::ClearPacketWithPsk;
+        assert_eq!(receiver.accept_packet(&data.bytes).unwrap_err(), clear);
+        assert_eq!(receiver.decode_datagram(&data.bytes).unwrap_err(), clear);
+        assert_eq!(receiver.handle_rtcp(&rtcp.bytes, ntp).unwrap_err(), clear);
+        assert_eq!(receiver.decode_datagram(&rtcp.bytes).unwrap_err(), clear);
+        assert_eq!(
+            receiver.accept_keepalive(&keepalive.bytes).unwrap_err(),
+            clear
+        );
+        assert_eq!(
+            receiver.decode_datagram(&keepalive.bytes).unwrap_err(),
+            clear
+        );
+        assert_eq!(
+            receiver
+                .accept_buffer_negotiation(&negotiation.bytes)
+                .unwrap_err(),
+            clear
+        );
+        assert_eq!(
+            receiver.screen_clear_datagram(&data.bytes).unwrap_err(),
+            clear
+        );
+
+        let stats = receiver.stats();
+        assert_eq!(stats.clear_packets_dropped, 8);
+        assert_eq!(stats.received_packets, 0);
+        assert_eq!(stats.decrypt_rejected, 0);
+        assert_eq!(receiver.flow_count(), 1);
+
+        let frame =
+            EapolFrame::eap(EAPOL_VERSION_3, &EapPacket::identity_response(3, b"rist")).unwrap();
+        let eapol = clear_sender.build_eapol(&frame).unwrap();
+        receiver.screen_clear_datagram(&eapol.bytes).unwrap();
+        assert!(matches!(
+            receiver.decode_datagram(&eapol.bytes).unwrap(),
+            MainPacket::Eapol(_)
+        ));
+        assert_eq!(receiver.accept_eapol(&eapol.bytes).unwrap(), frame);
+        assert_eq!(receiver.stats().clear_packets_dropped, 8);
+
+        // A fresh session for a new source starts its counters at zero.
+        assert_eq!(receiver.fresh_session().stats().clear_packets_dropped, 0);
+    }
+
+    /// A keyed receive session is proven only by checked data or RTCP: a
+    /// forged keepalive from a host with no key (which decrypts to
+    /// something that passes the keepalive check every time) and the
+    /// peer's own keepalives leave it unproven.
+    #[test]
+    fn keyed_receive_session_is_proven_only_by_data_or_rtcp() {
+        let now = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let template = MainReceiverCore::new(0x1122_3344, "rust", NackMode::Range)
+            .with_rx_key(PskKey::receiver(128, b"secret").unwrap());
+        assert!(MainReceiverCore::new(0x1122_3344, "rust", NackMode::Range).rx_peer_proven());
+
+        // GRE K and S, keepalive protocol, a fixed nonce, eight junk bytes.
+        let mut forged = vec![0x30, 0x00, 0x88, 0xb5, 0x0b, 0xad, 0x00, 0x01];
+        forged.extend_from_slice(&7u32.to_be_bytes());
+        forged.extend_from_slice(&[0x5a; 8]);
+        let mut attacker = template.fresh_session();
+        for _ in 0..100 {
+            assert!(matches!(
+                attacker.decode_datagram(&forged).unwrap(),
+                MainPacket::Keepalive(_)
+            ));
+        }
+        assert!(!attacker.rx_peer_proven());
+
+        let mut sender =
+            MainSenderCore::new(0x1122_3344, 64).with_tx_key(PskKey::new(128, b"secret").unwrap());
+        let mut session = template.fresh_session();
+        let keepalive = sender.build_keepalive(GreKeepalive::librist_default([1, 2, 3, 4, 5, 6]));
+        let negotiation = sender.build_buffer_negotiation(BufferNegotiation::session(1000, 0));
+        assert!(matches!(
+            session.decode_datagram(&keepalive.bytes).unwrap(),
+            MainPacket::Keepalive(_)
+        ));
+        assert!(matches!(
+            session.decode_datagram(&negotiation.bytes).unwrap(),
+            MainPacket::BufferNegotiation(_)
+        ));
+        assert!(!session.rx_peer_proven());
+        let data = sender.send_payload(b"payload", ntp, now);
+        assert!(matches!(
+            session.decode_datagram(&data.bytes).unwrap(),
+            MainPacket::Reduced(_)
+        ));
+        assert!(session.rx_peer_proven());
+
+        // RTCP proves a session as well.
+        let mut rtcp_session = template.fresh_session();
+        assert_eq!(sender.poll_rtcp(now, ntp), None);
+        let rtcp = sender.poll_rtcp(now + Duration::from_secs(1), ntp).unwrap();
+        rtcp_session.decode_datagram(&rtcp.bytes).unwrap();
+        assert!(rtcp_session.rx_peer_proven());
+    }
+
+    /// A keyed Main sender takes no clear feedback: a clear NACK is
+    /// dropped and counted, and nothing is retransmitted for it.
+    #[test]
+    fn keyed_main_sender_drops_clear_feedback() {
+        let now = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut sender = MainSenderCore::new(0x1122_3344, 64)
+            .with_tx_key(PskKey::new(128, b"secret").unwrap())
+            .with_rx_key(PskKey::receiver(128, b"secret").unwrap());
+        let mut clear_receiver = MainReceiverCore::new(0x1122_3344, "rust", NackMode::Range)
+            .with_rx_key(PskKey::receiver(128, b"secret").unwrap());
+        let first = sender.send_payload(b"first", ntp, now);
+        let _lost = sender.send_payload(b"lost", ntp, now);
+        let third = sender.send_payload(b"third", ntp, now);
+        clear_receiver.accept_packet(&first.bytes).unwrap();
+        clear_receiver.accept_packet(&third.bytes).unwrap();
+        // A NACK with the same content, sent clear.
+        let nack =
+            crate::packet::rtcp::encode_nack_compound(NackMode::Range, 0x1122_3344, "rust", &[1]);
+        let clear_nack = crate::packet::gre::encode_reduced_payload(
+            1,
+            0,
+            ReducedHeader {
+                src_port: DEFAULT_VIRT_DST_PORT,
+                dst_port: DEFAULT_VIRT_SRC_PORT,
+            },
+            &nack,
+        );
+        assert_eq!(
+            sender.handle_feedback(&clear_nack).unwrap_err(),
+            crate::Error::ClearPacketWithPsk
+        );
+        assert_eq!(
+            sender.decode_datagram(&clear_nack).unwrap_err(),
+            crate::Error::ClearPacketWithPsk
+        );
+        let stats = sender.stats();
+        assert_eq!(stats.clear_packets_dropped, 2);
+        assert_eq!(stats.retransmitted_packets, 0);
+
+        let mut peer = sender.new_peer_state();
+        assert_eq!(
+            sender
+                .handle_feedback_for_peer(&mut peer, &clear_nack)
+                .unwrap_err(),
+            crate::Error::ClearPacketWithPsk
+        );
+        assert_eq!(peer.stats().clear_packets_dropped, 1);
+    }
+
+    /// An endpoint given only a receive key encrypts what it sends with
+    /// the same passphrase: a receiver's NACKs, reports and keepalives,
+    /// and a sender's data, are never clear.
+    #[test]
+    fn receive_key_alone_makes_an_endpoint_send_encrypted() {
+        let now = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut sender = MainSenderCore::new(0x1122_3344, 64)
+            .with_rx_key(PskKey::receiver(128, b"secret").unwrap());
+        let mut receiver = MainReceiverCore::new(0x1122_3344, "rust", NackMode::Range)
+            .with_rx_key(PskKey::receiver(128, b"secret").unwrap());
+        let first = sender.send_payload(b"first", ntp, now);
+        let _lost = sender.send_payload(b"lost", ntp, now);
+        let third = sender.send_payload(b"third", ntp, now);
+        for packet in [&first, &third] {
+            assert!(GreHeader::decode(&packet.bytes).unwrap().0.key.is_some());
+            receiver.accept_packet(&packet.bytes).unwrap();
+        }
+        let feedback = receiver.build_feedback();
+        let keepalive = receiver.build_keepalive(GreKeepalive::librist_default([1; 6]));
+        let negotiation = receiver.build_buffer_negotiation(BufferNegotiation::session(0, 500));
+        let oob = receiver.build_oob(b"oob");
+        for bytes in [
+            &feedback.bytes,
+            &keepalive.bytes,
+            &negotiation.bytes,
+            &oob.bytes,
+        ] {
+            assert!(GreHeader::decode(bytes).unwrap().0.key.is_some());
+        }
+        let retries = sender.handle_feedback(&feedback.bytes).unwrap();
+        assert_eq!(retries.len(), 1);
+        assert!(GreHeader::decode(&retries[0].bytes)
+            .unwrap()
+            .0
+            .key
+            .is_some());
+        assert!(receiver.accept_packet(&retries[0].bytes).unwrap().recovered);
+        assert_eq!(receiver.stats().decrypt_rejected, 0);
+        assert_eq!(sender.stats().decrypt_rejected, 0);
+    }
+
+    /// An endpoint given only a transmit key drops clear packets from its
+    /// peer: a sender takes no clear NACK, a receiver no clear data.
+    #[test]
+    fn transmit_key_alone_makes_an_endpoint_drop_clear_packets() {
+        let now = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut clear_sender = MainSenderCore::new(0x1122_3344, 64);
+        let mut receiver = MainReceiverCore::new(0x1122_3344, "rust", NackMode::Range)
+            .with_tx_key(PskKey::new(128, b"secret").unwrap());
+        let data = clear_sender.send_payload(b"clear", ntp, now);
+        assert_eq!(
+            receiver.accept_packet(&data.bytes).unwrap_err(),
+            crate::Error::ClearPacketWithPsk
+        );
+        let mut sender =
+            MainSenderCore::new(0x1122_3344, 64).with_tx_key(PskKey::new(128, b"secret").unwrap());
+        let mut clear_receiver = MainReceiverCore::new(0x1122_3344, "rust", NackMode::Range);
+        let first = clear_sender.send_payload(b"a", ntp, now);
+        clear_receiver.accept_packet(&first.bytes).unwrap();
+        let report = clear_receiver.build_feedback();
+        assert_eq!(
+            sender.handle_feedback(&report.bytes).unwrap_err(),
+            crate::Error::ClearPacketWithPsk
+        );
+        assert_eq!(receiver.stats().clear_packets_dropped, 1);
+        assert_eq!(sender.stats().clear_packets_dropped, 1);
+        // And what the receiver sends is still encrypted.
+        let keepalive = receiver.build_keepalive(GreKeepalive::librist_default([1; 6]));
+        assert!(GreHeader::decode(&keepalive.bytes).unwrap().0.key.is_some());
+    }
+
+    /// A receiver keyed with the wrong passphrase delivers nothing from an
+    /// encrypted sender and counts the rejection; the nonce is shut out
+    /// after its first failure, so later packets are not even decrypted.
+    #[test]
+    fn wrong_passphrase_receiver_delivers_nothing_and_counts() {
+        let now = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut sender =
+            MainSenderCore::new(0x1122_3344, 64).with_tx_key(PskKey::new(128, b"right").unwrap());
+        let mut receiver = MainReceiverCore::new(0x1122_3344, "rust", NackMode::Range)
+            .with_rx_key(PskKey::receiver(128, b"wrong").unwrap());
+        let mut payload = Vec::new();
+        for pid in 0x100..0x107 {
+            payload.extend_from_slice(&ts_packet(pid, b"wrong secret"));
+        }
+        for _ in 0..50 {
+            let packet = sender.send_payload(&payload, ntp, now);
+            assert!(receiver.accept_packet(&packet.bytes).is_err());
+        }
+        let stats = receiver.stats();
+        assert_eq!(stats.received_packets, 0);
+        assert_eq!(stats.decrypt_rejected, 1);
+        assert_eq!(stats.decrypt_latched, 49);
+        assert_eq!(stats.nonce_latches, 1);
+        assert_eq!(receiver.flow_count(), 1);
+    }
+
     fn ts_packet(pid: u16, label: &[u8]) -> Vec<u8> {
         let mut packet = vec![0xff; TS_PACKET_SIZE];
         packet[0] = TS_SYNC_BYTE;
@@ -2112,5 +2536,112 @@ mod tests {
         packet[3] = 0x10;
         packet[4..4 + label.len()].copy_from_slice(label);
         packet
+    }
+
+    fn gre_nonce(datagram: &[u8]) -> ([u8; 4], u32) {
+        let (gre, _) = GreHeader::decode(datagram).unwrap();
+        (
+            gre.key.expect("encrypted").to_be_bytes(),
+            gre.sequence.expect("encrypted"),
+        )
+    }
+
+    /// Each peer state of a keyed sender encrypts with its own nonce:
+    /// peers' GRE sequences each start at 0, so a shared nonce would put
+    /// different packets under one AES-CTR keystream. A receiver with the
+    /// passphrase decrypts every peer's packets.
+    #[test]
+    fn sender_peer_states_get_their_own_transmit_nonce() {
+        let now = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut sender =
+            MainSenderCore::new(0x1122_3344, 64).with_tx_key(PskKey::new(128, b"secret").unwrap());
+        let mut peer_a = sender.new_peer_state();
+        let mut peer_b = sender.new_peer_state();
+        let core_nonce = sender.tx_key.as_ref().unwrap().nonce();
+        let nonce_a = peer_a.tx_key.as_ref().unwrap().nonce();
+        let nonce_b = peer_b.tx_key.as_ref().unwrap().nonce();
+        assert_ne!(nonce_a, nonce_b);
+        assert_ne!(nonce_a, core_nonce);
+        assert_ne!(nonce_b, core_nonce);
+
+        // Different packets to each peer at the same GRE sequence (what a
+        // weighted multi-sender does): different nonces on the wire, and
+        // the ciphertext XOR is not the plaintext XOR.
+        let packet_a = sender.prepare_payload(&[0x47; 188], ntp, now);
+        let packet_b = sender.prepare_payload(&[0x11; 188], ntp, now);
+        let wire_a = sender.wrap_payload_for_peer(&mut peer_a, &packet_a);
+        let wire_b = sender.wrap_payload_for_peer(&mut peer_b, &packet_b);
+        let (wire_nonce_a, seq_a) = gre_nonce(&wire_a.bytes);
+        let (wire_nonce_b, seq_b) = gre_nonce(&wire_b.bytes);
+        assert_eq!(seq_a, seq_b);
+        assert_eq!((wire_nonce_a, wire_nonce_b), (nonce_a, nonce_b));
+        for wire in [&wire_a.bytes, &wire_b.bytes] {
+            let mut receiver = MainReceiverCore::new(0x1122_3344, "rx", NackMode::Range)
+                .with_rx_key(PskKey::receiver(128, b"secret").unwrap());
+            assert!(matches!(
+                receiver.decode_datagram(wire).unwrap(),
+                MainPacket::Reduced(_)
+            ));
+            assert_eq!(receiver.stats().decrypt_rejected, 0);
+        }
+    }
+
+    /// Each receiver session encrypts its NACKs and reports with its own
+    /// nonce, whether the receiver was given a transmit key or only a
+    /// receive key.
+    #[test]
+    fn receiver_sessions_get_their_own_transmit_nonce() {
+        let with_tx = MainReceiverCore::new(0x1122_3344, "rx", NackMode::Range)
+            .with_tx_key(PskKey::new(128, b"secret").unwrap())
+            .with_rx_key(PskKey::receiver(128, b"secret").unwrap());
+        let rx_only = MainReceiverCore::new(0x1122_3344, "rx", NackMode::Range)
+            .with_rx_key(PskKey::receiver(128, b"secret").unwrap());
+        for template in [with_tx, rx_only] {
+            let template_nonce = template.tx_key.as_ref().unwrap().nonce();
+            let mut a = template.fresh_session();
+            let mut b = template.fresh_session();
+            let nonce_a = a.tx_key.as_ref().unwrap().nonce();
+            let nonce_b = b.tx_key.as_ref().unwrap().nonce();
+            assert_ne!(nonce_a, nonce_b);
+            assert_ne!(nonce_a, template_nonce);
+            assert_ne!(nonce_b, template_nonce);
+            let feedback_a = a.build_feedback();
+            let feedback_b = b.build_feedback();
+            let (wire_a, seq_a) = gre_nonce(&feedback_a.bytes);
+            let (wire_b, seq_b) = gre_nonce(&feedback_b.bytes);
+            assert_eq!(seq_a, seq_b);
+            assert_ne!(wire_a, wire_b);
+        }
+    }
+
+    /// Review 3, defect 2: a new receiver session or sender peer state picks
+    /// its own transmit nonce but derives no AES key (PBKDF2) until it first
+    /// sends, so sessions that a flood of forged packets creates cost no
+    /// derivation outside the receive-wide budget.
+    #[test]
+    fn new_sessions_and_peer_states_derive_no_key_until_they_send() {
+        let with_tx = MainReceiverCore::new(0x1122_3344, "rx", NackMode::Range)
+            .with_tx_key(PskKey::new(128, b"secret").unwrap())
+            .with_rx_key(PskKey::receiver(128, b"secret").unwrap());
+        let rx_only = MainReceiverCore::new(0x1122_3344, "rx", NackMode::Range)
+            .with_rx_key(PskKey::receiver(128, b"secret").unwrap());
+        for template in [with_tx, rx_only] {
+            let mut session = template.fresh_session();
+            assert!(!session.tx_key.as_ref().unwrap().aes_key_derived());
+            assert!(!session.rx_key.as_ref().unwrap().aes_key_derived());
+            let nonce = session.tx_key.as_ref().unwrap().nonce();
+            assert_ne!(nonce, [0; 4]);
+            let feedback = session.build_feedback();
+            assert_eq!(gre_nonce(&feedback.bytes).0, nonce);
+            assert!(session.tx_key.as_ref().unwrap().aes_key_derived());
+        }
+
+        let sender = MainSenderCore::new(0x1122_3344, 64)
+            .with_tx_key(PskKey::new(128, b"secret").unwrap())
+            .with_rx_key(PskKey::receiver(128, b"secret").unwrap());
+        let state = sender.new_peer_state();
+        assert!(!state.tx_key.as_ref().unwrap().aes_key_derived());
+        assert!(!state.rx_key.as_ref().unwrap().aes_key_derived());
     }
 }
