@@ -61,6 +61,12 @@ pub enum Error {
     #[error("encrypted packet dropped: its PSK nonce is shut out after failed checks")]
     PskNonceLatched,
 
+    #[error(
+        "encrypted packet dropped: a RIST control packet this endpoint does not use \
+         (no verdict on the key)"
+    )]
+    PskPacketIgnored,
+
     #[error("non-conformant GRE header: routing bit or reserved flags set")]
     NonConformantGre,
 

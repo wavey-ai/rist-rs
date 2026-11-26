@@ -97,6 +97,12 @@ pub enum DecryptVerdict {
     Weak,
     /// Not a valid RIST packet.
     Bad,
+    /// A packet a peer with the right passphrase may send but that this
+    /// endpoint does not use (a RIST VSF subtype such as 0x8001, which
+    /// librist also drops quietly, or a keepalive with an extension of a
+    /// form it does not know): dropped, but it neither proves the nonce
+    /// nor counts against it, so it can never shut a correct peer out.
+    Ignore,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,6 +204,48 @@ impl PskKey {
         Self::receiver(self.key_size.bits(), self.password.as_slice())
     }
 
+    /// A transmit key for a new peer or session: the same passphrase, key
+    /// size and rotation, but its own fresh random nonce (so its own AES
+    /// key), unused, with no receive history.
+    ///
+    /// The AES-CTR IV of RIST Main PSK comes only from the GRE version and
+    /// sequence, and every peer state or session starts its GRE sequence at
+    /// 0, so two peers or sessions that shared one nonce would encrypt
+    /// different packets with the same keystream. Each one gets its own
+    /// copy from here. A receiver takes any nonce from each sender, as
+    /// librist does.
+    pub fn fresh_sender_copy(&self) -> Self {
+        let mut nonce = [0; 4];
+        let mut fresh = false;
+        for _ in 0..8 {
+            if getrandom::getrandom(&mut nonce).is_ok() && nonce != [0; 4] && nonce != self.nonce {
+                fresh = true;
+                break;
+            }
+        }
+        if !fresh {
+            // The operating-system CSPRNG is unavailable: a process-wide
+            // counter still gives every copy a distinct nonce (uniqueness,
+            // not secrecy, is what CTR needs from it).
+            nonce = fallback_distinct_nonce(self.nonce);
+        }
+        let aes_key = Zeroizing::new(derive_aes_key(self.key_size, &self.password, &nonce));
+        Self {
+            key_size: self.key_size,
+            password: self.password.clone(),
+            nonce,
+            key_rotation: self.key_rotation,
+            used_times: 0,
+            aes_key,
+            previous_nonce: None,
+            previous_aes_key: None,
+            rekey_window_start: Instant::now(),
+            rekeys_in_window: 0,
+            nonce_health: [None; TRACKED_NONCES],
+            counters: PskReceiveCounters::default(),
+        }
+    }
+
     /// This key with its receive history and counters cleared, for a new
     /// session.
     pub fn fresh_copy(&self) -> Self {
@@ -240,7 +288,11 @@ impl PskKey {
     /// Records how a packet of `nonce` fared in the checks after
     /// decryption. A bad one is counted in `decrypt_rejected`; enough bad
     /// ones in a row shut the nonce out until the sender's nonce changes.
+    /// An ignored one leaves no trace.
     pub fn record_verdict(&mut self, nonce: [u8; 4], verdict: DecryptVerdict) {
+        if verdict == DecryptVerdict::Ignore {
+            return;
+        }
         let index = match self
             .nonce_health
             .iter()
@@ -267,7 +319,7 @@ impl PskKey {
                 health.proven = true;
                 health.failures = 0;
             }
-            DecryptVerdict::Weak => {}
+            DecryptVerdict::Weak | DecryptVerdict::Ignore => {}
             DecryptVerdict::Bad => {
                 self.counters.decrypt_rejected += 1;
                 health.failures = health.failures.saturating_add(1);
@@ -414,6 +466,18 @@ fn crypt_with_key(
     out
 }
 
+fn fallback_distinct_nonce(base: [u8; 4]) -> [u8; 4] {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(1);
+    loop {
+        let step = NEXT.fetch_add(1, Ordering::Relaxed);
+        let nonce = u32::from_be_bytes(base).wrapping_add(step).to_be_bytes();
+        if nonce != [0; 4] && nonce != base {
+            return nonce;
+        }
+    }
+}
+
 pub fn derive_aes_key(key_size: AesKeySize, password: &[u8], nonce: &[u8; 4]) -> Vec<u8> {
     let mut key = vec![0; key_size.bytes()];
     pbkdf2_hmac::<Sha256>(password, nonce, PBKDF2_HMAC_SHA256_ITERATIONS, &mut key);
@@ -550,5 +614,49 @@ mod tests {
         let encrypted = tx.encrypt(1, 9, b"payload");
         let mut rx = rx_template.fresh_copy();
         assert_eq!(rx.decrypt(nonce, 1, 9, &encrypted).unwrap(), b"payload");
+    }
+
+    /// Two transmit copies of one key never share a nonce (and so never
+    /// share the AES-CTR keystream at the same GRE sequence), keep the
+    /// size and rotation, and decrypt with the same passphrase.
+    #[test]
+    fn fresh_sender_copies_have_their_own_nonce_and_keystream() {
+        let base = PskKey::with_key_rotation(256, 50, b"secret").unwrap();
+        let mut a = base.fresh_sender_copy();
+        let mut b = base.fresh_sender_copy();
+        assert_ne!(a.nonce(), base.nonce());
+        assert_ne!(b.nonce(), base.nonce());
+        assert_ne!(a.nonce(), b.nonce());
+        assert_ne!(a.nonce(), [0; 4]);
+        assert_eq!(a.key_size(), AesKeySize::Aes256);
+        assert_eq!(a.key_rotation, 50);
+        assert_eq!(a.used_times, 0);
+        let plain_a = [0x47u8; 188];
+        let plain_b = [0x11u8; 188];
+        let ct_a = a.encrypt(1, 0, &plain_a);
+        let ct_b = b.encrypt(1, 0, &plain_b);
+        let xor_ct: Vec<u8> = ct_a.iter().zip(&ct_b).map(|(x, y)| x ^ y).collect();
+        let xor_pt: Vec<u8> = plain_a.iter().zip(&plain_b).map(|(x, y)| x ^ y).collect();
+        assert_ne!(xor_ct, xor_pt, "two copies reused one keystream");
+        let mut rx = PskKey::receiver(256, b"secret").unwrap();
+        assert_eq!(rx.decrypt(a.nonce(), 1, 0, &ct_a).unwrap(), plain_a);
+        assert_eq!(rx.decrypt(b.nonce(), 1, 0, &ct_b).unwrap(), plain_b);
+        // Many copies: all distinct.
+        let mut nonces = std::collections::HashSet::new();
+        for _ in 0..64 {
+            assert!(nonces.insert(base.fresh_sender_copy().nonce()));
+        }
+    }
+
+    #[test]
+    fn fallback_nonces_are_distinct_and_never_zero() {
+        let base = [0xff, 0xff, 0xff, 0xff];
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..16 {
+            let nonce = fallback_distinct_nonce(base);
+            assert_ne!(nonce, [0; 4]);
+            assert_ne!(nonce, base);
+            assert!(seen.insert(nonce));
+        }
     }
 }

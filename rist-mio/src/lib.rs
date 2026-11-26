@@ -3962,9 +3962,12 @@ impl MainMioMultiSender {
         self.core.disable_null_packet_suppression();
     }
 
+    /// Every peer gets its own copy of the key with a fresh nonce: peers'
+    /// GRE sequences run separately, so a shared nonce would reuse the
+    /// AES-CTR keystream across peers.
     pub fn set_tx_key(&mut self, key: PskKey) {
         for runtime in &mut self.peer_runtime {
-            runtime.sender.set_tx_key(key.clone());
+            runtime.sender.set_tx_key(key.fresh_sender_copy());
         }
         self.core.set_tx_key(key);
     }
@@ -4789,11 +4792,14 @@ impl MainMioReceiver {
         before - self.peer_runtime.len()
     }
 
+    /// Every session gets its own copy of the key with a fresh nonce:
+    /// sessions' GRE sequences run separately, so a shared nonce would
+    /// reuse the AES-CTR keystream across sessions.
     pub fn set_tx_key(&mut self, key: PskKey) {
-        self.core.set_tx_key(key.clone());
         for runtime in self.peer_runtime.values_mut() {
-            runtime.core.set_tx_key(key.clone());
+            runtime.core.set_tx_key(key.fresh_sender_copy());
         }
+        self.core.set_tx_key(key);
     }
 
     pub fn set_rx_key(&mut self, key: PskKey) {
@@ -5816,6 +5822,108 @@ mod tests {
             receiver.psk_receive_counters().clear_packets_dropped,
             dropped
         );
+    }
+
+    fn wire_nonce(datagram: &[u8]) -> ([u8; 4], u32) {
+        let (gre, _) = GreHeader::decode(datagram).unwrap();
+        (
+            gre.key.expect("encrypted").to_be_bytes(),
+            gre.sequence.expect("encrypted"),
+        )
+    }
+
+    /// A keyed multi-peer sender encrypts for each peer with its own nonce,
+    /// for peers added before and after the key: with weights each peer
+    /// gets different packets at the same GRE sequence, which a shared
+    /// nonce would put under one AES-CTR keystream.
+    #[test]
+    fn keyed_multi_sender_gives_every_peer_its_own_nonce() {
+        let ntp = ntp_now();
+        let sinks = [raw_sink(), raw_sink(), raw_sink()];
+        for weighted in [false, true] {
+            let weight = u32::from(weighted);
+            let mut sender = MainMioMultiSender::bind(loopback_any(), 0x1122_3344, 64).unwrap();
+            sender
+                .add_peer(sinks[0].local_addr().unwrap(), weight)
+                .unwrap();
+            sender.set_tx_key(PskKey::new(128, b"secret").unwrap());
+            sender.set_rx_key(PskKey::receiver(128, b"secret").unwrap());
+            sender
+                .add_peer(sinks[1].local_addr().unwrap(), weight)
+                .unwrap();
+            sender
+                .add_peer(sinks[2].local_addr().unwrap(), weight)
+                .unwrap();
+            let mut by_peer: HashMap<usize, ([u8; 4], u32)> = HashMap::new();
+            for index in 0..6u8 {
+                let sent = sender
+                    .send_payload(&[index; 188], ntp, Instant::now())
+                    .unwrap();
+                for packet in sent.peer_packets {
+                    by_peer
+                        .entry(packet.peer)
+                        .or_insert_with(|| wire_nonce(&packet.packet.bytes));
+                }
+            }
+            assert_eq!(by_peer.len(), 3, "weighted={weighted}: {by_peer:?}");
+            let nonces: std::collections::HashSet<[u8; 4]> =
+                by_peer.values().map(|(nonce, _)| *nonce).collect();
+            assert_eq!(nonces.len(), 3, "weighted={weighted}: peers share a nonce");
+            // Every peer's first packet carried GRE sequence 0.
+            assert!(by_peer.values().all(|(_, sequence)| *sequence == 0));
+            for sink in &sinks {
+                drain_raw(sink);
+            }
+        }
+    }
+
+    /// A keyed Main receiver answers each sender's session with its own
+    /// nonce, also after the key is set again while the sessions exist.
+    #[test]
+    fn keyed_main_receiver_gives_every_session_its_own_nonce() {
+        let flow_id = 0x1122_3344;
+        let ntp = ntp_now();
+        let mut receiver =
+            MainMioReceiver::bind(loopback_any(), flow_id, "rust", NackMode::Range).unwrap();
+        receiver.set_rx_key(PskKey::receiver(128, b"secret").unwrap());
+        let receiver_addr = receiver.local_addr().unwrap();
+        let peers = [raw_sink(), raw_sink()];
+        for peer in &peers {
+            let mut core =
+                MainSenderCore::new(flow_id, 64).with_tx_key(PskKey::new(128, b"secret").unwrap());
+            let packet = core.send_payload(&[0x47; 188], ntp, Instant::now());
+            peer.send_to(&packet.bytes, receiver_addr).unwrap();
+        }
+        let mut buf = [0u8; 2_048];
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while receiver.peer_count() < 2 {
+            let _ = receiver.try_recv_event(&mut buf);
+            assert!(Instant::now() < deadline, "sessions not made");
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(receiver.psk_receive_counters().decrypt_rejected, 0);
+        let read_feedback_nonces = |receiver: &mut MainMioReceiver| {
+            peers
+                .iter()
+                .map(|peer| {
+                    receiver
+                        .send_feedback_to(peer.local_addr().unwrap())
+                        .unwrap();
+                    let mut buf = [0u8; 2_048];
+                    let (len, _) = peer.recv_from(&mut buf).unwrap();
+                    wire_nonce(&buf[..len])
+                })
+                .collect::<Vec<_>>()
+        };
+        let first = read_feedback_nonces(&mut receiver);
+        assert_ne!(first[0].0, first[1].0, "sessions share a nonce: {first:?}");
+        receiver.set_tx_key(PskKey::new(128, b"secret").unwrap());
+        let second = read_feedback_nonces(&mut receiver);
+        assert_ne!(
+            second[0].0, second[1].0,
+            "sessions share a nonce: {second:?}"
+        );
+        assert_eq!(second[0].1, second[1].1);
     }
 
     /// A keyed Main sender puts nothing clear on the wire on any send path:

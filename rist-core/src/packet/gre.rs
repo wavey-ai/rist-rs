@@ -550,10 +550,11 @@ fn decrypt_checked(gre: GreHeader, body: &[u8], key: &mut PskKey) -> Result<Vec<
     };
     let verdict = check_decrypted(gre.protocol_type, &decrypted);
     key.record_verdict(nonce, verdict);
-    if verdict == DecryptVerdict::Bad {
-        return Err(Error::PskCheckFailed);
+    match verdict {
+        DecryptVerdict::Bad => Err(Error::PskCheckFailed),
+        DecryptVerdict::Ignore => Err(Error::PskPacketIgnored),
+        DecryptVerdict::Strong | DecryptVerdict::Weak => Ok(decrypted),
     }
-    Ok(decrypted)
 }
 
 /// The checks RIST Main PSK allows on a decrypted payload. AES-CTR has no
@@ -561,7 +562,10 @@ fn decrypt_checked(gre: GreHeader, body: &[u8], key: &mut PskKey) -> Result<Vec<
 /// packet) shows only as contents that are not a valid RIST packet:
 ///
 /// - VSF: protocol 0 (RIST) and a subtype in use (reduced, keepalive,
-///   buffer negotiation), as librist requires.
+///   buffer negotiation), as librist requires. Another RIST subtype (such
+///   as 0x8001) is dropped with [`DecryptVerdict::Ignore`], as librist
+///   drops it without counting a bad decryption: a correct peer may send
+///   one, so it must not shut the peer's nonce out.
 /// - Reduced (data and RTCP): the reduced header and a full RTP header
 ///   with version 2 (librist's check). Data must be MPEG-TS over RTP as
 ///   librist and rist-rs send it: no padding, no CSRC, payload type 33,
@@ -569,9 +573,14 @@ fn decrypt_checked(gre: GreHeader, body: &[u8], key: &mut PskKey) -> Result<Vec<
 ///   word). RTCP must be a well-formed compound: every packet version 2
 ///   with an RTCP payload type, lengths that end exactly at the end.
 /// - Keepalive: MAC and capabilities, then nothing, the four-byte TR-06-3
-///   capabilities, or a JSON object.
+///   capabilities, a JSON object, or the four bytes then a JSON object
+///   (whitespace and NUL padding around the JSON allowed). A tail of any
+///   other form is dropped with [`DecryptVerdict::Ignore`], never `Bad`:
+///   a keepalive proves nothing either way.
 /// - Buffer negotiation: its six fixed bytes.
-/// - Out-of-band (GRE full) data is opaque and cannot be checked.
+/// - Out-of-band (GRE full) data is opaque and cannot be checked: a wrong
+///   passphrase's or a forger's out-of-band packet is always accepted, and
+///   delivered as garbage bytes.
 ///
 /// Only RTP and RTCP give a [`DecryptVerdict::Strong`] result: a wrong key
 /// passes them by chance (about one data packet in 2^15), the rest carry
@@ -595,7 +604,11 @@ pub fn check_decrypted(protocol_type: u16, payload: &[u8]) -> DecryptVerdict {
                 VSF_SUBTYPE_BUFFER_NEGOTIATION if body.len() >= BufferNegotiation::MIN_LEN => {
                     DecryptVerdict::Weak
                 }
-                _ => DecryptVerdict::Bad,
+                VSF_SUBTYPE_BUFFER_NEGOTIATION => DecryptVerdict::Bad,
+                // Other RIST subtypes (0x8001 flow attributes and anything
+                // later): librist drops them quietly, so a correct peer may
+                // send them.
+                _ => DecryptVerdict::Ignore,
             }
         }
         _ => DecryptVerdict::Bad,
@@ -667,21 +680,37 @@ fn check_keepalive_body(body: &[u8]) -> DecryptVerdict {
         return DecryptVerdict::Bad;
     }
     let rest = &body[GreKeepalive::MIN_LEN..];
-    let end = rest
-        .iter()
-        .rposition(|byte| *byte != 0)
-        .map_or(0, |at| at + 1);
-    let json = &rest[..end];
-    let valid = rest.is_empty()
-        || rest.len() == 4
-        || (json.first() == Some(&b'{')
-            && json.last() == Some(&b'}')
-            && std::str::from_utf8(json).is_ok());
+    let valid = rest.len() == 4
+        || is_padding(rest)
+        || is_json_object(rest)
+        || (rest.len() > 4 && is_json_object(&rest[4..]));
     if valid {
         DecryptVerdict::Weak
     } else {
-        DecryptVerdict::Bad
+        // A keepalive extension of a form this endpoint does not know:
+        // dropped, but not held against the nonce (a keepalive proves
+        // nothing either way, and a correct peer may send one).
+        DecryptVerdict::Ignore
     }
+}
+
+fn is_padding_byte(byte: u8) -> bool {
+    byte == 0 || byte.is_ascii_whitespace()
+}
+
+fn is_padding(bytes: &[u8]) -> bool {
+    bytes.iter().all(|byte| is_padding_byte(*byte))
+}
+
+/// A JSON object, with whitespace or NUL padding around it allowed.
+fn is_json_object(bytes: &[u8]) -> bool {
+    let start = bytes.iter().position(|byte| !is_padding_byte(*byte));
+    let end = bytes.iter().rposition(|byte| !is_padding_byte(*byte));
+    let (Some(start), Some(end)) = (start, end) else {
+        return false;
+    };
+    let json = &bytes[start..=end];
+    json.first() == Some(&b'{') && json.last() == Some(&b'}') && std::str::from_utf8(json).is_ok()
 }
 
 fn is_reduced_payload(gre: GreHeader, payload: &[u8]) -> bool {
@@ -1749,28 +1778,134 @@ mod tests {
             DecryptVerdict::Bad,
             "VSF protocol"
         );
+        // RIST subtypes this endpoint does not use are dropped without a
+        // verdict (librist drops them quietly).
         for subtype in [0x0001u16, VSF_SUBTYPE_FUTURE_NONCE, 0x8003] {
             let mut vsf = vec![0, 0];
             vsf.extend_from_slice(&subtype.to_be_bytes());
             vsf.extend_from_slice(&with_reduced(&good));
             assert_eq!(
                 check_decrypted(GRE_PROTOCOL_TYPE_VSF, &vsf),
-                DecryptVerdict::Bad,
+                DecryptVerdict::Ignore,
                 "VSF subtype {subtype:#06x}"
             );
         }
+        let mut short_negotiation = Vec::new();
+        VsfHeader::rist_buffer_negotiation().encode(&mut short_negotiation);
+        short_negotiation.extend_from_slice(&[0; 3]);
+        assert_eq!(
+            check_decrypted(GRE_PROTOCOL_TYPE_VSF, &short_negotiation),
+            DecryptVerdict::Bad
+        );
         assert_eq!(
             check_decrypted(GRE_PROTOCOL_TYPE_KEEPALIVE, &[0; 7]),
             DecryptVerdict::Bad
         );
+        // A keepalive tail of an unknown form is dropped, not held against
+        // the nonce.
         assert_eq!(
             check_decrypted(GRE_PROTOCOL_TYPE_KEEPALIVE, &[7; 8 + 9]),
-            DecryptVerdict::Bad
+            DecryptVerdict::Ignore
         );
         assert_eq!(
             check_decrypted(GRE_PROTOCOL_TYPE_EAPOL, &with_reduced(&good)),
             DecryptVerdict::Bad
         );
+    }
+
+    /// Packets a peer with the right passphrase may send as the first of
+    /// a nonce must not shut that nonce out: a VSF 0x8001 (flow
+    /// attributes, which librist drops quietly), a TR-06-3 keepalive with
+    /// its four capability bytes and then JSON, JSON with trailing
+    /// whitespace, and a keepalive extension of an unknown form. They are
+    /// dropped or accepted, never counted against the nonce, and the
+    /// peer's data that follows is delivered.
+    #[test]
+    fn correct_peer_packets_never_latch_the_nonce_at_the_first_failure() {
+        let nonce = [0x21, 0x43, 0x65, 0x87];
+        let (mut tx, mut rx) = psk_pair(nonce);
+        let mut sequence = 0u32;
+        let mut next = || {
+            sequence += 1;
+            sequence - 1
+        };
+
+        // VSF 0x8001 first: dropped without a verdict.
+        let mut flow_attribute = vec![0, 0];
+        flow_attribute.extend_from_slice(&VSF_SUBTYPE_FUTURE_NONCE.to_be_bytes());
+        flow_attribute.extend_from_slice(br#"{"flow":"attributes"}"#);
+        let packet = encode_encrypted_gre_payload(
+            2,
+            GRE_PROTOCOL_TYPE_VSF,
+            next(),
+            &flow_attribute,
+            &mut tx,
+        );
+        assert_eq!(
+            decode_main_packet(&packet, Some(&mut rx)).unwrap_err(),
+            Error::PskPacketIgnored
+        );
+
+        let keepalive = |tail: &[u8]| {
+            let mut body = Vec::new();
+            GreKeepalive::librist_default([1, 2, 3, 4, 5, 6]).encode(&mut body);
+            body.extend_from_slice(tail);
+            body
+        };
+        // TR-06-3 capabilities then JSON, and JSON with whitespace or NUL
+        // padding: accepted as keepalives.
+        for tail in [
+            &b"\x00\x00\x00\x01{\"peer\":\"tr-06-3\"}"[..],
+            &b"{\"peer\":\"librist\"}\n  "[..],
+            &b" \t{\"peer\":\"padded\"}\r\n\x00\x00"[..],
+            &b"\x00\x00\x00\x01  {\"a\":1}\n"[..],
+        ] {
+            let packet = encode_encrypted_gre_payload(
+                1,
+                GRE_PROTOCOL_TYPE_KEEPALIVE,
+                next(),
+                &keepalive(tail),
+                &mut tx,
+            );
+            assert!(
+                matches!(
+                    decode_main_packet(&packet, Some(&mut rx)).unwrap(),
+                    MainPacket::Keepalive(_)
+                ),
+                "{tail:?}"
+            );
+        }
+        // A keepalive extension of an unknown form: dropped, no verdict.
+        let packet = encode_encrypted_gre_payload(
+            1,
+            GRE_PROTOCOL_TYPE_KEEPALIVE,
+            next(),
+            &keepalive(b"\x01\x02\x03 not json"),
+            &mut tx,
+        );
+        assert_eq!(
+            decode_main_packet(&packet, Some(&mut rx)).unwrap_err(),
+            Error::PskPacketIgnored
+        );
+
+        // The peer's data on the same nonce is delivered.
+        for rtp_sequence in 0..4u16 {
+            let packet = encode_encrypted_reduced_payload(
+                1,
+                next(),
+                librist_reduced(),
+                &rtp(rtp_sequence, &ts_payload()[..188]),
+                &mut tx,
+            );
+            assert!(matches!(
+                decode_main_packet(&packet, Some(&mut rx)).unwrap(),
+                MainPacket::Reduced(_)
+            ));
+        }
+        let counters = rx.receive_counters();
+        assert_eq!(counters.decrypt_rejected, 0, "{counters:?}");
+        assert_eq!(counters.nonce_latches, 0, "{counters:?}");
+        assert_eq!(counters.decrypt_latched, 0, "{counters:?}");
     }
 
     /// The root cause of the wrong-secret payload: a librist sender starts

@@ -489,7 +489,8 @@ impl MainSenderCore {
         MainSenderPeerState {
             simple: self.simple.new_peer_state(),
             next_gre_sequence: 0,
-            tx_key: self.tx_key.clone(),
+            // Its own nonce: this peer's GRE sequence also starts at 0.
+            tx_key: self.tx_key.as_ref().map(PskKey::fresh_sender_copy),
             rx_key: self.rx_key.as_ref().map(PskKey::fresh_copy),
         }
     }
@@ -1134,7 +1135,8 @@ impl MainReceiverCore {
         session.set_recovery_tuning(self.tuning);
         session.max_flows = self.max_flows;
         if let Some(key) = &self.tx_key {
-            session.set_tx_key(key.clone());
+            // Its own nonce: the session's GRE sequence also starts at 0.
+            session.set_tx_key(key.fresh_sender_copy());
         }
         if let Some(key) = &self.rx_key {
             session.set_rx_key(key.fresh_copy());
@@ -2424,5 +2426,82 @@ mod tests {
         packet[3] = 0x10;
         packet[4..4 + label.len()].copy_from_slice(label);
         packet
+    }
+
+    fn gre_nonce(datagram: &[u8]) -> ([u8; 4], u32) {
+        let (gre, _) = GreHeader::decode(datagram).unwrap();
+        (
+            gre.key.expect("encrypted").to_be_bytes(),
+            gre.sequence.expect("encrypted"),
+        )
+    }
+
+    /// Each peer state of a keyed sender encrypts with its own nonce:
+    /// peers' GRE sequences each start at 0, so a shared nonce would put
+    /// different packets under one AES-CTR keystream. A receiver with the
+    /// passphrase decrypts every peer's packets.
+    #[test]
+    fn sender_peer_states_get_their_own_transmit_nonce() {
+        let now = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut sender =
+            MainSenderCore::new(0x1122_3344, 64).with_tx_key(PskKey::new(128, b"secret").unwrap());
+        let mut peer_a = sender.new_peer_state();
+        let mut peer_b = sender.new_peer_state();
+        let core_nonce = sender.tx_key.as_ref().unwrap().nonce();
+        let nonce_a = peer_a.tx_key.as_ref().unwrap().nonce();
+        let nonce_b = peer_b.tx_key.as_ref().unwrap().nonce();
+        assert_ne!(nonce_a, nonce_b);
+        assert_ne!(nonce_a, core_nonce);
+        assert_ne!(nonce_b, core_nonce);
+
+        // Different packets to each peer at the same GRE sequence (what a
+        // weighted multi-sender does): different nonces on the wire, and
+        // the ciphertext XOR is not the plaintext XOR.
+        let packet_a = sender.prepare_payload(&[0x47; 188], ntp, now);
+        let packet_b = sender.prepare_payload(&[0x11; 188], ntp, now);
+        let wire_a = sender.wrap_payload_for_peer(&mut peer_a, &packet_a);
+        let wire_b = sender.wrap_payload_for_peer(&mut peer_b, &packet_b);
+        let (wire_nonce_a, seq_a) = gre_nonce(&wire_a.bytes);
+        let (wire_nonce_b, seq_b) = gre_nonce(&wire_b.bytes);
+        assert_eq!(seq_a, seq_b);
+        assert_eq!((wire_nonce_a, wire_nonce_b), (nonce_a, nonce_b));
+        for wire in [&wire_a.bytes, &wire_b.bytes] {
+            let mut receiver = MainReceiverCore::new(0x1122_3344, "rx", NackMode::Range)
+                .with_rx_key(PskKey::receiver(128, b"secret").unwrap());
+            assert!(matches!(
+                receiver.decode_datagram(wire).unwrap(),
+                MainPacket::Reduced(_)
+            ));
+            assert_eq!(receiver.stats().decrypt_rejected, 0);
+        }
+    }
+
+    /// Each receiver session encrypts its NACKs and reports with its own
+    /// nonce, whether the receiver was given a transmit key or only a
+    /// receive key.
+    #[test]
+    fn receiver_sessions_get_their_own_transmit_nonce() {
+        let with_tx = MainReceiverCore::new(0x1122_3344, "rx", NackMode::Range)
+            .with_tx_key(PskKey::new(128, b"secret").unwrap())
+            .with_rx_key(PskKey::receiver(128, b"secret").unwrap());
+        let rx_only = MainReceiverCore::new(0x1122_3344, "rx", NackMode::Range)
+            .with_rx_key(PskKey::receiver(128, b"secret").unwrap());
+        for template in [with_tx, rx_only] {
+            let template_nonce = template.tx_key.as_ref().unwrap().nonce();
+            let mut a = template.fresh_session();
+            let mut b = template.fresh_session();
+            let nonce_a = a.tx_key.as_ref().unwrap().nonce();
+            let nonce_b = b.tx_key.as_ref().unwrap().nonce();
+            assert_ne!(nonce_a, nonce_b);
+            assert_ne!(nonce_a, template_nonce);
+            assert_ne!(nonce_b, template_nonce);
+            let feedback_a = a.build_feedback();
+            let feedback_b = b.build_feedback();
+            let (wire_a, seq_a) = gre_nonce(&feedback_a.bytes);
+            let (wire_b, seq_b) = gre_nonce(&feedback_b.bytes);
+            assert_eq!(seq_a, seq_b);
+            assert_ne!(wire_a, wire_b);
+        }
     }
 }
