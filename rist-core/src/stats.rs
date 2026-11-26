@@ -31,6 +31,18 @@ pub struct SenderStats {
     /// but not sent because the socket would block with the send queue
     /// full. Not in retransmitted_packets, duplicate_repairs or tail_probes.
     pub repairs_dropped_queue_full: u64,
+    /// PSK: unencrypted packets (not EAPOL) dropped because a key is
+    /// configured.
+    pub clear_packets_dropped: u64,
+    /// PSK: encrypted packets that failed the checks after decryption (a
+    /// wrong passphrase, or a forged or damaged packet) or carried a
+    /// malformed encrypted header or a refused nonce change.
+    pub decrypt_rejected: u64,
+    /// PSK: encrypted packets dropped undecrypted because their nonce was
+    /// shut out after failed checks.
+    pub decrypt_latched: u64,
+    /// PSK: nonces shut out after failed checks.
+    pub nonce_latches: u64,
 }
 
 impl SenderStats {
@@ -54,6 +66,10 @@ impl SenderStats {
             duplicate_repairs: 0,
             tail_probes: 0,
             repairs_dropped_queue_full: 0,
+            clear_packets_dropped: 0,
+            decrypt_rejected: 0,
+            decrypt_latched: 0,
+            nonce_latches: 0,
         }
     }
 
@@ -157,6 +173,18 @@ pub struct ReceiverStats {
     /// Packets taken below the first sequence seen at the start of a stream
     /// as its new start.
     pub startup_packets: u64,
+    /// PSK: unencrypted packets (not EAPOL) dropped because a key is
+    /// configured.
+    pub clear_packets_dropped: u64,
+    /// PSK: encrypted packets that failed the checks after decryption (a
+    /// wrong passphrase, or a forged or damaged packet) or carried a
+    /// malformed encrypted header or a refused nonce change.
+    pub decrypt_rejected: u64,
+    /// PSK: encrypted packets dropped undecrypted because their nonce was
+    /// shut out after failed checks.
+    pub decrypt_latched: u64,
+    /// PSK: nonces shut out after failed checks.
+    pub nonce_latches: u64,
 }
 
 impl ReceiverStats {
@@ -194,6 +222,10 @@ impl ReceiverStats {
             duplicate_window_packets: 0,
             startup_holes: 0,
             startup_packets: 0,
+            clear_packets_dropped: 0,
+            decrypt_rejected: 0,
+            decrypt_latched: 0,
+            nonce_latches: 0,
         }
     }
 

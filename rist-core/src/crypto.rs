@@ -11,6 +11,18 @@ pub const PBKDF2_HMAC_SHA256_ITERATIONS: u32 = 1024;
 pub const AES_BLOCK_SIZE: usize = 16;
 pub const DEFAULT_KEY_ROTATION_PACKETS: u64 = 1_000_000;
 const MAX_RECEIVE_REKEYS_PER_SECOND: u8 = 8;
+/// Consecutive packets of one nonce that may fail the checks after
+/// decryption before that nonce is shut out, once the nonce has carried a
+/// packet that passed them. librist latches on the seventh failure in a
+/// row (`bad_count++ > 5`); so does this.
+pub const PSK_BAD_DECRYPTION_LIMIT: u8 = 7;
+/// The same limit for a nonce that has not yet carried a packet that
+/// passed the checks: a sender with the right passphrase passes them from
+/// its first packet, so the first failure shuts the nonce out.
+pub const PSK_UNPROVEN_BAD_DECRYPTION_LIMIT: u8 = 1;
+/// Nonces whose check history a receive key keeps (the current one and
+/// the one before a rotation).
+const TRACKED_NONCES: usize = 2;
 
 type Aes128Ctr = ctr::Ctr128BE<Aes128>;
 type Aes192Ctr = ctr::Ctr128BE<Aes192>;
@@ -46,6 +58,55 @@ impl AesKeySize {
     }
 }
 
+/// What a receive key turned away: an endpoint with a key drops clear
+/// packets (other than EAPOL) and encrypted packets that fail the checks
+/// RIST Main PSK allows after decryption. Additive counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PskReceiveCounters {
+    /// Unencrypted packets (not EAPOL) dropped because a key is configured.
+    pub clear_packets_dropped: u64,
+    /// Encrypted packets dropped because they failed the PSK checks: a
+    /// malformed encrypted header, a refused nonce change, or decrypted
+    /// contents that are not a valid RIST packet (a wrong passphrase, or a
+    /// forged or damaged packet).
+    pub decrypt_rejected: u64,
+    /// Encrypted packets dropped without decryption because their nonce
+    /// was shut out after failed checks (see [`PSK_BAD_DECRYPTION_LIMIT`]).
+    pub decrypt_latched: u64,
+    /// Times a nonce was shut out.
+    pub nonce_latches: u64,
+}
+
+impl PskReceiveCounters {
+    pub fn add(&mut self, other: Self) {
+        self.clear_packets_dropped += other.clear_packets_dropped;
+        self.decrypt_rejected += other.decrypt_rejected;
+        self.decrypt_latched += other.decrypt_latched;
+        self.nonce_latches += other.nonce_latches;
+    }
+}
+
+/// How the contents of one decrypted packet fared in the checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecryptVerdict {
+    /// A structure a wrong key reproduces only by chance (an RTP or RTCP
+    /// header and lengths): proves the nonce.
+    Strong,
+    /// Accepted, but with too little structure to prove anything
+    /// (keepalive, buffer negotiation, out-of-band data).
+    Weak,
+    /// Not a valid RIST packet.
+    Bad,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NonceHealth {
+    nonce: [u8; 4],
+    proven: bool,
+    failures: u8,
+    latched: bool,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct PskKey {
     key_size: AesKeySize,
@@ -58,6 +119,8 @@ pub struct PskKey {
     previous_aes_key: Option<Zeroizing<Vec<u8>>>,
     rekey_window_start: Instant,
     rekeys_in_window: u8,
+    nonce_health: [Option<NonceHealth>; TRACKED_NONCES],
+    counters: PskReceiveCounters,
 }
 
 impl PskKey {
@@ -112,7 +175,113 @@ impl PskKey {
             previous_aes_key: None,
             rekey_window_start: Instant::now(),
             rekeys_in_window: 0,
+            nonce_health: [None; TRACKED_NONCES],
+            counters: PskReceiveCounters::default(),
         })
+    }
+
+    /// A transmit key for the same passphrase and key size, with a fresh
+    /// random nonce and the default rotation: what an endpoint that was
+    /// given only a receive key encrypts with, so it never sends clear.
+    pub fn sender_for(&self) -> Result<Self> {
+        Self::with_key_rotation(
+            self.key_size.bits(),
+            DEFAULT_KEY_ROTATION_PACKETS,
+            self.password.as_slice(),
+        )
+    }
+
+    /// A receive key for the same passphrase and key size: what an
+    /// endpoint that was given only a transmit key decrypts with, so it
+    /// drops clear packets from its peer.
+    pub fn receiver_for(&self) -> Result<Self> {
+        Self::receiver(self.key_size.bits(), self.password.as_slice())
+    }
+
+    /// This key with its receive history and counters cleared, for a new
+    /// session.
+    pub fn fresh_copy(&self) -> Self {
+        let mut key = self.clone();
+        key.nonce_health = [None; TRACKED_NONCES];
+        key.counters = PskReceiveCounters::default();
+        key
+    }
+
+    /// What this key turned away as a receive key.
+    pub fn receive_counters(&self) -> PskReceiveCounters {
+        self.counters
+    }
+
+    /// Counts a clear packet dropped because this key is configured.
+    pub fn note_clear_dropped(&mut self) {
+        self.counters.clear_packets_dropped += 1;
+    }
+
+    /// Counts an encrypted packet rejected before or during decryption.
+    pub fn note_rejected(&mut self) {
+        self.counters.decrypt_rejected += 1;
+    }
+
+    /// Whether packets of `nonce` are shut out. Counts the packet as
+    /// dropped when they are.
+    pub fn refuse_latched(&mut self, nonce: [u8; 4]) -> Result<()> {
+        if self
+            .nonce_health
+            .iter()
+            .flatten()
+            .any(|health| health.nonce == nonce && health.latched)
+        {
+            self.counters.decrypt_latched += 1;
+            return Err(Error::PskNonceLatched);
+        }
+        Ok(())
+    }
+
+    /// Records how a packet of `nonce` fared in the checks after
+    /// decryption. A bad one is counted in `decrypt_rejected`; enough bad
+    /// ones in a row shut the nonce out until the sender's nonce changes.
+    pub fn record_verdict(&mut self, nonce: [u8; 4], verdict: DecryptVerdict) {
+        let index = match self
+            .nonce_health
+            .iter()
+            .position(|health| health.is_some_and(|health| health.nonce == nonce))
+        {
+            Some(index) => index,
+            None => {
+                // Newest first: the oldest tracked nonce makes room.
+                self.nonce_health.rotate_right(1);
+                self.nonce_health[0] = Some(NonceHealth {
+                    nonce,
+                    proven: false,
+                    failures: 0,
+                    latched: false,
+                });
+                0
+            }
+        };
+        let health = self.nonce_health[index]
+            .as_mut()
+            .expect("tracked nonce was just found or inserted");
+        match verdict {
+            DecryptVerdict::Strong => {
+                health.proven = true;
+                health.failures = 0;
+            }
+            DecryptVerdict::Weak => {}
+            DecryptVerdict::Bad => {
+                self.counters.decrypt_rejected += 1;
+                health.failures = health.failures.saturating_add(1);
+                let limit = if health.proven {
+                    PSK_BAD_DECRYPTION_LIMIT
+                } else {
+                    PSK_UNPROVEN_BAD_DECRYPTION_LIMIT
+                };
+                if !health.latched && health.failures >= limit {
+                    health.latched = true;
+                    self.counters.nonce_latches += 1;
+                }
+            }
+        }
     }
 
     pub fn key_size(&self) -> AesKeySize {
@@ -212,6 +381,7 @@ impl fmt::Debug for PskKey {
             .field("nonce", &self.nonce)
             .field("key_rotation", &self.key_rotation)
             .field("used_times", &self.used_times)
+            .field("counters", &self.counters)
             .field("password", &"<redacted>")
             .field("aes_key", &"<redacted>")
             .finish()
@@ -319,5 +489,66 @@ mod tests {
         let gre_v0 = iv_for_sequence(0, 0x0102_0304);
         assert_eq!(&gre_v0[..12], &[0; 12]);
         assert_eq!(&gre_v0[12..], &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn nonce_latch_follows_librist_once_proven_and_is_strict_before() {
+        let mut rx = PskKey::receiver(128, b"secret").unwrap();
+        let proven = [1, 1, 1, 1];
+        rx.record_verdict(proven, DecryptVerdict::Strong);
+        // Six failures in a row are tolerated, and a good packet clears them.
+        for _ in 0..PSK_BAD_DECRYPTION_LIMIT - 1 {
+            rx.record_verdict(proven, DecryptVerdict::Bad);
+        }
+        assert!(rx.refuse_latched(proven).is_ok());
+        rx.record_verdict(proven, DecryptVerdict::Strong);
+        for _ in 0..PSK_BAD_DECRYPTION_LIMIT - 1 {
+            rx.record_verdict(proven, DecryptVerdict::Bad);
+        }
+        assert!(rx.refuse_latched(proven).is_ok());
+        // A keepalive proves nothing and clears nothing.
+        rx.record_verdict(proven, DecryptVerdict::Weak);
+        // The seventh in a row shuts the nonce out.
+        rx.record_verdict(proven, DecryptVerdict::Bad);
+        assert_eq!(rx.refuse_latched(proven), Err(Error::PskNonceLatched));
+        assert_eq!(rx.receive_counters().nonce_latches, 1);
+        assert_eq!(
+            rx.receive_counters().decrypt_rejected,
+            u64::from(2 * PSK_BAD_DECRYPTION_LIMIT - 1)
+        );
+        assert_eq!(rx.receive_counters().decrypt_latched, 1);
+
+        // A nonce that never passed a check is shut out at its first failure,
+        // even after keepalives.
+        let unproven = [2, 2, 2, 2];
+        rx.record_verdict(unproven, DecryptVerdict::Weak);
+        assert!(rx.refuse_latched(unproven).is_ok());
+        rx.record_verdict(unproven, DecryptVerdict::Bad);
+        assert_eq!(rx.refuse_latched(unproven), Err(Error::PskNonceLatched));
+
+        // Two nonces are tracked: a third one pushes the oldest out, and
+        // that nonce starts over (as librist resets on a nonce change).
+        let third = [3, 3, 3, 3];
+        rx.record_verdict(third, DecryptVerdict::Strong);
+        assert!(rx.refuse_latched(proven).is_ok());
+        assert_eq!(rx.refuse_latched(unproven), Err(Error::PskNonceLatched));
+
+        // A fresh copy for a new session forgets all of it.
+        let fresh = rx.fresh_copy();
+        assert_eq!(fresh.receive_counters(), PskReceiveCounters::default());
+        let mut fresh = fresh;
+        assert!(fresh.refuse_latched(unproven).is_ok());
+    }
+
+    #[test]
+    fn sender_for_a_receive_key_encrypts_for_the_same_passphrase() {
+        let rx_template = PskKey::receiver(192, b"secret").unwrap();
+        let mut tx = rx_template.sender_for().unwrap();
+        assert_eq!(tx.key_size(), AesKeySize::Aes192);
+        assert_ne!(tx.nonce(), [0; 4]);
+        let nonce = tx.nonce();
+        let encrypted = tx.encrypt(1, 9, b"payload");
+        let mut rx = rx_template.fresh_copy();
+        assert_eq!(rx.decrypt(nonce, 1, 9, &encrypted).unwrap(), b"payload");
     }
 }

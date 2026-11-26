@@ -27,7 +27,7 @@ pub use auth::{
     SrpCredentialStore, SrpGroup, SrpHashVersion, SrpPassphrase, SrpUserRecord,
 };
 pub use bonding::{PeerSelection, WeightedPeerSelector};
-pub use crypto::{AesKeySize, PskKey};
+pub use crypto::{AesKeySize, DecryptVerdict, PskKey, PskReceiveCounters};
 pub use endpoint::{
     AdvancedUrlConfig, CongestionControlMode, ConnectionConfig, EncryptionConfig, Endpoint,
     MultiplexMode, PeerConfig, RecoveryConfig, RecoveryMode, RecoveryTuning, TailProbe, TimingMode,
