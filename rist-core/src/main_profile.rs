@@ -2547,4 +2547,34 @@ mod tests {
             assert_ne!(wire_a, wire_b);
         }
     }
+
+    /// Review 3, defect 2: a new receiver session or sender peer state picks
+    /// its own transmit nonce but derives no AES key (PBKDF2) until it first
+    /// sends, so sessions that a flood of forged packets creates cost no
+    /// derivation outside the receive-wide budget.
+    #[test]
+    fn new_sessions_and_peer_states_derive_no_key_until_they_send() {
+        let with_tx = MainReceiverCore::new(0x1122_3344, "rx", NackMode::Range)
+            .with_tx_key(PskKey::new(128, b"secret").unwrap())
+            .with_rx_key(PskKey::receiver(128, b"secret").unwrap());
+        let rx_only = MainReceiverCore::new(0x1122_3344, "rx", NackMode::Range)
+            .with_rx_key(PskKey::receiver(128, b"secret").unwrap());
+        for template in [with_tx, rx_only] {
+            let mut session = template.fresh_session();
+            assert!(!session.tx_key.as_ref().unwrap().aes_key_derived());
+            assert!(!session.rx_key.as_ref().unwrap().aes_key_derived());
+            let nonce = session.tx_key.as_ref().unwrap().nonce();
+            assert_ne!(nonce, [0; 4]);
+            let feedback = session.build_feedback();
+            assert_eq!(gre_nonce(&feedback.bytes).0, nonce);
+            assert!(session.tx_key.as_ref().unwrap().aes_key_derived());
+        }
+
+        let sender = MainSenderCore::new(0x1122_3344, 64)
+            .with_tx_key(PskKey::new(128, b"secret").unwrap())
+            .with_rx_key(PskKey::receiver(128, b"secret").unwrap());
+        let state = sender.new_peer_state();
+        assert!(!state.tx_key.as_ref().unwrap().aes_key_derived());
+        assert!(!state.rx_key.as_ref().unwrap().aes_key_derived());
+    }
 }

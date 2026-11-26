@@ -11,13 +11,24 @@ use zeroize::Zeroizing;
 pub const PBKDF2_HMAC_SHA256_ITERATIONS: u32 = 1024;
 pub const AES_BLOCK_SIZE: usize = 16;
 pub const DEFAULT_KEY_ROTATION_PACKETS: u64 = 1_000_000;
-const MAX_RECEIVE_REKEYS_PER_SECOND: u8 = 8;
+pub const MAX_RECEIVE_REKEYS_PER_SECOND: u8 = 8;
 /// Nonce changes (each one a PBKDF2 derivation) that all receive copies of
-/// one key may make together in one second: every session of a listening
-/// receiver and every candidate source of a listening sender draws on it.
-/// It bounds the CPU a flood of new nonces costs, and how often a forger,
-/// who needs no key and may pick a new nonce for every packet, gets a try
-/// at the checks, however many source addresses and ports it uses.
+/// one key may make together in one second, while the copy's current
+/// nonce has not carried a packet that passed the checks: every new
+/// session of a listening receiver and every candidate source of a
+/// listening sender draws on it. It bounds the CPU a flood of new nonces
+/// costs, and how often a forger, who needs no key and may pick a new
+/// nonce for every packet, gets a try at the checks, however many source
+/// addresses and ports it uses.
+///
+/// A copy whose current nonce passed the checks (an established session
+/// of a peer with the right passphrase) changes nonce under its own limit
+/// of [`MAX_RECEIVE_REKEYS_PER_SECOND`] only, so a flood from other sources
+/// can never hold up an established peer's nonce rotation. A forger gets
+/// such a copy only by the chance a wrong key passes the checks (or by
+/// replaying a correct peer's packet), and then only for one nonce change:
+/// that nonce's first packet fails the checks and the copy is back on this
+/// budget.
 pub const MAX_SHARED_RECEIVE_REKEYS_PER_SECOND: u32 = 64;
 /// Packets a transmit key encrypts under one nonce at most, whatever its
 /// `key_rotation` (also 0, no rotation): the AES-CTR counter comes from
@@ -166,6 +177,28 @@ impl PartialEq for SharedRekeyBudget {
 
 impl Eq for SharedRekeyBudget {}
 
+/// The AES key of one nonce, derived (PBKDF2) on first use: a transmit
+/// copy made for a new session derives nothing until the session sends,
+/// so sessions a flood of forged packets creates cost no derivation of
+/// their own. It is a function of the key size, passphrase and nonce,
+/// which equality already compares, so it never affects equality.
+#[derive(Clone, Default)]
+struct AesKeySlot(Option<Zeroizing<Vec<u8>>>);
+
+impl AesKeySlot {
+    fn is_derived(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+impl PartialEq for AesKeySlot {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for AesKeySlot {}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct PskKey {
     key_size: AesKeySize,
@@ -173,9 +206,9 @@ pub struct PskKey {
     nonce: [u8; 4],
     key_rotation: u64,
     used_times: u64,
-    aes_key: Zeroizing<Vec<u8>>,
+    aes_key: AesKeySlot,
     previous_nonce: Option<[u8; 4]>,
-    previous_aes_key: Option<Zeroizing<Vec<u8>>>,
+    previous_aes_key: AesKeySlot,
     rekey_window_start: Instant,
     rekeys_in_window: u8,
     nonce_health: [Option<NonceHealth>; TRACKED_NONCES],
@@ -226,23 +259,23 @@ impl PskKey {
         Ok(Self::build(key_size, password, key_rotation, nonce))
     }
 
-    /// A key with a fresh history and its own receive-wide budget.
+    /// A key with a fresh history and its own receive-wide budget. Its
+    /// AES key is derived on first use.
     fn build(
         key_size: AesKeySize,
         password: Zeroizing<Vec<u8>>,
         key_rotation: u64,
         nonce: [u8; 4],
     ) -> Self {
-        let aes_key = Zeroizing::new(derive_aes_key(key_size, &password, &nonce));
         Self {
             key_size,
             password,
             nonce,
             key_rotation,
             used_times: 0,
-            aes_key,
+            aes_key: AesKeySlot::default(),
             previous_nonce: None,
-            previous_aes_key: None,
+            previous_aes_key: AesKeySlot::default(),
             rekey_window_start: Instant::now(),
             rekeys_in_window: 0,
             nonce_health: [None; TRACKED_NONCES],
@@ -279,6 +312,9 @@ impl PskKey {
     /// different packets with the same keystream. Each one gets its own
     /// copy from here. A receiver takes any nonce from each sender, as
     /// librist does.
+    ///
+    /// The nonce is picked here; its AES key is derived on the first
+    /// encryption, so a session that never sends never derives one.
     pub fn fresh_sender_copy(&self) -> Self {
         let mut nonce = [0; 4];
         let mut fresh = false;
@@ -294,16 +330,15 @@ impl PskKey {
             // not secrecy, is what CTR needs from it).
             nonce = fallback_distinct_nonce(self.nonce);
         }
-        let aes_key = Zeroizing::new(derive_aes_key(self.key_size, &self.password, &nonce));
         Self {
             key_size: self.key_size,
             password: self.password.clone(),
             nonce,
             key_rotation: self.key_rotation,
             used_times: 0,
-            aes_key,
+            aes_key: AesKeySlot::default(),
             previous_nonce: None,
-            previous_aes_key: None,
+            previous_aes_key: AesKeySlot::default(),
             rekey_window_start: Instant::now(),
             rekeys_in_window: 0,
             nonce_health: [None; TRACKED_NONCES],
@@ -418,32 +453,71 @@ impl PskKey {
         self.nonce
     }
 
+    /// Whether this copy's current nonce carried a packet that passed the
+    /// checks and is not shut out: the copy is an established session of a
+    /// peer with the right passphrase (or, by the chance a wrong key passes
+    /// the checks, a forger's for one nonce).
+    fn current_nonce_proven(&self) -> bool {
+        self.nonce_health
+            .iter()
+            .flatten()
+            .any(|health| health.nonce == self.nonce && health.proven && !health.latched)
+    }
+
+    /// Makes `nonce` the receive nonce, deriving its AES key. Every change
+    /// counts against this copy's [`MAX_RECEIVE_REKEYS_PER_SECOND`]; while
+    /// the current nonce is not proven (see [`Self::current_nonce_proven`])
+    /// it also takes a slot of the receive-wide
+    /// [`MAX_SHARED_RECEIVE_REKEYS_PER_SECOND`].
     pub fn set_nonce(&mut self, nonce: [u8; 4]) -> Result<()> {
         if nonce == [0; 4] {
             return Err(Error::InvalidPskNonce);
         }
-        if self.nonce != nonce {
+        // A nonce whose key is not derived yet (a copy that has not used
+        // it) costs a derivation like any change, so it is counted as one.
+        if self.nonce != nonce || !self.aes_key.is_derived() {
             let now = Instant::now();
             if now.duration_since(self.rekey_window_start) >= Duration::from_secs(1) {
                 self.rekey_window_start = now;
                 self.rekeys_in_window = 0;
             }
             if self.rekeys_in_window >= MAX_RECEIVE_REKEYS_PER_SECOND
-                || !self.shared_rekeys.take(now)
+                || (!self.current_nonce_proven() && !self.shared_rekeys.take(now))
             {
                 return Err(Error::PskRekeyRateLimited);
             }
             self.rekeys_in_window += 1;
-            self.previous_nonce = (self.nonce != [0; 4]).then_some(self.nonce);
-            self.previous_aes_key = self
-                .previous_nonce
-                .map(|_| Zeroizing::new(self.aes_key.to_vec()));
+            if self.nonce != nonce {
+                let keep_previous = self.nonce != [0; 4] && self.aes_key.is_derived();
+                self.previous_nonce = keep_previous.then_some(self.nonce);
+                self.previous_aes_key = if keep_previous {
+                    std::mem::take(&mut self.aes_key)
+                } else {
+                    AesKeySlot::default()
+                };
+            }
             self.nonce = nonce;
-            self.aes_key =
-                Zeroizing::new(derive_aes_key(self.key_size, &self.password, &self.nonce));
+            self.aes_key = AesKeySlot(Some(Zeroizing::new(derive_aes_key(
+                self.key_size,
+                &self.password,
+                &self.nonce,
+            ))));
             self.used_times = 0;
         }
         Ok(())
+    }
+
+    /// The AES key of the current nonce, derived now if it has not been.
+    fn current_aes_key(&mut self) -> &[u8] {
+        let (key_size, password, nonce) = (self.key_size, &self.password, &self.nonce);
+        self.aes_key
+            .0
+            .get_or_insert_with(|| Zeroizing::new(derive_aes_key(key_size, password, nonce)))
+    }
+
+    /// Whether the AES key of the current nonce has been derived.
+    pub fn aes_key_derived(&self) -> bool {
+        self.aes_key.is_derived()
     }
 
     pub fn encrypt(&mut self, gre_version: u8, sequence: u32, input: &[u8]) -> Vec<u8> {
@@ -460,6 +534,7 @@ impl PskKey {
         if self.previous_nonce == Some(nonce) {
             let key = self
                 .previous_aes_key
+                .0
                 .as_ref()
                 .ok_or(Error::InvalidPskNonce)?;
             return Ok(crypt_with_key(
@@ -472,9 +547,10 @@ impl PskKey {
         }
         self.set_nonce(nonce)?;
         // A receive key follows the sender's nonce: it never rotates its own.
+        let key_size = self.key_size;
         Ok(crypt_with_key(
-            self.key_size,
-            &self.aes_key,
+            key_size,
+            self.current_aes_key(),
             gre_version,
             sequence,
             input,
@@ -494,12 +570,18 @@ impl PskKey {
     fn crypt(&mut self, gre_version: u8, sequence: u32, input: &[u8]) -> Vec<u8> {
         if self.used_times >= self.packets_per_nonce() {
             self.advance_nonce();
-            self.aes_key =
-                Zeroizing::new(derive_aes_key(self.key_size, &self.password, &self.nonce));
+            self.aes_key = AesKeySlot::default();
             self.used_times = 0;
         }
 
-        let out = crypt_with_key(self.key_size, &self.aes_key, gre_version, sequence, input);
+        let key_size = self.key_size;
+        let out = crypt_with_key(
+            key_size,
+            self.current_aes_key(),
+            gre_version,
+            sequence,
+            input,
+        );
         self.used_times += 1;
         out
     }
@@ -849,6 +931,146 @@ mod tests {
         late.set_nonce([8, 8, 8, 8]).unwrap();
         // It is not part of a key's identity.
         assert_eq!(template.fresh_copy(), template.fresh_copy());
+    }
+
+    /// Uses up the receive-wide budget of `template` with copies of it,
+    /// as a flood of new nonces from many sources would.
+    /// Holds every one-second window of `template` and its later copies
+    /// open, so a slow (debug, loaded) run never sees a window refill
+    /// part-way through a test.
+    fn freeze_windows(template: &mut PskKey) {
+        let far = Instant::now() + Duration::from_secs(3600);
+        template.rekey_window_start = far;
+        let mut window = template.shared_rekeys.0.lock().unwrap();
+        window.start = Some(far);
+        window.used = 0;
+    }
+
+    fn exhaust_shared_budget(template: &PskKey, next: &mut u32) {
+        // Each flood source is a fresh copy: its first change needs a
+        // slot of the shared budget, so the first refusal means it is used up.
+        for _ in 0..=MAX_SHARED_RECEIVE_REKEYS_PER_SECOND {
+            let mut flood = template.fresh_copy();
+            *next += 1;
+            if flood.set_nonce(next.to_be_bytes()).is_err() {
+                return;
+            }
+        }
+        panic!("the shared budget never ran out");
+    }
+
+    /// Review 3, defect 1: a copy whose current nonce passed the checks (an
+    /// established peer) changes nonce under its own per-session limit and
+    /// never waits on the receive-wide budget, so a flood of new nonces from
+    /// other sources cannot hold up its rotation. A copy whose current
+    /// nonce failed the checks is back on the shared budget at once.
+    #[test]
+    fn an_established_peer_rotates_while_a_flood_holds_the_shared_budget() {
+        let mut template = PskKey::receiver(128, b"secret").unwrap();
+        freeze_windows(&mut template);
+        let mut next = 0x1000_0000u32;
+
+        let mut established = template.fresh_copy();
+        established.set_nonce([1, 0, 0, 1]).unwrap();
+        established.record_verdict([1, 0, 0, 1], DecryptVerdict::Strong);
+
+        exhaust_shared_budget(&template, &mut next);
+
+        // A new session waits for the budget: a new peer's first packets
+        // can be delayed by the flood.
+        let mut newcomer = template.fresh_copy();
+        assert_eq!(
+            newcomer.set_nonce([2, 0, 0, 2]),
+            Err(Error::PskRekeyRateLimited)
+        );
+
+        // The established session rotates under its own limit (it used
+        // one change to start), each new nonce proven by its first packet.
+        for n in 2..=MAX_RECEIVE_REKEYS_PER_SECOND {
+            let nonce = [1, 0, 0, n];
+            established.set_nonce(nonce).unwrap();
+            established.record_verdict(nonce, DecryptVerdict::Strong);
+        }
+        // The per-session limit still holds.
+        assert_eq!(
+            established.set_nonce([1, 0, 0, 0xff]),
+            Err(Error::PskRekeyRateLimited)
+        );
+
+        // A forger's session whose nonce once passed by chance gets one
+        // change outside the budget; that nonce fails the checks, and the
+        // next change waits on the budget again.
+        let mut lucky = template.fresh_copy();
+        lucky.shared_rekeys.0.lock().unwrap().used = 0;
+        lucky.set_nonce([3, 0, 0, 1]).unwrap();
+        lucky.record_verdict([3, 0, 0, 1], DecryptVerdict::Strong);
+        exhaust_shared_budget(&template, &mut next);
+        lucky.set_nonce([3, 0, 0, 2]).unwrap();
+        lucky.record_verdict([3, 0, 0, 2], DecryptVerdict::Bad);
+        assert_eq!(
+            lucky.set_nonce([3, 0, 0, 3]),
+            Err(Error::PskRekeyRateLimited)
+        );
+        // Returning to the proven nonce is a change like any other (the
+        // previous nonce was the latched one), so it waits too.
+        assert_eq!(
+            lucky.set_nonce([3, 0, 0, 1]),
+            Err(Error::PskRekeyRateLimited)
+        );
+    }
+
+    /// Review 3, defect 2: a transmit copy for a new session picks its
+    /// nonce at once but derives its AES key only on its first
+    /// encryption, so a session that never sends costs no derivation; nor
+    /// does a receive key before its first nonce.
+    #[test]
+    fn copies_derive_their_aes_key_on_first_use_only() {
+        let base = PskKey::with_key_rotation(128, 3, b"secret").unwrap();
+        assert!(!base.aes_key_derived());
+        let rx_template = base.receiver_for();
+        assert!(!rx_template.aes_key_derived());
+        assert!(!PskKey::receiver(128, b"secret").unwrap().aes_key_derived());
+        assert!(!rx_template.sender_for().aes_key_derived());
+
+        let mut copy = base.fresh_sender_copy();
+        assert!(!copy.aes_key_derived());
+        assert_ne!(copy.nonce(), [0; 4]);
+        let nonce = copy.nonce();
+        let encrypted = copy.encrypt(2, 0, b"payload");
+        assert!(copy.aes_key_derived());
+        assert_eq!(copy.nonce(), nonce);
+        let mut rx = rx_template.fresh_copy();
+        assert_eq!(rx.decrypt(nonce, 2, 0, &encrypted).unwrap(), b"payload");
+        assert!(rx.aes_key_derived());
+
+        // A rotation picks the next nonce and derives it on that packet.
+        for sequence in 1..3 {
+            copy.encrypt(2, sequence, b"x");
+        }
+        let rotated = copy.encrypt(2, 3, b"rotated");
+        assert_ne!(copy.nonce(), nonce);
+        assert!(copy.aes_key_derived());
+        assert_eq!(
+            rx.decrypt(copy.nonce(), 2, 3, &rotated).unwrap(),
+            b"rotated"
+        );
+        // The receiver kept the key of the nonce before.
+        assert_eq!(rx.decrypt(nonce, 2, 0, &encrypted).unwrap(), b"payload");
+
+        // A key whose own nonce is not derived yet (one used both ways)
+        // pays for that nonce like any change: never a derivation outside
+        // the budget, even for packets that carry its nonce.
+        let mut template = PskKey::new(128, b"secret").unwrap();
+        freeze_windows(&mut template);
+        let own = template.nonce();
+        let mut next = 0x2000_0000u32;
+        exhaust_shared_budget(&template, &mut next);
+        let mut session = template.fresh_copy();
+        assert_eq!(
+            session.decrypt(own, 2, 0, b"anything"),
+            Err(Error::PskRekeyRateLimited)
+        );
+        assert!(!session.aes_key_derived());
     }
 
     #[test]
