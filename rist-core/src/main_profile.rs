@@ -1,25 +1,59 @@
 use crate::auth::EapolFrame;
 use crate::crypto::PskKey;
-use crate::endpoint::{CongestionControlMode, RecoveryConfig};
+use crate::endpoint::{CongestionControlMode, RecoveryConfig, RecoveryTuning};
 use crate::packet::gre::{
     decode_eapol_payload, decode_encrypted_buffer_negotiation_packet,
     decode_encrypted_keepalive_packet, decode_encrypted_reduced_packet, decode_main_packet,
     encode_buffer_negotiation_payload, encode_eapol_payload,
     encode_encrypted_buffer_negotiation_payload, encode_encrypted_keepalive_payload,
     encode_encrypted_oob_payload, encode_encrypted_reduced_payload, encode_keepalive_payload,
-    encode_oob_payload, encode_reduced_payload, BufferNegotiation, BufferNegotiationPacket,
-    GreHeader, GreKeepalive, KeepalivePacket, MainPacket, OwnedBufferNegotiationPacket,
-    OwnedKeepalivePacket, OwnedReducedPacket, ReducedHeader, ReducedPacket,
+    encode_oob_payload, encode_reduced_payload, reduced_header, BufferNegotiation,
+    BufferNegotiationPacket, GreHeader, GreKeepalive, KeepalivePacket, MainPacket,
+    OwnedBufferNegotiationPacket, OwnedKeepalivePacket, OwnedReducedPacket, ReducedHeader,
+    ReducedPacket,
 };
 use crate::packet::rtcp::NackMode;
 use crate::packet::rtp::RtpPacket;
 use crate::simple::{
     OutboundPacket, ReceivedPayload, SimpleReceiverCore, SimpleSenderCore, SimpleSenderPeerState,
+    MAX_NACK_PACKETS_PER_POLL,
 };
 use crate::stats::{ReceiverStats, SenderStats};
+use crate::time::ntp_now;
 use crate::Result;
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::time::{Duration, Instant};
+
+/// Hasher for the per-peer flow maps, keyed by flow id (the RTP SSRC with
+/// the retry bit cleared). The maps hold at most `max_flows` entries, so
+/// SipHash's flooding resistance buys nothing; this is one multiply.
+#[derive(Debug, Clone, Copy, Default)]
+struct FlowIdHasher(u64);
+
+impl Hasher for FlowIdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.write_u64(self.0.rotate_left(8) ^ u64::from(byte));
+        }
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.write_u64(u64::from(value));
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        let mixed = (self.0 ^ value).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        self.0 = mixed ^ (mixed >> 32);
+    }
+}
+
+type FlowMap<V> = HashMap<u32, V, BuildHasherDefault<FlowIdHasher>>;
 
 pub const DEFAULT_VIRT_SRC_PORT: u16 = 1971;
 pub const DEFAULT_VIRT_DST_PORT: u16 = 1968;
@@ -94,6 +128,12 @@ impl MainSessionTimers {
         self.last_peer_activity
     }
 
+    /// When [`Self::poll`] next reports a keepalive as due (`None` before
+    /// the first poll arms the timer).
+    pub fn next_keepalive_at(&self) -> Option<Instant> {
+        self.next_keepalive
+    }
+
     pub fn is_timed_out(&self, now: Instant) -> bool {
         self.peer_timed_out(now)
     }
@@ -149,12 +189,31 @@ fn elapsed_at_least(now: Instant, then: Instant, duration: Duration) -> bool {
         .unwrap_or(false)
 }
 
+/// What [`MainSenderCore::send_payload_with`] sent: the datagram's
+/// sequences and length, without its bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MainPacketMeta {
+    pub rtp_sequence: u32,
+    pub gre_sequence: u32,
+    pub retry: bool,
+    /// The datagram's length in bytes.
+    pub len: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MainOutboundPacket {
     pub rtp_sequence: u32,
     pub gre_sequence: u32,
     pub retry: bool,
     pub bytes: Vec<u8>,
+}
+
+/// What a Main sender owes the peer for one feedback compound: echo
+/// responses (send first) and retransmissions, each wrapped in reduced GRE.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MainFeedbackOutcome {
+    pub retries: Vec<MainOutboundPacket>,
+    pub responses: Vec<MainControlPacket>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,6 +239,11 @@ pub struct MainSenderPeerState {
 impl MainSenderPeerState {
     pub fn stats(&self) -> SenderStats {
         self.simple.stats()
+    }
+
+    /// When a duplicate repair for this peer is next due.
+    pub fn next_repair_at(&self) -> Option<Instant> {
+        self.simple.next_repair_at()
     }
 
     pub fn set_tx_key(&mut self, key: PskKey) {
@@ -232,6 +296,19 @@ impl MainSenderCore {
     ) {
         self.simple
             .set_recovery_config(recovery, congestion_control);
+    }
+
+    pub fn set_recovery_tuning(&mut self, tuning: RecoveryTuning) {
+        self.simple.set_recovery_tuning(tuning);
+    }
+
+    pub fn with_recovery_tuning(mut self, tuning: RecoveryTuning) -> Self {
+        self.set_recovery_tuning(tuning);
+        self
+    }
+
+    pub fn recovery_tuning(&self) -> RecoveryTuning {
+        self.simple.recovery_tuning()
     }
 
     pub fn with_gre_version(mut self, gre_version: u8) -> Self {
@@ -294,8 +371,83 @@ impl MainSenderCore {
         ntp_timestamp: u64,
         now: Instant,
     ) -> MainOutboundPacket {
-        let packet = self.prepare_payload(payload, ntp_timestamp, now);
-        self.wrap_rtp(packet.sequence, packet.retry, &packet.bytes)
+        self.send_payload_with(payload, ntp_timestamp, now, |meta, head, body| {
+            let mut bytes = Vec::with_capacity(meta.len);
+            bytes.extend_from_slice(head);
+            bytes.extend_from_slice(body);
+            MainOutboundPacket {
+                rtp_sequence: meta.rtp_sequence,
+                gre_sequence: meta.gre_sequence,
+                retry: false,
+                bytes,
+            }
+        })
+    }
+
+    /// [`Self::send_payload`] without an owned packet: `send` gets the
+    /// datagram as two parts to send back to back (`head` then `body`).
+    /// Unencrypted, `head` is the GRE header on the stack and `body` the RTP
+    /// packet in its send-history slot, so the payload is copied once and
+    /// nothing is allocated once the history is warm. With a PSK, `head` is
+    /// the whole encrypted datagram and `body` is empty.
+    pub fn send_payload_with<R>(
+        &mut self,
+        payload: &[u8],
+        ntp_timestamp: u64,
+        now: Instant,
+        send: impl FnOnce(MainPacketMeta, &[u8], &[u8]) -> R,
+    ) -> R {
+        let gre_sequence = self.next_gre_sequence();
+        let gre_version = self.gre_version;
+        let reduced = ReducedHeader {
+            src_port: self.virt_src_port,
+            dst_port: self.virt_dst_port,
+        };
+        let tx_key = &mut self.tx_key;
+        self.simple
+            .send_payload_with(payload, ntp_timestamp, now, |rtp_sequence, rtp| {
+                if let Some(key) = tx_key {
+                    let bytes = encode_encrypted_reduced_payload(
+                        gre_version,
+                        gre_sequence,
+                        reduced,
+                        rtp,
+                        key,
+                    );
+                    let meta = MainPacketMeta {
+                        rtp_sequence,
+                        gre_sequence,
+                        retry: false,
+                        len: bytes.len(),
+                    };
+                    return send(meta, &bytes, &[]);
+                }
+                let header = reduced_header(gre_version, gre_sequence, reduced);
+                let meta = MainPacketMeta {
+                    rtp_sequence,
+                    gre_sequence,
+                    retry: false,
+                    len: header.as_slice().len() + rtp.len(),
+                };
+                send(meta, header.as_slice(), rtp)
+            })
+    }
+
+    /// [`Self::send_payload_with`] into `out`, which is cleared first: the
+    /// whole datagram in a buffer the caller reuses.
+    pub fn send_payload_into(
+        &mut self,
+        payload: &[u8],
+        ntp_timestamp: u64,
+        now: Instant,
+        out: &mut Vec<u8>,
+    ) -> MainPacketMeta {
+        self.send_payload_with(payload, ntp_timestamp, now, |meta, head, body| {
+            out.clear();
+            out.extend_from_slice(head);
+            out.extend_from_slice(body);
+            meta
+        })
     }
 
     pub fn prepare_payload(
@@ -330,16 +482,41 @@ impl MainSenderCore {
         self.handle_reduced_feedback(packet.reduced(), packet.payload())
     }
 
+    /// Retransmissions for one feedback compound. Echo requests in it are
+    /// not answered; use [`Self::handle_reduced_feedback_outcome`].
     pub fn handle_reduced_feedback(
+        &mut self,
+        reduced: ReducedHeader,
+        payload: &[u8],
+    ) -> Result<Vec<MainOutboundPacket>> {
+        Ok(self
+            .handle_reduced_feedback_outcome(reduced, payload, ntp_now(), Instant::now())?
+            .retries)
+    }
+
+    /// Handles one feedback compound: RTT samples from echo responses,
+    /// answers to echo requests and retransmissions, all wrapped.
+    pub fn handle_reduced_feedback_outcome(
         &mut self,
         _reduced: ReducedHeader,
         payload: &[u8],
-    ) -> Result<Vec<MainOutboundPacket>> {
-        let retries = self.simple.handle_feedback(payload)?;
-        Ok(retries
+        now_ntp: u64,
+        now: Instant,
+    ) -> Result<MainFeedbackOutcome> {
+        let outcome = self
+            .simple
+            .handle_feedback_outcome_at(payload, now_ntp, now)?;
+        let responses = outcome
+            .responses
+            .iter()
+            .map(|response| self.wrap_control_payload(response))
+            .collect();
+        let retries = outcome
+            .retries
             .into_iter()
             .map(|retry| self.wrap_rtp(retry.sequence, true, &retry.bytes))
-            .collect())
+            .collect();
+        Ok(MainFeedbackOutcome { retries, responses })
     }
 
     pub fn handle_feedback_for_peer(
@@ -356,13 +533,116 @@ impl MainSenderCore {
         state: &mut MainSenderPeerState,
         payload: &[u8],
     ) -> Result<Vec<MainOutboundPacket>> {
-        let retries = self
-            .simple
-            .handle_feedback_for_peer(&mut state.simple, payload)?;
-        Ok(retries
+        Ok(self
+            .handle_reduced_feedback_outcome_for_peer(state, payload, ntp_now(), Instant::now())?
+            .retries)
+    }
+
+    /// [`Self::handle_reduced_feedback_outcome`] for one peer of a
+    /// multi-peer sender.
+    pub fn handle_reduced_feedback_outcome_for_peer(
+        &self,
+        state: &mut MainSenderPeerState,
+        payload: &[u8],
+        now_ntp: u64,
+        now: Instant,
+    ) -> Result<MainFeedbackOutcome> {
+        let outcome = self.simple.handle_feedback_outcome_for_peer_at(
+            &mut state.simple,
+            payload,
+            now_ntp,
+            now,
+        )?;
+        let responses = outcome
+            .responses
+            .iter()
+            .map(|response| self.wrap_control_for_peer(state, response))
+            .collect();
+        let retries = outcome
+            .retries
             .into_iter()
             .map(|retry| self.wrap_rtp_for_peer(state, retry.sequence, true, &retry.bytes))
-            .collect())
+            .collect();
+        Ok(MainFeedbackOutcome { retries, responses })
+    }
+
+    /// Repairs the sender sends on its own, due at `now` (see
+    /// [`SimpleSenderCore::poll_repairs_at`]), wrapped.
+    pub fn poll_repairs(&mut self, now: Instant) -> Vec<MainOutboundPacket> {
+        self.simple
+            .poll_repairs_at(now)
+            .into_iter()
+            .map(|repair| self.wrap_rtp(repair.sequence, true, &repair.bytes))
+            .collect()
+    }
+
+    /// [`Self::poll_repairs`], at most `limit` of them (see
+    /// [`SimpleSenderCore::poll_repairs_limited_at`]).
+    pub fn poll_repairs_limited(&mut self, now: Instant, limit: usize) -> Vec<MainOutboundPacket> {
+        self.simple
+            .poll_repairs_limited_at(now, limit)
+            .into_iter()
+            .map(|repair| self.wrap_rtp(repair.sequence, true, &repair.bytes))
+            .collect()
+    }
+
+    /// Drops the repairs due at `now` unsent (see
+    /// [`SimpleSenderCore::discard_due_repairs_at`]).
+    pub fn discard_due_repairs(&mut self, now: Instant) -> usize {
+        self.simple.discard_due_repairs_at(now)
+    }
+
+    /// Takes back a retransmission of RTP sequence `rtp_sequence` that
+    /// could not be sent (see [`SimpleSenderCore::retransmit_not_sent`]).
+    pub fn retransmit_not_sent(&mut self, rtp_sequence: u32) {
+        self.simple.retransmit_not_sent(rtp_sequence);
+    }
+
+    /// [`Self::retransmit_not_sent`] for one peer of a multi-peer sender.
+    pub fn retransmit_not_sent_for_peer(&self, state: &mut MainSenderPeerState, rtp_sequence: u32) {
+        self.simple
+            .retransmit_not_sent_for_peer(&mut state.simple, rtp_sequence);
+    }
+
+    /// [`Self::poll_repairs`] for one peer of a multi-peer sender.
+    pub fn poll_repairs_for_peer(
+        &self,
+        state: &mut MainSenderPeerState,
+        now: Instant,
+    ) -> Vec<MainOutboundPacket> {
+        self.poll_repairs_for_peer_limited(state, now, usize::MAX)
+    }
+
+    /// [`Self::poll_repairs_limited`] for one peer of a multi-peer sender.
+    pub fn poll_repairs_for_peer_limited(
+        &self,
+        state: &mut MainSenderPeerState,
+        now: Instant,
+        limit: usize,
+    ) -> Vec<MainOutboundPacket> {
+        self.simple
+            .poll_repairs_for_peer_limited_at(&mut state.simple, now, limit)
+            .into_iter()
+            .map(|repair| self.wrap_rtp_for_peer(state, repair.sequence, true, &repair.bytes))
+            .collect()
+    }
+
+    /// [`Self::discard_due_repairs`] for one peer of a multi-peer sender.
+    pub fn discard_due_repairs_for_peer(
+        &self,
+        state: &mut MainSenderPeerState,
+        now: Instant,
+    ) -> usize {
+        self.simple
+            .discard_due_repairs_for_peer_at(&mut state.simple, now)
+    }
+
+    pub fn next_repair_at(&self) -> Option<Instant> {
+        self.simple.next_repair_at()
+    }
+
+    pub fn next_rtcp_at(&self) -> Option<Instant> {
+        self.simple.next_rtcp_at()
     }
 
     pub fn poll_rtcp(&mut self, now: Instant, ntp_timestamp: u64) -> Option<MainControlPacket> {
@@ -644,14 +924,17 @@ pub struct MainReceiverCore {
     primary_flow_id: u32,
     cname: String,
     nack_mode: NackMode,
-    flows: HashMap<u32, SimpleReceiverCore>,
+    flows: FlowMap<SimpleReceiverCore>,
+    /// Flow ids in ascending order (flows are never removed).
+    flow_order: Vec<u32>,
     max_flows: usize,
     recovery: RecoveryConfig,
     congestion_control: CongestionControlMode,
+    tuning: RecoveryTuning,
     gre_version: u8,
     next_gre_sequence: u32,
     last_reduced: Option<ReducedHeader>,
-    flow_reduced: HashMap<u32, ReducedHeader>,
+    flow_reduced: FlowMap<ReducedHeader>,
     tx_key: Option<PskKey>,
     rx_key: Option<PskKey>,
 }
@@ -659,7 +942,7 @@ pub struct MainReceiverCore {
 impl MainReceiverCore {
     pub fn new(flow_id: u32, cname: impl Into<String>, nack_mode: NackMode) -> Self {
         let cname = cname.into();
-        let mut flows = HashMap::new();
+        let mut flows = FlowMap::default();
         flows.insert(
             flow_id,
             SimpleReceiverCore::new(flow_id, cname.clone(), nack_mode),
@@ -669,13 +952,15 @@ impl MainReceiverCore {
             cname,
             nack_mode,
             flows,
+            flow_order: vec![flow_id],
             max_flows: DEFAULT_MAIN_FLOWS_PER_PEER,
             recovery: RecoveryConfig::default(),
             congestion_control: CongestionControlMode::default(),
+            tuning: RecoveryTuning::default(),
             gre_version: 1,
             next_gre_sequence: 0,
             last_reduced: None,
-            flow_reduced: HashMap::new(),
+            flow_reduced: FlowMap::default(),
             tx_key: None,
             rx_key: None,
         }
@@ -696,6 +981,31 @@ impl MainReceiverCore {
         }
         self.recovery = recovery;
         self.congestion_control = congestion_control;
+    }
+
+    pub fn with_recovery_tuning(mut self, tuning: RecoveryTuning) -> Self {
+        self.set_recovery_tuning(tuning);
+        self
+    }
+
+    /// Applies `tuning` to every flow, present and future.
+    pub fn set_recovery_tuning(&mut self, tuning: RecoveryTuning) {
+        for flow in self.flows.values_mut() {
+            flow.set_recovery_tuning(tuning);
+        }
+        self.tuning = tuning;
+    }
+
+    pub fn recovery_tuning(&self) -> RecoveryTuning {
+        self.tuning
+    }
+
+    /// The earliest [`SimpleReceiverCore::next_poll_at`] of all flows.
+    pub fn next_poll_at(&self) -> Option<Instant> {
+        self.flows
+            .values()
+            .filter_map(SimpleReceiverCore::next_poll_at)
+            .min()
     }
 
     pub fn with_tx_key(mut self, key: PskKey) -> Self {
@@ -730,6 +1040,7 @@ impl MainReceiverCore {
         let mut session = Self::new(self.primary_flow_id, self.cname.clone(), self.nack_mode)
             .with_gre_version(self.gre_version);
         session.set_recovery_config(self.recovery.clone(), self.congestion_control);
+        session.set_recovery_tuning(self.tuning);
         session.max_flows = self.max_flows;
         if let Some(key) = &self.tx_key {
             session.set_tx_key(key.clone());
@@ -750,12 +1061,24 @@ impl MainReceiverCore {
         reduced: ReducedHeader,
         payload: &[u8],
     ) -> Result<ReceivedPayload> {
+        self.accept_reduced_at(reduced, payload, Instant::now())
+    }
+
+    /// [`Self::accept_reduced`] with the caller's clock reading.
+    pub fn accept_reduced_at(
+        &mut self,
+        reduced: ReducedHeader,
+        payload: &[u8],
+        now: Instant,
+    ) -> Result<ReceivedPayload> {
         self.last_reduced = Some(reduced);
         let mut packet = RtpPacket::decode(payload)?;
+        let retry = packet.header.ssrc & 1 == 1;
         let flow_id = packet.header.ssrc & !1;
         packet.header.ssrc = flow_id;
         self.flow_reduced.insert(flow_id, reduced);
-        self.flow_mut(flow_id)?.accept_rtp_packet(packet)
+        self.flow_mut(flow_id)?
+            .accept_rtp_packet_with_retry_at(packet, retry, now)
     }
 
     pub fn build_feedback(&mut self) -> MainReceiverFeedback {
@@ -781,26 +1104,59 @@ impl MainReceiverCore {
         now: Instant,
         now_ntp: u64,
     ) -> Vec<(u32, MainReceiverFeedback)> {
-        let flow_ids = self.flow_ids();
         let mut due = Vec::new();
-        for flow_id in flow_ids {
-            if let Some(packet) = self
-                .flows
+        self.poll_rtcp_all_with(now, now_ntp, |flow_id, feedback| {
+            due.push((flow_id, feedback));
+            true
+        });
+        due
+    }
+
+    /// [`Self::poll_rtcp_all`] for a transport that sends each packet as it
+    /// is built: `send` puts one wrapped packet of a flow on the wire and
+    /// returns whether it went out. Flows are polled in ascending flow-id
+    /// order, each for up to [`MAX_NACK_PACKETS_PER_POLL`] packets. Holes
+    /// count as requested only once `send` accepted their packet (see
+    /// [`SimpleReceiverCore::poll_rtcp_with`]). After the first refusal no
+    /// further packet is built: the refused packet's holes and every later
+    /// due hole stay due for the next poll. Returns the number of packets
+    /// `send` accepted.
+    pub fn poll_rtcp_all_with<F>(&mut self, now: Instant, now_ntp: u64, mut send: F) -> usize
+    where
+        F: FnMut(u32, MainReceiverFeedback) -> bool,
+    {
+        let Self {
+            flows,
+            flow_order,
+            flow_reduced,
+            gre_version,
+            next_gre_sequence,
+            tx_key,
+            ..
+        } = self;
+        let mut accepted = 0;
+        let mut refused = false;
+        for &flow_id in flow_order.iter() {
+            if refused {
+                break;
+            }
+            let reduced = reply_reduced(flow_reduced.get(&flow_id).copied());
+            accepted += flows
                 .get_mut(&flow_id)
                 .expect("listed Main receiver flow must exist")
-                .poll_rtcp(now, now_ntp)
-            {
-                due.push((flow_id, packet));
-            }
+                .poll_rtcp_with(now, now_ntp, MAX_NACK_PACKETS_PER_POLL, |packet| {
+                    let feedback = wrap_receiver_feedback(
+                        *gre_version,
+                        next_gre_sequence,
+                        tx_key,
+                        reduced,
+                        packet,
+                    );
+                    refused = !send(flow_id, feedback);
+                    !refused
+                });
         }
-        due.into_iter()
-            .map(|(flow_id, packet)| {
-                (
-                    flow_id,
-                    self.wrap_feedback_payload_for_flow(flow_id, &packet),
-                )
-            })
-            .collect()
+        accepted
     }
 
     pub fn handle_rtcp(
@@ -829,16 +1185,7 @@ impl MainReceiverCore {
     }
 
     fn wrap_feedback_payload(&mut self, feedback: &[u8]) -> MainReceiverFeedback {
-        let reduced = self
-            .last_reduced
-            .map(|reduced| ReducedHeader {
-                src_port: reduced.dst_port,
-                dst_port: reduced.src_port,
-            })
-            .unwrap_or(ReducedHeader {
-                src_port: DEFAULT_VIRT_DST_PORT,
-                dst_port: DEFAULT_VIRT_SRC_PORT,
-            });
+        let reduced = reply_reduced(self.last_reduced);
         self.wrap_feedback_with_reduced(reduced, feedback)
     }
 
@@ -847,18 +1194,7 @@ impl MainReceiverCore {
         flow_id: u32,
         feedback: &[u8],
     ) -> MainReceiverFeedback {
-        let reduced = self
-            .flow_reduced
-            .get(&flow_id)
-            .copied()
-            .map(|reduced| ReducedHeader {
-                src_port: reduced.dst_port,
-                dst_port: reduced.src_port,
-            })
-            .unwrap_or(ReducedHeader {
-                src_port: DEFAULT_VIRT_DST_PORT,
-                dst_port: DEFAULT_VIRT_SRC_PORT,
-            });
+        let reduced = reply_reduced(self.flow_reduced.get(&flow_id).copied());
         self.wrap_feedback_with_reduced(reduced, feedback)
     }
 
@@ -867,16 +1203,13 @@ impl MainReceiverCore {
         reduced: ReducedHeader,
         feedback: &[u8],
     ) -> MainReceiverFeedback {
-        let gre_sequence = self.next_gre_sequence();
-        let bytes = if let Some(key) = &mut self.tx_key {
-            encode_encrypted_reduced_payload(self.gre_version, gre_sequence, reduced, feedback, key)
-        } else {
-            encode_reduced_payload(self.gre_version, gre_sequence, reduced, feedback)
-        };
-        MainReceiverFeedback {
-            gre_sequence,
-            bytes,
-        }
+        wrap_receiver_feedback(
+            self.gre_version,
+            &mut self.next_gre_sequence,
+            &mut self.tx_key,
+            reduced,
+            feedback,
+        )
     }
 
     pub fn build_keepalive(&mut self, keepalive: GreKeepalive<'_>) -> MainControlPacket {
@@ -989,9 +1322,7 @@ impl MainReceiverCore {
     }
 
     pub fn flow_ids(&self) -> Vec<u32> {
-        let mut flow_ids = self.flows.keys().copied().collect::<Vec<_>>();
-        flow_ids.sort_unstable();
-        flow_ids
+        self.flow_order.clone()
     }
 
     pub fn stats_for_flow(&self, flow_id: u32) -> Option<ReceiverStats> {
@@ -1011,22 +1342,24 @@ impl MainReceiverCore {
     }
 
     fn flow_mut(&mut self, flow_id: u32) -> Result<&mut SimpleReceiverCore> {
-        if !self.flows.contains_key(&flow_id) {
-            if self.flows.len() >= self.max_flows {
-                return Err(crate::Error::MainFlowCapacityExceeded {
-                    maximum: self.max_flows,
-                });
+        let flows = self.flows.len();
+        match self.flows.entry(flow_id) {
+            Entry::Occupied(entry) => Ok(entry.into_mut()),
+            Entry::Vacant(entry) => {
+                if flows >= self.max_flows {
+                    return Err(crate::Error::MainFlowCapacityExceeded {
+                        maximum: self.max_flows,
+                    });
+                }
+                let position = self.flow_order.partition_point(|id| *id < flow_id);
+                self.flow_order.insert(position, flow_id);
+                Ok(entry.insert(
+                    SimpleReceiverCore::new(flow_id, self.cname.clone(), self.nack_mode)
+                        .with_recovery_config(self.recovery.clone(), self.congestion_control)
+                        .with_recovery_tuning(self.tuning),
+                ))
             }
-            self.flows.insert(
-                flow_id,
-                SimpleReceiverCore::new(flow_id, self.cname.clone(), self.nack_mode)
-                    .with_recovery_config(self.recovery.clone(), self.congestion_control),
-            );
         }
-        Ok(self
-            .flows
-            .get_mut(&flow_id)
-            .expect("RIST Main receiver flow must exist"))
     }
 
     fn decode_reduced<'a>(&mut self, packet: &'a [u8]) -> Result<DecodedReduced<'a>> {
@@ -1068,6 +1401,40 @@ impl DecodedReduced<'_> {
     }
 }
 
+/// Wraps one receiver RTCP compound in a reduced-overhead GRE packet (and
+/// encrypts it with `tx_key`), consuming one GRE sequence.
+fn wrap_receiver_feedback(
+    gre_version: u8,
+    next_gre_sequence: &mut u32,
+    tx_key: &mut Option<PskKey>,
+    reduced: ReducedHeader,
+    feedback: &[u8],
+) -> MainReceiverFeedback {
+    let gre_sequence = *next_gre_sequence;
+    *next_gre_sequence = gre_sequence.wrapping_add(1);
+    let bytes = if let Some(key) = tx_key {
+        encode_encrypted_reduced_payload(gre_version, gre_sequence, reduced, feedback, key)
+    } else {
+        encode_reduced_payload(gre_version, gre_sequence, reduced, feedback)
+    };
+    MainReceiverFeedback {
+        gre_sequence,
+        bytes,
+    }
+}
+
+fn reply_reduced(flow_reduced: Option<ReducedHeader>) -> ReducedHeader {
+    flow_reduced
+        .map(|reduced| ReducedHeader {
+            src_port: reduced.dst_port,
+            dst_port: reduced.src_port,
+        })
+        .unwrap_or(ReducedHeader {
+            src_port: DEFAULT_VIRT_DST_PORT,
+            dst_port: DEFAULT_VIRT_SRC_PORT,
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1084,6 +1451,60 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn send_payload_with_sends_the_same_datagram_from_the_history_slot() {
+        let now = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut owned = MainSenderCore::new(0x1122_3344, 64).with_gre_version(2);
+        let mut borrowed = MainSenderCore::new(0x1122_3344, 64).with_gre_version(2);
+        let mut out = Vec::new();
+        for n in 0..100u32 {
+            let payload = vec![n as u8; 1_316];
+            let expected = owned.send_payload(&payload, ntp, now);
+            let meta = if n % 2 == 0 {
+                borrowed.send_payload_with(&payload, ntp, now, |meta, head, body| {
+                    out.clear();
+                    out.extend_from_slice(head);
+                    out.extend_from_slice(body);
+                    // GRE (8), VSF (4), ports (4); the RTP packet apart.
+                    assert_eq!(head.len(), 16);
+                    assert_eq!(body.len(), 12 + 1_316);
+                    meta
+                })
+            } else {
+                borrowed.send_payload_into(&payload, ntp, now, &mut out)
+            };
+            assert_eq!(out, expected.bytes, "packet {n}");
+            assert_eq!(meta.rtp_sequence, expected.rtp_sequence);
+            assert_eq!(meta.gre_sequence, expected.gre_sequence);
+            assert_eq!(meta.len, expected.bytes.len());
+            assert!(!meta.retry);
+        }
+        assert_eq!(borrowed.stats().sent_packets, 100);
+        assert_eq!(borrowed.stats().sent_bytes, owned.stats().sent_bytes);
+    }
+
+    #[test]
+    fn send_payload_with_encrypts_into_one_part() {
+        let now = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut sender =
+            MainSenderCore::new(0x1122_3344, 64).with_tx_key(PskKey::new(256, b"secret").unwrap());
+        let mut receiver = MainReceiverCore::new(0x1122_3344, "rust", NackMode::Range)
+            .with_rx_key(PskKey::receiver(256, b"secret").unwrap());
+        for n in 0..3u8 {
+            let datagram = sender.send_payload_with(&[n; 188], ntp, now, |meta, head, body| {
+                assert!(body.is_empty());
+                assert_eq!(meta.len, head.len());
+                head.to_vec()
+            });
+            assert!(GreHeader::decode(&datagram).unwrap().0.key.is_some());
+            let received = receiver.accept_packet(&datagram).unwrap();
+            assert_eq!(received.sequence, u32::from(n));
+            assert_eq!(received.payload, vec![n; 188]);
+        }
+    }
+
+    #[test]
     fn main_profile_wraps_rtp_in_reduced_gre() {
         let now = Instant::now();
         let ntp = ntp_from_unix_duration(Duration::from_secs(1));
@@ -1097,6 +1518,18 @@ mod tests {
         assert_eq!(decoded.reduced.dst_port, DEFAULT_VIRT_DST_PORT);
         assert_eq!(decoded.payload[0], 0x80);
         assert_eq!(decoded.payload[1], 0x21);
+    }
+
+    #[test]
+    fn main_sender_clears_the_retry_bit_of_an_odd_flow_id() {
+        let now = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut sender = MainSenderCore::new(0x1122_3345, 64);
+        let packet = sender.send_payload(b"payload", ntp, now);
+        let decoded = ReducedPacket::decode(&packet.bytes).unwrap();
+        let rtp = RtpPacket::decode(decoded.payload).unwrap();
+        assert_eq!(rtp.header.ssrc, 0x1122_3344);
+        assert_eq!(sender.stats().flow_id, 0x1122_3344);
     }
 
     #[test]
@@ -1216,6 +1649,101 @@ mod tests {
     }
 
     #[test]
+    fn main_poll_rtcp_all_sends_every_due_nack_packet_per_flow_in_flow_order() {
+        let start = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut receiver = MainReceiverCore::new(0x10, "rust", NackMode::Range)
+            .with_recovery_tuning(RecoveryTuning {
+                measure_rtt: false,
+                ..RecoveryTuning::librist_like()
+            });
+        let mut senders =
+            [0x30_u32, 0x10, 0x20].map(|ssrc| (ssrc, MainSenderCore::new(ssrc, 4096)));
+        for (_, sender) in &mut senders {
+            for index in 0..=1_000_u32 {
+                let packet = sender.send_payload(&index.to_be_bytes(), ntp, start);
+                if index % 2 == 0 {
+                    receiver.accept_packet(&packet.bytes).unwrap();
+                }
+            }
+        }
+        assert_eq!(receiver.flow_ids(), vec![0x10, 0x20, 0x30]);
+        // Every hole was detected after `start`: none is due yet.
+        let now = start;
+        assert!(receiver.poll_rtcp_all(now, ntp).is_empty());
+        let due = receiver.poll_rtcp_all(Instant::now() + Duration::from_millis(20), ntp);
+        // 500 isolated holes per flow: 3 packets of at most 200 records each.
+        let flows = due.iter().map(|(flow_id, _)| *flow_id).collect::<Vec<_>>();
+        assert_eq!(
+            flows,
+            vec![0x10, 0x10, 0x10, 0x20, 0x20, 0x20, 0x30, 0x30, 0x30]
+        );
+        for (ssrc, sender) in &mut senders {
+            let mut retries = 0;
+            let mut first = None;
+            for (_, feedback) in due.iter().filter(|(flow_id, _)| flow_id == ssrc) {
+                let packets = sender.handle_feedback(&feedback.bytes).unwrap();
+                first.get_or_insert(packets[0].rtp_sequence);
+                retries += packets.len();
+            }
+            assert_eq!(retries, 500, "flow {ssrc:#x}");
+            assert_eq!(first, Some(1), "oldest hole first");
+            let stats = receiver.stats_for_flow(*ssrc).unwrap();
+            assert_eq!(stats.nack_packets, 3);
+            assert_eq!(stats.nack_entries_sent, 500);
+        }
+    }
+
+    #[test]
+    fn main_poll_rtcp_all_with_stops_at_a_refused_send_and_keeps_holes_due() {
+        let start = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut receiver = MainReceiverCore::new(0x10, "rust", NackMode::Range)
+            .with_recovery_tuning(RecoveryTuning {
+                measure_rtt: false,
+                ..RecoveryTuning::librist_like()
+            });
+        for ssrc in [0x10_u32, 0x20] {
+            let mut sender = MainSenderCore::new(ssrc, 4096);
+            for index in 0..=1_000_u32 {
+                let packet = sender.send_payload(&index.to_be_bytes(), ntp, start);
+                if index % 2 == 0 {
+                    receiver.accept_packet(&packet.bytes).unwrap();
+                }
+            }
+        }
+        let now = start;
+        assert!(receiver.poll_rtcp_all(now, ntp).is_empty());
+        let first_poll = Instant::now() + Duration::from_millis(20);
+        // Accept the first packet of flow 0x10, refuse the second.
+        let mut offered = Vec::new();
+        let accepted = receiver.poll_rtcp_all_with(first_poll, ntp, |flow_id, _| {
+            offered.push(flow_id);
+            offered.len() == 1
+        });
+        assert_eq!(accepted, 1);
+        assert_eq!(offered, vec![0x10, 0x10], "nothing offered after a refusal");
+        let stats = receiver.stats_for_flow(0x10).unwrap();
+        assert_eq!(stats.nack_packets, 1);
+        assert_eq!(stats.nack_entries_sent, 200);
+        assert_eq!(stats.nack_entries_deferred, 300);
+        assert_eq!(receiver.stats_for_flow(0x20).unwrap().nack_packets, 0);
+
+        // The next poll requests the refused holes and the untouched flow.
+        let due = receiver.poll_rtcp_all(first_poll + Duration::from_millis(20), ntp);
+        let flows = due.iter().map(|(flow_id, _)| *flow_id).collect::<Vec<_>>();
+        assert_eq!(flows, vec![0x10, 0x10, 0x10, 0x20, 0x20, 0x20]);
+        assert_eq!(
+            receiver.stats_for_flow(0x10).unwrap().nack_entries_sent,
+            200 + 500
+        );
+        assert_eq!(
+            receiver.stats_for_flow(0x20).unwrap().nack_entries_sent,
+            500
+        );
+    }
+
+    #[test]
     fn main_profile_normalizes_librist_retry_ssrc_bit() {
         let now = Instant::now();
         let ntp = ntp_from_unix_duration(Duration::from_secs(1));
@@ -1242,6 +1770,113 @@ mod tests {
         assert_eq!(recovered.payload, b"lost");
         assert!(receiver.missing_sequences().is_empty());
         assert_eq!(receiver.stats().recovered_packets, 1);
+    }
+
+    #[test]
+    fn main_sender_answers_echo_request_through_reduced_gre() {
+        let now = Instant::now();
+        let request_ntp = ntp_from_unix_duration(Duration::from_secs(9));
+        let mut sender = MainSenderCore::new(0x1122_3344, 64);
+        let mut request = Vec::new();
+        crate::packet::rtcp::encode_empty_receiver_report(0x1122_3344, &mut request);
+        crate::packet::rtcp::encode_echo(
+            Echo {
+                ssrc: 0x1122_3344,
+                ntp_timestamp: request_ntp,
+                kind: EchoKind::Request,
+            },
+            &mut request,
+        );
+        let reduced = ReducedHeader {
+            src_port: DEFAULT_VIRT_DST_PORT,
+            dst_port: DEFAULT_VIRT_SRC_PORT,
+        };
+        let outcome = sender
+            .handle_reduced_feedback_outcome(reduced, &request, request_ntp, now)
+            .unwrap();
+        assert!(outcome.retries.is_empty());
+        assert_eq!(outcome.responses.len(), 1);
+        let decoded = ReducedPacket::decode(&outcome.responses[0].bytes).unwrap();
+        assert_eq!(decoded.reduced.src_port, DEFAULT_VIRT_SRC_PORT);
+        assert!(decode_compound(decoded.payload)
+            .unwrap()
+            .contains(&RtcpPacket::Echo(Echo {
+                ssrc: 0x1122_3344,
+                ntp_timestamp: request_ntp,
+                kind: EchoKind::Response { delay: 0 },
+            })));
+    }
+
+    #[test]
+    fn main_duplicate_repairs_are_wrapped_and_marked() {
+        let t = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut sender = MainSenderCore::new(0x1122_3344, 64);
+        let mut receiver = MainReceiverCore::new(0x1122_3344, "rust", NackMode::Range);
+        let first = sender.send_payload(b"first", ntp, t);
+        let _lost = sender.send_payload(b"lost", ntp, t);
+        let third = sender.send_payload(b"third", ntp, t);
+        receiver.accept_packet(&first.bytes).unwrap();
+        receiver.accept_packet(&third.bytes).unwrap();
+        // The first packet goes out twice: the copy is wrapped and marked,
+        // and a receiver that has the original drops it.
+        assert_eq!(sender.next_repair_at(), Some(t + Duration::from_millis(1)));
+        let startup = sender.poll_repairs(t + Duration::from_millis(1));
+        assert_eq!(startup.len(), 1);
+        assert!(startup[0].retry);
+        assert!(receiver.accept_packet(&startup[0].bytes).unwrap().duplicate);
+        let feedback = receiver.build_feedback();
+        let reduced = ReducedHeader {
+            src_port: DEFAULT_VIRT_DST_PORT,
+            dst_port: DEFAULT_VIRT_SRC_PORT,
+        };
+        let payload = ReducedPacket::decode(&feedback.bytes)
+            .unwrap()
+            .payload
+            .to_vec();
+        for at in [t, t + Duration::from_millis(10)] {
+            let outcome = sender
+                .handle_reduced_feedback_outcome(reduced, &payload, ntp, at)
+                .unwrap();
+            assert_eq!(outcome.retries.len(), 1);
+        }
+        let due = sender.next_repair_at().unwrap();
+        let copies = sender.poll_repairs(due);
+        assert_eq!(copies.len(), 1);
+        assert!(copies[0].retry);
+        let decoded = ReducedPacket::decode(&copies[0].bytes).unwrap();
+        assert_eq!(
+            RtpPacket::decode(decoded.payload).unwrap().header.ssrc,
+            0x1122_3345
+        );
+        let recovered = receiver.accept_packet(&copies[0].bytes).unwrap();
+        assert!(recovered.recovered);
+    }
+
+    #[test]
+    fn main_retransmission_carries_the_retry_bit_and_round_trips() {
+        let now = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut sender = MainSenderCore::new(0x1122_3344, 64);
+        let mut receiver = MainReceiverCore::new(0x1122_3344, "rust", NackMode::Range);
+
+        let first = sender.send_payload(b"first", ntp, now);
+        let _lost = sender.send_payload(b"lost", ntp, now);
+        let third = sender.send_payload(b"third", ntp, now);
+        receiver.accept_packet(&first.bytes).unwrap();
+        receiver.accept_packet(&third.bytes).unwrap();
+
+        let feedback = receiver.build_feedback();
+        let retries = sender.handle_feedback(&feedback.bytes).unwrap();
+        assert_eq!(retries.len(), 1);
+        let decoded = ReducedPacket::decode(&retries[0].bytes).unwrap();
+        let rtp = RtpPacket::decode(decoded.payload).unwrap();
+        assert_eq!(rtp.header.ssrc, 0x1122_3345, "retries are marked SSRC | 1");
+
+        let recovered = receiver.accept_packet(&retries[0].bytes).unwrap();
+        assert!(recovered.recovered);
+        assert_eq!(receiver.flow_ids(), vec![0x1122_3344]);
+        assert_eq!(receiver.stats().retry_packets_received, 1);
     }
 
     #[test]

@@ -1,5 +1,47 @@
 # rist-rs
 
+## rist-rs against librist
+
+On our own bench, rist-rs now beats librist v0.2.20, the reference C
+implementation that FFmpeg and GStreamer use for RIST. Across the same 102
+cases (26 November 2026, dedicated Linode instances, London to London, New
+York and Sydney, 1 to 257 ms RTT, no added loss, 1% and 5% random loss,
+burst loss and outages of 20 ms to 1 s):
+
+| | rist-rs | librist |
+| --- | --- | --- |
+| Frames lost or late, all 102 cases | **63** (the previous rist-rs: 8,927 in its 94 cases) | 2,111 |
+| Sender CPU per Gbit/s | **about 0.66–0.71×** librist's | 1× |
+| Receiver CPU per Gbit/s | **about 0.11–0.23×** librist's | 1× |
+| Highest 4K rate carried whole | **every rung to 334 Mbit/s**, in every condition | stops between 165 and 334 Mbit/s |
+| Added latency (p99) | **lower in all 102 cases** | |
+| Interop with librist, both ways | works in all 44 cells (Main profile) | |
+
+All with the product's own settings, not a tuned profile.
+
+What it does not show yet:
+
+1. **Only librist.** No commercial RIST stack or other open-source
+   implementation was measured.
+2. **Our own test.** We chose the cases and wrote the bench. librist's figures
+   are its 24 November baseline, not re-run in the same hour. Interop is
+   proven against librist, not yet against real encoders and decoders.
+3. **Profiles.** Main on the bench and Simple in the interop tests, without
+   encryption; the Advanced profile is not covered.
+4. **Known weak spots.**
+   - Fan-out to 100 receivers from one host fails, as it does for librist; one
+     sending thread runs out of CPU, so rist-rs loses slightly more frames
+     outright there.
+   - Up to 6 to 8.5 points more bytes on the wire at 5% loss with short
+     buffers and during a 1 s outage, because some repair requests and late
+     repairs are sent twice. The median difference across the 102 cases is
+     zero.
+   - One case lost one frame where librist lost none; the same case lost
+     nothing in three other runs.
+
+The report, charts, per-case tables and how it was measured are in
+[benchmarks/2026-11-26-librist-parity](benchmarks/2026-11-26-librist-parity/).
+
 Pure Rust RIST protocol work plus the existing safe Rust bindings for
 [librist](https://code.videolan.org/rist/librist).
 

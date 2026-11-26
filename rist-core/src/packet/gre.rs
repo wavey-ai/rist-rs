@@ -457,23 +457,56 @@ pub fn decode_main_packet(input: &[u8], key: Option<&mut PskKey>) -> Result<Main
             .ok_or(Error::UnsupportedGreProtocol(gre.protocol_type))?;
         key.decrypt(nonce.to_be_bytes(), gre.version, sequence, &input[offset..])?
     } else {
-        input[offset..].to_vec()
+        let payload = &input[offset..];
+        if is_reduced_payload(gre, payload) {
+            // Data path: copy only the media payload, not the whole datagram.
+            let packet = ReducedPacket::decode_after_gre(gre, payload)?;
+            return Ok(MainPacket::Reduced(OwnedReducedPacket {
+                gre,
+                vsf: packet.vsf,
+                reduced: packet.reduced,
+                payload: packet.payload.to_vec(),
+            }));
+        }
+        payload.to_vec()
     };
 
     decode_main_payload(gre, payload)
 }
 
+fn is_reduced_payload(gre: GreHeader, payload: &[u8]) -> bool {
+    match gre.protocol_type {
+        GRE_PROTOCOL_TYPE_REDUCED => true,
+        GRE_PROTOCOL_TYPE_VSF => VsfHeader::decode(payload).is_ok_and(|vsf| {
+            vsf.protocol_type == VSF_PROTOCOL_TYPE_RIST && vsf.subtype == VSF_SUBTYPE_REDUCED
+        }),
+        _ => false,
+    }
+}
+
+/// Builds an owned reduced packet from a decrypted buffer by dropping the
+/// headers in place instead of copying the payload into a new allocation.
+fn owned_reduced_from_buffer(gre: GreHeader, mut payload: Vec<u8>) -> Result<MainPacket> {
+    let (vsf, reduced, header_len) = {
+        let packet = ReducedPacket::decode_after_gre(gre, &payload)?;
+        (
+            packet.vsf,
+            packet.reduced,
+            payload.len() - packet.payload.len(),
+        )
+    };
+    payload.drain(..header_len);
+    Ok(MainPacket::Reduced(OwnedReducedPacket {
+        gre,
+        vsf,
+        reduced,
+        payload,
+    }))
+}
+
 fn decode_main_payload(gre: GreHeader, payload: Vec<u8>) -> Result<MainPacket> {
     match gre.protocol_type {
-        GRE_PROTOCOL_TYPE_REDUCED => {
-            let packet = ReducedPacket::decode_after_gre(gre, &payload)?;
-            Ok(MainPacket::Reduced(OwnedReducedPacket {
-                gre,
-                vsf: packet.vsf,
-                reduced: packet.reduced,
-                payload: packet.payload.to_vec(),
-            }))
-        }
+        GRE_PROTOCOL_TYPE_REDUCED => owned_reduced_from_buffer(gre, payload),
         GRE_PROTOCOL_TYPE_KEEPALIVE => Ok(MainPacket::Keepalive(
             KeepalivePacket::decode_after_gre(gre, &payload)?.into_owned(),
         )),
@@ -492,15 +525,7 @@ fn decode_main_payload(gre: GreHeader, payload: Vec<u8>) -> Result<MainPacket> {
                 });
             }
             match vsf.subtype {
-                VSF_SUBTYPE_REDUCED => {
-                    let packet = ReducedPacket::decode_after_gre(gre, &payload)?;
-                    Ok(MainPacket::Reduced(OwnedReducedPacket {
-                        gre,
-                        vsf: packet.vsf,
-                        reduced: packet.reduced,
-                        payload: packet.payload.to_vec(),
-                    }))
-                }
+                VSF_SUBTYPE_REDUCED => owned_reduced_from_buffer(gre, payload),
                 VSF_SUBTYPE_KEEPALIVE => Ok(MainPacket::Keepalive(
                     KeepalivePacket::decode_after_gre(gre, &payload)?.into_owned(),
                 )),
@@ -608,6 +633,56 @@ pub struct OwnedReducedPacket {
     pub vsf: Option<VsfHeader>,
     pub reduced: ReducedHeader,
     pub payload: Vec<u8>,
+}
+
+/// The largest header [`reduced_header`] writes: GRE with sequence (8),
+/// VSF (4) and the reduced ports (4).
+pub const MAX_REDUCED_HEADER_LEN: usize = 16;
+
+/// The unencrypted header [`encode_reduced_payload`] puts before its
+/// payload, built on the stack, so a sender can send the header and a
+/// stored RTP packet as two parts of one datagram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReducedHeaderBytes {
+    bytes: [u8; MAX_REDUCED_HEADER_LEN],
+    len: u8,
+}
+
+impl ReducedHeaderBytes {
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+}
+
+pub fn reduced_header(
+    gre_version: u8,
+    sequence: u32,
+    reduced: ReducedHeader,
+) -> ReducedHeaderBytes {
+    let use_vsf = gre_version >= 2;
+    let mut bytes = [0u8; MAX_REDUCED_HEADER_LEN];
+    bytes[0] = GRE_FLAG_SEQUENCE;
+    bytes[1] = (gre_version & 0x07) << 3;
+    let protocol_type = if use_vsf {
+        GRE_PROTOCOL_TYPE_VSF
+    } else {
+        GRE_PROTOCOL_TYPE_REDUCED
+    };
+    bytes[2..4].copy_from_slice(&protocol_type.to_be_bytes());
+    bytes[4..8].copy_from_slice(&sequence.to_be_bytes());
+    let mut len = 8;
+    if use_vsf {
+        let vsf = VsfHeader::rist_reduced();
+        bytes[8..10].copy_from_slice(&vsf.protocol_type.to_be_bytes());
+        bytes[10..12].copy_from_slice(&vsf.subtype.to_be_bytes());
+        len = 12;
+    }
+    bytes[len..len + 2].copy_from_slice(&reduced.src_port.to_be_bytes());
+    bytes[len + 2..len + 4].copy_from_slice(&reduced.dst_port.to_be_bytes());
+    ReducedHeaderBytes {
+        bytes,
+        len: (len + 4) as u8,
+    }
 }
 
 pub fn encode_reduced_payload(
@@ -884,6 +959,27 @@ pub fn decode_eapol_payload(input: &[u8]) -> Result<EapolGrePacket> {
 mod tests {
     use super::*;
     use crate::auth::{EapPacket, EAPOL_VERSION_3, EAP_TYPE_IDENTITY};
+
+    #[test]
+    fn reduced_header_is_the_prefix_of_encode_reduced_payload() {
+        let reduced = ReducedHeader {
+            src_port: 0x1234,
+            dst_port: 0xabcd,
+        };
+        for version in 0..=3 {
+            let header = reduced_header(version, 0xdead_beef, reduced);
+            let mut joined = header.as_slice().to_vec();
+            joined.extend_from_slice(b"rtp bytes");
+            assert_eq!(
+                joined,
+                encode_reduced_payload(version, 0xdead_beef, reduced, b"rtp bytes"),
+                "GRE version {version}"
+            );
+            let decoded = ReducedPacket::decode(&joined).unwrap();
+            assert_eq!(decoded.payload, b"rtp bytes");
+            assert_eq!(decoded.gre.sequence, Some(0xdead_beef));
+        }
+    }
 
     #[test]
     fn gre_header_round_trips_sequence_shape() {
@@ -1164,5 +1260,42 @@ mod tests {
             decode_main_packet(&bytes, None).unwrap(),
             MainPacket::Unknown { payload, .. } if payload == b"opaque"
         ));
+    }
+
+    #[test]
+    fn main_datagram_decoder_matches_the_borrowed_reduced_decoder() {
+        let reduced = ReducedHeader {
+            src_port: 1971,
+            dst_port: 1968,
+        };
+        for version in [0, 1, 2] {
+            let clear = encode_reduced_payload(version, 70_000, reduced, b"ts-payload");
+            let borrowed = ReducedPacket::decode(&clear).unwrap();
+            assert_eq!(
+                decode_main_packet(&clear, None).unwrap(),
+                MainPacket::Reduced(OwnedReducedPacket {
+                    gre: borrowed.gre,
+                    vsf: borrowed.vsf,
+                    reduced,
+                    payload: b"ts-payload".to_vec(),
+                })
+            );
+            let mut tx = PskKey::from_nonce(128, 0, b"secret", [9, 9, 9, version]).unwrap();
+            let mut rx = PskKey::receiver(128, b"secret").unwrap();
+            let encrypted =
+                encode_encrypted_reduced_payload(version, 5, reduced, b"secure", &mut tx);
+            match decode_main_packet(&encrypted, Some(&mut rx)).unwrap() {
+                MainPacket::Reduced(packet) => {
+                    assert_eq!(packet.reduced, reduced);
+                    assert_eq!(packet.vsf.is_some(), version >= 2);
+                    assert_eq!(packet.payload, b"secure");
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        // A truncated reduced header is still an error, not a silent drop.
+        let mut short = encode_reduced_payload(1, 1, reduced, b"");
+        short.truncate(short.len() - 1);
+        assert!(decode_main_packet(&short, None).is_err());
     }
 }

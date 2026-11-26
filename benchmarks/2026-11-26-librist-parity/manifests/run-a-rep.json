@@ -1,0 +1,246 @@
+{
+ "schema": "transport-bench.manifest.v1",
+ "run_id": "trist-linode-20261126a-rep",
+ "written": "2026-11-26T04:46:24.984788Z",
+ "start": "2026-11-26T04:39:27.486834Z",
+ "end": "2026-11-26T04:45:33.808295Z",
+ "modes": [
+  "linode"
+ ],
+ "code": {
+  "transport_bench": {
+   "path": "~/wavey.ai/transport-bench-rist",
+   "head": "fe89c2a7727082af5726ddbf139668c859001ed8",
+   "branch": "rist",
+   "dirty": true
+  },
+  "cargo_lock": {
+   "rist-core": [
+    "614c10ab03fb37e25b7d892a2224caaddcbb89a6",
+    "904e3e8960cb7d61867f5ec96db5600da2d351b6"
+   ],
+   "rist-mio": [
+    "614c10ab03fb37e25b7d892a2224caaddcbb89a6",
+    "904e3e8960cb7d61867f5ec96db5600da2d351b6"
+   ],
+   "mio": [
+    "1.2.5"
+   ],
+   "raptorq": [
+    "2.0.1"
+   ],
+   "raptorq-datagram-fec": [
+    "0.1.6"
+   ],
+   "rist-sys": [
+    "0.1.1"
+   ],
+   "socket2": [
+    "0.5.10",
+    "0.6.5"
+   ]
+  },
+  "rist_rs_revs_expected": [
+   "904e3e8",
+   "614c10a"
+  ],
+  "rist_rs_next": {
+   "path": "~/wavey.ai/rist-rs-perf",
+   "head": "82bfc2b4ab874c6bbca51f608c1b95566ad24cf0",
+   "branch": "perf-librist-parity",
+   "dirty": false,
+   "revs_in_summaries": [
+    "82bfc2b4ab87"
+   ]
+  },
+  "third_party": {
+   "librist": {
+    "version": "0.2.20",
+    "git_describe": "v0.2.20",
+    "git_head": "4f45ef8f78983892d52ccd52d9f675435b23738f"
+   },
+   "libsrt": {
+    "version": "1.5.7",
+    "git_describe": "v1.5.7",
+    "git_head": "899348d8318eb9a3c5a5b6ec43c4a1114288773a"
+   }
+  },
+  "tb_binaries": []
+ },
+ "settings": {
+  "netem_limit": 400000,
+  "t0_lead_s": 5.0,
+  "base_port": 5000,
+  "impairment": "prio root (priomap all band 1:1) + netem on 1:3 + u32 match ip dst PEER/32; same netem on both hosts; lon/local paths add delay RTT/2 each way, nyc/syd add none (real path) and only loss",
+  "latency_rules": "ARQ max(4*RTT,40) ms; raptorq/raptorq-main deadline max(2*RTT,40) ms, arq=0; raptorq-arq the ARQ rule; set C/D override",
+  "drain_linger": "drain = latency + 2*RTT + 1500 ms, linger = latency + RTT + 1000 ms",
+  "node_sysctls": {
+   "net.core.rmem_max": "67108864",
+   "net.core.wmem_max": "67108864",
+   "net.core.rmem_default": "8388608",
+   "net.core.wmem_default": "8388608",
+   "net.core.netdev_max_backlog": "250000",
+   "net.ipv4.ipfrag_time": "1",
+   "net.ipv4.ipfrag_high_thresh": "67108864",
+   "net.ipv4.ipfrag_max_dist": "0",
+   "note": "remote: /etc/sysctl.d/90-tb.conf by prep; local: ipfrag set in both netns (rmem/wmem are global, left as the box has them); every case checks the ipfrag values on both hosts (guard)"
+  },
+  "statuses": "ok | transport_failed (lab fine, transport did not deliver: receiver empty, sender frame > late-max-ms late, non-zero exit with summary, hang to timeout) | failed (lab/orchestrator: exception, outage helper, ipfrag guard, missing summary or exit)",
+  "cores": "ndjson tx_cores/rx_cores = cpu_s / duration_s; tb's own cores = cpu_s / wall",
+  "host_samples": "sampler-{tx,rx}/: per-second /proc/stat cpu, /proc/net/dev, softirqs NET_RX/NET_TX, NIC interrupts, mpstat JSON",
+  "invocations": [
+   {
+    "mode": "linode",
+    "started": "2026-11-26T04:39:27.486343Z",
+    "argv": [
+     "lab/bench.py",
+     "run",
+     "--matrix",
+     "lab/matrices/next-t8.json",
+     "--run-id",
+     "trist-linode-20261126a-rep",
+     "--resume",
+     "--only",
+     "^(A-rist-rs-next-lon-2160p160-rtt1-l0-out20e2000|A-rist-rs-next-lon-2160p25-rtt100-l1|A-rist-rs-next-lon-2160p25-rtt30-ge|A-rist-rs-next-lon-2160p25-rtt250-ge|C-rist-rs-next-lon-2160p80-rtt30-l5-lat1.5x|C-rist-rs-next-lon-2160p80-rtt250-l5-lat1.5x|D-rist-rs-next-lon-2160p80-rtt100-l0-out1000at7|D-rist-rs-next-lon-2160p80-rtt100-l0-out500at7)$"
+    ],
+    "matrix": "~/wavey.ai/transport-bench-rist/lab/matrices/next-t8.json",
+    "matrix_sha256": "d7a5092a6972d4a8e5f0dfab99e57942a79d29f1a38cfd5ab738390c8e7efd59",
+    "matrix_copy": "matrices/next-t8-d7a5092a69.json",
+    "only": "^(A-rist-rs-next-lon-2160p160-rtt1-l0-out20e2000|A-rist-rs-next-lon-2160p25-rtt100-l1|A-rist-rs-next-lon-2160p25-rtt30-ge|A-rist-rs-next-lon-2160p25-rtt250-ge|C-rist-rs-next-lon-2160p80-rtt30-l5-lat1.5x|C-rist-rs-next-lon-2160p80-rtt250-l5-lat1.5x|D-rist-rs-next-lon-2160p80-rtt100-l0-out1000at7|D-rist-rs-next-lon-2160p80-rtt100-l0-out500at7)$",
+    "resume": true,
+    "host": "localhost",
+    "lab_run_id": "tr1126a",
+    "state_file": "~/wavey.ai/transport-bench-rist/target/lab/trist-lab.json",
+    "ended": "2026-11-26T04:43:59.434264Z",
+    "cases_run": 8,
+    "status_counts": {
+     "ok": 8
+    }
+   },
+   {
+    "mode": "linode",
+    "started": "2026-11-26T04:44:43.405960Z",
+    "argv": [
+     "lab/bench.py",
+     "run",
+     "--matrix",
+     "lab/matrices/next-ef.json",
+     "--run-id",
+     "trist-linode-20261126a-rep",
+     "--resume",
+     "--only",
+     "^F-rist-rs-next-lon-2160p25-rtt30-l1-fo100$"
+    ],
+    "matrix": "~/wavey.ai/transport-bench-rist/lab/matrices/next-ef.json",
+    "matrix_sha256": "403ada39e8746b0a5368de9c313a124b9200ed17b3ab35e327cc03278914f70c",
+    "matrix_copy": "matrices/next-ef-403ada39e8.json",
+    "only": "^F-rist-rs-next-lon-2160p25-rtt30-l1-fo100$",
+    "resume": true,
+    "host": "localhost",
+    "lab_run_id": "tr1126a",
+    "state_file": "~/wavey.ai/transport-bench-rist/target/lab/trist-lab.json",
+    "ended": "2026-11-26T04:45:34.475992Z",
+    "cases_run": 1,
+    "status_counts": {
+     "transport_failed": 1
+    }
+   }
+  ]
+ },
+ "cases": {
+  "count": 9,
+  "status": {
+   "ok": 8,
+   "transport_failed": 1
+  },
+  "earlier_attempts": 0,
+  "not_ok": [
+   "F-rist-rs-next-lon-2160p25-rtt30-l1-fo100"
+  ],
+  "transport_failed": [
+   "F-rist-rs-next-lon-2160p25-rtt30-l1-fo100"
+  ],
+  "failed": []
+ },
+ "topology": {
+  "lab_run_id": "tr1126a",
+  "image": "linode/arch",
+  "nodes": [
+   {
+    "name": "syd-rx",
+    "role": "bench-rx",
+    "site": "sydney",
+    "region": "ap-southeast",
+    "type": "g6-dedicated-8",
+    "hourly_usd": 0.216,
+    "public_ipv4": "redacted",
+    "vlan_ipv4": null,
+    "created": "2026-11-26T02:31:10"
+   },
+   {
+    "name": "new-rx",
+    "role": "bench-rx",
+    "site": "newark",
+    "region": "us-east",
+    "type": "g6-dedicated-8",
+    "hourly_usd": 0.216,
+    "public_ipv4": "redacted",
+    "vlan_ipv4": null,
+    "created": "2026-11-26T02:31:11"
+   },
+   {
+    "name": "lon-rx",
+    "role": "bench-rx",
+    "site": "london",
+    "region": "gb-lon",
+    "type": "g6-dedicated-16",
+    "hourly_usd": 0.432,
+    "public_ipv4": "redacted",
+    "vlan_ipv4": "10.78.1.11",
+    "created": "2026-11-26T02:31:12"
+   },
+   {
+    "name": "lon-tx",
+    "role": "bench-tx",
+    "site": "london",
+    "region": "gb-lon",
+    "type": "g6-dedicated-16",
+    "hourly_usd": 0.432,
+    "public_ipv4": "redacted",
+    "vlan_ipv4": "10.78.1.10",
+    "created": "2026-11-26T02:31:13"
+   }
+  ]
+ },
+ "cost": {
+  "source": "estimate: ceil(hours to last case) x hourly price, from lab-state.json",
+  "usd": 3.888,
+  "rows": [
+   {
+    "name": "syd-rx",
+    "hours": 3,
+    "usd": 0.648
+   },
+   {
+    "name": "new-rx",
+    "hours": 3,
+    "usd": 0.648
+   },
+   {
+    "name": "lon-rx",
+    "hours": 3,
+    "usd": 1.296
+   },
+   {
+    "name": "lon-tx",
+    "hours": 3,
+    "usd": 1.296
+   }
+  ]
+ },
+ "files": {
+  "count": 715,
+  "note": "per-file list omitted here; full manifest with raw data in needletail-data/trist-linode-20261126a-rep/ (R2 bucket needletail-data)"
+ },
+ "total_bytes": 14052022
+}

@@ -7,6 +7,30 @@ pub struct SenderStats {
     pub retransmitted_bytes: u64,
     pub feedback_packets: u64,
     pub rtt_micros: Option<u64>,
+    /// Sequences requested by received NACKs (before any refusal).
+    pub nack_requests: u64,
+    /// Requested sequences no longer (or never) in the send history.
+    pub retransmit_refused_not_in_history: u64,
+    /// Requested sequences older than the recovery buffer.
+    pub retransmit_refused_too_old: u64,
+    /// Retransmissions refused by the max_bitrate cap.
+    pub retransmit_refused_bitrate: u64,
+    /// Retransmissions refused because the previous one was less than an RTT ago.
+    pub retransmit_refused_spacing: u64,
+    /// Retransmissions refused because the sequence reached max_retries.
+    pub retransmit_refused_max_retries: u64,
+    /// Feedback packets that failed to decode.
+    pub feedback_decode_errors: u64,
+    /// Echo requests answered.
+    pub echo_responses: u64,
+    /// Second copies of late repairs sent (also in retransmitted_packets).
+    pub duplicate_repairs: u64,
+    /// Tail-loss probes sent (also in retransmitted_packets).
+    pub tail_probes: u64,
+    /// Repairs (retransmissions, second copies, tail probes) that were due
+    /// but not sent because the socket would block with the send queue
+    /// full. Not in retransmitted_packets, duplicate_repairs or tail_probes.
+    pub repairs_dropped_queue_full: u64,
 }
 
 impl SenderStats {
@@ -19,6 +43,17 @@ impl SenderStats {
             retransmitted_bytes: 0,
             feedback_packets: 0,
             rtt_micros: None,
+            nack_requests: 0,
+            retransmit_refused_not_in_history: 0,
+            retransmit_refused_too_old: 0,
+            retransmit_refused_bitrate: 0,
+            retransmit_refused_spacing: 0,
+            retransmit_refused_max_retries: 0,
+            feedback_decode_errors: 0,
+            echo_responses: 0,
+            duplicate_repairs: 0,
+            tail_probes: 0,
+            repairs_dropped_queue_full: 0,
         }
     }
 
@@ -43,12 +78,16 @@ impl SenderStats {
         self.retransmitted_bytes += bytes as u64;
     }
 
-    pub(crate) fn record_feedback(&mut self) {
-        self.feedback_packets += 1;
+    /// Takes back a retransmission that was counted but never reached the
+    /// socket (see `repairs_dropped_queue_full`).
+    pub(crate) fn record_unsent_retransmit(&mut self, bytes: usize) {
+        self.retransmitted_packets = self.retransmitted_packets.saturating_sub(1);
+        self.retransmitted_bytes = self.retransmitted_bytes.saturating_sub(bytes as u64);
+        self.repairs_dropped_queue_full += 1;
     }
 
-    pub(crate) fn set_rtt_micros(&mut self, rtt_micros: u64) {
-        self.rtt_micros = Some(rtt_micros);
+    pub(crate) fn record_feedback(&mut self) {
+        self.feedback_packets += 1;
     }
 }
 
@@ -63,6 +102,61 @@ pub struct ReceiverStats {
     pub currently_missing_packets: u64,
     pub feedback_packets: u64,
     pub rtt_micros: Option<u64>,
+    /// RTCP packets sent that carried a NACK (also counted in feedback_packets).
+    pub nack_packets: u64,
+    /// Sequences requested in NACK packets that were sent.
+    pub nack_entries_sent: u64,
+    /// Due sequences held back (packet limit or return-bandwidth refusal);
+    /// they stay due and are requested later.
+    pub nack_entries_deferred: u64,
+    /// Holes still missing when they reached the recovery age.
+    pub holes_expired: u64,
+    /// Missing sequences beyond the 16-bit NACK horizon (never requestable).
+    pub holes_unaddressable: u64,
+    /// Open holes discarded by a sender restart or reconfiguration.
+    pub holes_reset: u64,
+    /// Packets that arrived after their hole had expired.
+    pub late_packets: u64,
+    /// Holes that reached max_retries NACKs.
+    pub retries_exhausted: u64,
+    /// Holes not requested because a NACK could no longer arrive in time.
+    pub nack_too_late: u64,
+    /// Data packets that carried the SSRC retry bit (retransmissions).
+    pub retry_packets_received: u64,
+    /// Smallest RTT sample (`rtt_micros` is the smoothed value).
+    pub rtt_min_micros: Option<u64>,
+    /// RTT samples from echo responses.
+    pub rtt_samples_echo: u64,
+    /// RTT samples from retry-marked repairs of holes NACKed once.
+    pub rtt_samples_karn: u64,
+    /// Echo requests sent.
+    pub echo_requests_sent: u64,
+    /// Originals that filled a hole (reordering samples).
+    pub reorder_samples: u64,
+    /// The first-NACK delay at the last poll.
+    pub first_nack_delay_micros: u64,
+    /// Sequences requested again in NACK copies (not attempts; also
+    /// counted in nack_packets, not in nack_entries_sent).
+    pub nack_copies_sent: u64,
+    /// Times the highest sequence moved forward by more than half the
+    /// 16-bit NACK horizon at once (a long outage, a sender restart, or a
+    /// misread sequence: should stay near zero).
+    pub forward_jumps: u64,
+    /// Karn samples refused because they were under half the smallest
+    /// echo-measured RTT (a repair that cannot answer the NACK it seems to).
+    pub rtt_samples_karn_rejected: u64,
+    /// Originals far behind the highest sequence that the receiver read as
+    /// behind (stale) rather than as the first packet after a long gap.
+    pub stale_far_behind: u64,
+    /// Size of the duplicate-detection ring, in packets (it grows with the
+    /// observed packet rate).
+    pub duplicate_window_packets: u64,
+    /// Holes opened below the first sequence seen at the start of a stream
+    /// (`RecoveryTuning::startup_recovery`); also in total_missing_packets.
+    pub startup_holes: u64,
+    /// Packets taken below the first sequence seen at the start of a stream
+    /// as its new start.
+    pub startup_packets: u64,
 }
 
 impl ReceiverStats {
@@ -77,6 +171,29 @@ impl ReceiverStats {
             currently_missing_packets: 0,
             feedback_packets: 0,
             rtt_micros: None,
+            nack_packets: 0,
+            nack_entries_sent: 0,
+            nack_entries_deferred: 0,
+            holes_expired: 0,
+            holes_unaddressable: 0,
+            holes_reset: 0,
+            late_packets: 0,
+            retries_exhausted: 0,
+            nack_too_late: 0,
+            retry_packets_received: 0,
+            rtt_min_micros: None,
+            rtt_samples_echo: 0,
+            rtt_samples_karn: 0,
+            echo_requests_sent: 0,
+            reorder_samples: 0,
+            first_nack_delay_micros: 0,
+            nack_copies_sent: 0,
+            forward_jumps: 0,
+            rtt_samples_karn_rejected: 0,
+            stale_far_behind: 0,
+            duplicate_window_packets: 0,
+            startup_holes: 0,
+            startup_packets: 0,
         }
     }
 
@@ -115,6 +232,23 @@ impl ReceiverStats {
 
     pub(crate) fn record_feedback(&mut self) {
         self.feedback_packets += 1;
+    }
+
+    pub(crate) fn record_nack_packet(&mut self, entries: usize) {
+        self.feedback_packets += 1;
+        self.nack_packets += 1;
+        self.nack_entries_sent += entries as u64;
+    }
+
+    pub(crate) fn apply_tracker_counters(&mut self, counters: crate::recovery::TrackerCounters) {
+        self.holes_expired = counters.holes_expired;
+        self.holes_unaddressable = counters.holes_unaddressable;
+        self.holes_reset = counters.holes_reset;
+        self.late_packets = counters.late_packets;
+        self.retries_exhausted = counters.retries_exhausted;
+        self.nack_too_late = counters.nack_too_late;
+        self.startup_holes = counters.startup_holes;
+        self.startup_packets = counters.startup_packets;
     }
 }
 

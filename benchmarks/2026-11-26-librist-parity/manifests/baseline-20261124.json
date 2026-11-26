@@ -1,0 +1,591 @@
+{
+ "schema": "transport-bench.manifest.v1",
+ "run_id": "tbench-linode-20261124",
+ "written": "2026-11-24T17:24:27.541701Z",
+ "start": "2026-11-24T08:10:23.192377Z",
+ "end": "2026-11-24T17:24:04.590112Z",
+ "modes": [
+  "linode"
+ ],
+ "code": {
+  "transport_bench": {
+   "path": "~/wavey.ai/transport-bench",
+   "head": "9df3883778d2bc6e2689ffe0e52596ad3ae19ff0",
+   "branch": "main",
+   "dirty": true
+  },
+  "cargo_lock": {
+   "rist-core": [
+    "614c10ab03fb37e25b7d892a2224caaddcbb89a6",
+    "904e3e8960cb7d61867f5ec96db5600da2d351b6"
+   ],
+   "rist-mio": [
+    "614c10ab03fb37e25b7d892a2224caaddcbb89a6",
+    "904e3e8960cb7d61867f5ec96db5600da2d351b6"
+   ],
+   "mio": [
+    "1.2.5"
+   ],
+   "raptorq": [
+    "2.0.1"
+   ],
+   "raptorq-datagram-fec": [
+    "0.1.6"
+   ],
+   "rist-sys": [
+    "0.1.1"
+   ],
+   "socket2": [
+    "0.5.10",
+    "0.6.5"
+   ]
+  },
+  "rist_rs_revs_expected": [
+   "904e3e8",
+   "614c10a"
+  ],
+  "third_party": {
+   "librist": {
+    "version": "0.2.20",
+    "git_describe": "v0.2.20",
+    "git_head": "4f45ef8f78983892d52ccd52d9f675435b23738f"
+   },
+   "libsrt": {
+    "version": "1.5.7",
+    "git_describe": "v1.5.7",
+    "git_head": "899348d8318eb9a3c5a5b6ec43c4a1114288773a"
+   }
+  },
+  "tb_binaries": []
+ },
+ "settings": {
+  "netem_limit": 400000,
+  "t0_lead_s": 5.0,
+  "base_port": 5000,
+  "impairment": "prio root (priomap all band 1:1) + netem on 1:3 + u32 match ip dst PEER/32; same netem on both hosts; lon/local paths add delay RTT/2 each way, nyc/syd add none (real path) and only loss",
+  "latency_rules": "ARQ max(4*RTT,40) ms; raptorq/raptorq-main deadline max(2*RTT,40) ms, arq=0; raptorq-arq the ARQ rule; set C/D override",
+  "drain_linger": "drain = latency + 2*RTT + 1500 ms, linger = latency + RTT + 1000 ms",
+  "node_sysctls": {
+   "net.core.rmem_max": "67108864",
+   "net.core.wmem_max": "67108864",
+   "net.core.rmem_default": "8388608",
+   "net.core.wmem_default": "8388608",
+   "net.core.netdev_max_backlog": "250000",
+   "net.ipv4.ipfrag_time": "1",
+   "net.ipv4.ipfrag_high_thresh": "67108864",
+   "net.ipv4.ipfrag_max_dist": "0",
+   "note": "remote: /etc/sysctl.d/90-tb.conf by prep; local: ipfrag set in both netns (rmem/wmem are global, left as the box has them); every case checks the ipfrag values on both hosts (guard)"
+  },
+  "statuses": "ok | transport_failed (lab fine, transport did not deliver: receiver empty, sender frame > late-max-ms late, non-zero exit with summary, hang to timeout) | failed (lab/orchestrator: exception, outage helper, ipfrag guard, missing summary or exit)",
+  "cores": "ndjson tx_cores/rx_cores = cpu_s / duration_s; tb's own cores = cpu_s / wall",
+  "host_samples": "sampler-{tx,rx}/: per-second /proc/stat cpu, /proc/net/dev, softirqs NET_RX/NET_TX, NIC interrupts, mpstat JSON",
+  "invocations": [
+   {
+    "mode": "linode",
+    "started": "2026-11-24T08:10:17.163569Z",
+    "argv": [
+     "lab/bench.py",
+     "run",
+     "--matrix",
+     "lab/matrices/G.json",
+     "--run-id",
+     "tbench-linode-20261124",
+     "--resume"
+    ],
+    "matrix": "~/wavey.ai/transport-bench/lab/matrices/G.json",
+    "matrix_sha256": "515a16a38963cf8123ce9493923c522c8d1428ff994d1ad2a205eb241de8d3d5",
+    "matrix_copy": "matrices/G-515a16a389.json",
+    "only": null,
+    "resume": true,
+    "host": "localhost",
+    "lab_run_id": "tb1124a",
+    "state_file": "~/wavey.ai/transport-bench/target/lab/tb-lab.json",
+    "ended": "2026-11-24T09:19:06.253150Z",
+    "cases_run": 112,
+    "status_counts": {
+     "ok": 112
+    }
+   },
+   {
+    "mode": "linode",
+    "started": "2026-11-24T09:19:06.406757Z",
+    "argv": [
+     "lab/bench.py",
+     "run",
+     "--matrix",
+     "lab/matrices/B.json",
+     "--run-id",
+     "tbench-linode-20261124",
+     "--resume"
+    ],
+    "matrix": "~/wavey.ai/transport-bench/lab/matrices/B.json",
+    "matrix_sha256": "51b79457aaf21371f8fe42c70ea01c197370d96d3e810f782a0ca06d9d911f3f",
+    "matrix_copy": "matrices/B-51b79457aa.json",
+    "only": null,
+    "resume": true,
+    "host": "localhost",
+    "lab_run_id": "tb1124a",
+    "state_file": "~/wavey.ai/transport-bench/target/lab/tb-lab.json",
+    "ended": "2026-11-24T10:59:48.265319Z",
+    "cases_run": 180,
+    "status_counts": {
+     "ok": 180
+    }
+   },
+   {
+    "mode": "linode",
+    "started": "2026-11-24T10:59:48.415284Z",
+    "argv": [
+     "lab/bench.py",
+     "run",
+     "--matrix",
+     "lab/matrices/A.json",
+     "--run-id",
+     "tbench-linode-20261124",
+     "--resume"
+    ],
+    "matrix": "~/wavey.ai/transport-bench/lab/matrices/A.json",
+    "matrix_sha256": "7a88508a98186af130f5407fa4a116273ae22771da69a51fd46e28594aff1b63",
+    "matrix_copy": "matrices/A-7a88508a98.json",
+    "only": null,
+    "resume": true,
+    "host": "localhost",
+    "lab_run_id": "tb1124a",
+    "state_file": "~/wavey.ai/transport-bench/target/lab/tb-lab.json",
+    "ended": "2026-11-24T14:52:26.012894Z",
+    "cases_run": 420,
+    "status_counts": {
+     "ok": 419,
+     "transport_failed": 1
+    }
+   },
+   {
+    "mode": "linode",
+    "started": "2026-11-24T14:52:26.173898Z",
+    "argv": [
+     "lab/bench.py",
+     "run",
+     "--matrix",
+     "lab/matrices/C.json",
+     "--run-id",
+     "tbench-linode-20261124",
+     "--resume"
+    ],
+    "matrix": "~/wavey.ai/transport-bench/lab/matrices/C.json",
+    "matrix_sha256": "79aa4207e0c39554431901d1b03a6eb7aa3e2853e150a79437459cb68e956791",
+    "matrix_copy": "matrices/C-79aa4207e0.json",
+    "only": null,
+    "resume": true,
+    "host": "localhost",
+    "lab_run_id": "tb1124a",
+    "state_file": "~/wavey.ai/transport-bench/target/lab/tb-lab.json",
+    "ended": "2026-11-24T15:55:46.934346Z",
+    "cases_run": 112,
+    "status_counts": {
+     "ok": 111,
+     "transport_failed": 1
+    }
+   },
+   {
+    "mode": "linode",
+    "started": "2026-11-24T15:55:47.074270Z",
+    "argv": [
+     "lab/bench.py",
+     "run",
+     "--matrix",
+     "lab/matrices/D.json",
+     "--run-id",
+     "tbench-linode-20261124",
+     "--resume"
+    ],
+    "matrix": "~/wavey.ai/transport-bench/lab/matrices/D.json",
+    "matrix_sha256": "e09f182ffa19c568bb6994d2159bdd7f8344b05df1457eae82183476ed8eca6b",
+    "matrix_copy": "matrices/D-e09f182ffa.json",
+    "only": null,
+    "resume": true,
+    "host": "localhost",
+    "lab_run_id": "tb1124a",
+    "state_file": "~/wavey.ai/transport-bench/target/lab/tb-lab.json",
+    "ended": "2026-11-24T16:13:17.326245Z",
+    "cases_run": 32,
+    "status_counts": {
+     "ok": 32
+    }
+   },
+   {
+    "mode": "linode",
+    "started": "2026-11-24T16:13:17.462701Z",
+    "argv": [
+     "lab/bench.py",
+     "run",
+     "--matrix",
+     "lab/matrices/E.json",
+     "--run-id",
+     "tbench-linode-20261124",
+     "--resume"
+    ],
+    "matrix": "~/wavey.ai/transport-bench/lab/matrices/E.json",
+    "matrix_sha256": "217cbeefc998e4708d7c0dd533fa8fa06f0e369ce29e1e0fcf0b862a5e402a13",
+    "matrix_copy": "matrices/E-217cbeefc9.json",
+    "only": null,
+    "resume": true,
+    "host": "localhost",
+    "lab_run_id": "tb1124a",
+    "state_file": "~/wavey.ai/transport-bench/target/lab/tb-lab.json",
+    "ended": "2026-11-24T16:28:24.689227Z",
+    "cases_run": 28,
+    "status_counts": {
+     "ok": 28
+    }
+   },
+   {
+    "mode": "linode",
+    "started": "2026-11-24T16:28:24.859240Z",
+    "argv": [
+     "lab/bench.py",
+     "run",
+     "--matrix",
+     "lab/matrices/F.json",
+     "--run-id",
+     "tbench-linode-20261124",
+     "--resume"
+    ],
+    "matrix": "~/wavey.ai/transport-bench/lab/matrices/F.json",
+    "matrix_sha256": "661bbe588f79f2e57c9bdbbf10918cb2afdf87301df0bb1b62cdee20571f3028",
+    "matrix_copy": "matrices/F-661bbe588f.json",
+    "only": null,
+    "resume": true,
+    "host": "localhost",
+    "lab_run_id": "tb1124a",
+    "state_file": "~/wavey.ai/transport-bench/target/lab/tb-lab.json",
+    "ended": "2026-11-24T16:39:49.685221Z",
+    "cases_run": 20,
+    "status_counts": {
+     "ok": 14,
+     "transport_failed": 6
+    }
+   },
+   {
+    "mode": "linode",
+    "started": "2026-11-24T16:40:39.861527Z",
+    "argv": [
+     "lab/bench.py",
+     "run",
+     "--matrix",
+     "lab/matrices/H.json",
+     "--run-id",
+     "tbench-linode-20261124",
+     "--resume"
+    ],
+    "matrix": "~/wavey.ai/transport-bench/lab/matrices/H.json",
+    "matrix_sha256": "0a0e6c686e50fb69881b1d76473bf96226e96b3cf53e4304912da86a4e73389e",
+    "matrix_copy": "matrices/H-0a0e6c686e.json",
+    "only": null,
+    "resume": true,
+    "host": "localhost",
+    "lab_run_id": "tb1124a",
+    "state_file": "~/wavey.ai/transport-bench/target/lab/tb-lab.json",
+    "ended": "2026-11-24T17:19:37.041196Z",
+    "cases_run": 68,
+    "status_counts": {
+     "ok": 68
+    }
+   },
+   {
+    "mode": "linode",
+    "started": "2026-11-24T17:19:41.303002Z",
+    "argv": [
+     "lab/bench.py",
+     "run",
+     "--run-id",
+     "tbench-linode-20261124",
+     "--matrix",
+     "lab/matrices/A.json",
+     "--only",
+     "^A-srt-fec-lon-2160p160-rtt250-ge$"
+    ],
+    "matrix": "~/wavey.ai/transport-bench/lab/matrices/A.json",
+    "matrix_sha256": "7a88508a98186af130f5407fa4a116273ae22771da69a51fd46e28594aff1b63",
+    "matrix_copy": "matrices/A-7a88508a98.json",
+    "only": "^A-srt-fec-lon-2160p160-rtt250-ge$",
+    "resume": false,
+    "host": "localhost",
+    "lab_run_id": "tb1124a",
+    "state_file": "~/wavey.ai/transport-bench/target/lab/tb-lab.json",
+    "ended": "2026-11-24T17:20:17.110774Z",
+    "cases_run": 1,
+    "status_counts": {
+     "transport_failed": 1
+    }
+   },
+   {
+    "mode": "linode",
+    "started": "2026-11-24T17:20:17.238194Z",
+    "argv": [
+     "lab/bench.py",
+     "run",
+     "--run-id",
+     "tbench-linode-20261124",
+     "--matrix",
+     "lab/matrices/C.json",
+     "--only",
+     "^C-srt(-fec)?-lon-2160p80-rtt30-l5-lat(1.5|2.5)x$"
+    ],
+    "matrix": "~/wavey.ai/transport-bench/lab/matrices/C.json",
+    "matrix_sha256": "79aa4207e0c39554431901d1b03a6eb7aa3e2853e150a79437459cb68e956791",
+    "matrix_copy": "matrices/C-79aa4207e0.json",
+    "only": "^C-srt(-fec)?-lon-2160p80-rtt30-l5-lat(1.5|2.5)x$",
+    "resume": false,
+    "host": "localhost",
+    "lab_run_id": "tb1124a",
+    "state_file": "~/wavey.ai/transport-bench/target/lab/tb-lab.json",
+    "ended": "2026-11-24T17:22:31.003400Z",
+    "cases_run": 4,
+    "status_counts": {
+     "ok": 4
+    }
+   },
+   {
+    "mode": "linode",
+    "started": "2026-11-24T17:22:31.131135Z",
+    "argv": [
+     "lab/bench.py",
+     "run",
+     "--run-id",
+     "tbench-linode-20261124",
+     "--matrix",
+     "lab/matrices/F.json",
+     "--only",
+     "^F-srt(-fec)?-lon-2160p5-rtt30-l1-fo100$"
+    ],
+    "matrix": "~/wavey.ai/transport-bench/lab/matrices/F.json",
+    "matrix_sha256": "661bbe588f79f2e57c9bdbbf10918cb2afdf87301df0bb1b62cdee20571f3028",
+    "matrix_copy": "matrices/F-661bbe588f.json",
+    "only": "^F-srt(-fec)?-lon-2160p5-rtt30-l1-fo100$",
+    "resume": false,
+    "host": "localhost",
+    "lab_run_id": "tb1124a",
+    "state_file": "~/wavey.ai/transport-bench/target/lab/tb-lab.json",
+    "ended": "2026-11-24T17:24:05.176560Z",
+    "cases_run": 2,
+    "status_counts": {
+     "ok": 2
+    }
+   }
+  ]
+ },
+ "cases": {
+  "count": 972,
+  "status": {
+   "ok": 967,
+   "transport_failed": 5
+  },
+  "earlier_attempts": 7,
+  "not_ok": [
+   "A-srt-fec-lon-2160p160-rtt250-ge",
+   "F-librist-lon-2160p25-rtt30-l1-fo100",
+   "F-rist-rs-lon-2160p25-rtt30-l1-fo100",
+   "F-srt-fec-lon-2160p25-rtt30-l1-fo100",
+   "F-srt-lon-2160p25-rtt30-l1-fo100"
+  ],
+  "transport_failed": [
+   "A-srt-fec-lon-2160p160-rtt250-ge",
+   "F-librist-lon-2160p25-rtt30-l1-fo100",
+   "F-rist-rs-lon-2160p25-rtt30-l1-fo100",
+   "F-srt-fec-lon-2160p25-rtt30-l1-fo100",
+   "F-srt-lon-2160p25-rtt30-l1-fo100"
+  ],
+  "failed": []
+ },
+ "topology": {
+  "lab_run_id": "tb1124a",
+  "image": "linode/arch",
+  "nodes": [
+   {
+    "name": "syd-rx",
+    "role": "bench-rx",
+    "site": "sydney",
+    "region": "ap-southeast",
+    "type": "g6-dedicated-8",
+    "hourly_usd": 0.216,
+    "public_ipv4": "redacted",
+    "vlan_ipv4": null,
+    "created": "2026-11-24T07:59:27"
+   },
+   {
+    "name": "new-rx",
+    "role": "bench-rx",
+    "site": "newark",
+    "region": "us-east",
+    "type": "g6-dedicated-8",
+    "hourly_usd": 0.216,
+    "public_ipv4": "redacted",
+    "vlan_ipv4": null,
+    "created": "2026-11-24T07:59:28"
+   },
+   {
+    "name": "lon-rx",
+    "role": "bench-rx",
+    "site": "london",
+    "region": "gb-lon",
+    "type": "g6-dedicated-16",
+    "hourly_usd": 0.432,
+    "public_ipv4": "redacted",
+    "vlan_ipv4": "10.78.1.11",
+    "created": "2026-11-24T07:59:30"
+   },
+   {
+    "name": "lon-tx",
+    "role": "bench-tx",
+    "site": "london",
+    "region": "gb-lon",
+    "type": "g6-dedicated-16",
+    "hourly_usd": 0.432,
+    "public_ipv4": "redacted",
+    "vlan_ipv4": "10.78.1.10",
+    "created": "2026-11-24T07:59:32"
+   }
+  ]
+ },
+ "cost": {
+  "source": "estimate: ceil(hours to last case) x hourly price, from lab-state.json",
+  "usd": 12.96,
+  "rows": [
+   {
+    "name": "syd-rx",
+    "hours": 10,
+    "usd": 2.16
+   },
+   {
+    "name": "new-rx",
+    "hours": 10,
+    "usd": 2.16
+   },
+   {
+    "name": "lon-rx",
+    "hours": 10,
+    "usd": 4.32
+   },
+   {
+    "name": "lon-tx",
+    "hours": 10,
+    "usd": 4.32
+   }
+  ]
+ },
+ "node_facts": {
+  "new-rx": {
+   "kernel": "7.2.11-arch1-1",
+   "glibc": "ldd (GNU libc) 2.44",
+   "cpu": "AMD EPYC 7642 48-Core Processor",
+   "nproc": "8",
+   "mem_kb": "16367072",
+   "chrony_offset_ms": 7.4e-05,
+   "chrony_rms_offset_ms": 0.083933,
+   "chrony_synced": true,
+   "full_upgrade": true,
+   "tb_sha256": "61511b551c410fd9608838df90bddc5286b15626ebc772cd7a79aa644fd70656",
+   "rmem_max": "67108864",
+   "wmem_max": "67108864",
+   "backlog": "250000",
+   "ipfrag_time": "1",
+   "ipfrag_high_thresh": "67108864",
+   "ipfrag_max_dist": "0",
+   "chrony_source": "redacted",
+   "rungs": [
+    "2160p25",
+    "2160p80",
+    "2160p160",
+    "2160p240"
+   ],
+   "error": null
+  },
+  "lon-tx": {
+   "kernel": "7.2.11-arch1-1",
+   "glibc": "ldd (GNU libc) 2.44",
+   "cpu": "AMD EPYC 7713 64-Core Processor",
+   "nproc": "16",
+   "mem_kb": "32855472",
+   "chrony_offset_ms": 0.001586,
+   "chrony_rms_offset_ms": 0.108747,
+   "chrony_synced": true,
+   "full_upgrade": true,
+   "tb_sha256": "61511b551c410fd9608838df90bddc5286b15626ebc772cd7a79aa644fd70656",
+   "rmem_max": "67108864",
+   "wmem_max": "67108864",
+   "backlog": "250000",
+   "ipfrag_time": "1",
+   "ipfrag_high_thresh": "67108864",
+   "ipfrag_max_dist": "0",
+   "chrony_source": "redacted",
+   "rungs": [
+    "2160p5",
+    "2160p25",
+    "2160p80",
+    "2160p160",
+    "2160p240",
+    "2160p320"
+   ],
+   "error": null
+  },
+  "syd-rx": {
+   "kernel": "7.2.11-arch1-1",
+   "glibc": "ldd (GNU libc) 2.44",
+   "cpu": "AMD EPYC 7713 64-Core Processor",
+   "nproc": "8",
+   "mem_kb": "16367076",
+   "chrony_offset_ms": -0.039532,
+   "chrony_rms_offset_ms": 0.444245,
+   "chrony_synced": true,
+   "full_upgrade": true,
+   "tb_sha256": "61511b551c410fd9608838df90bddc5286b15626ebc772cd7a79aa644fd70656",
+   "rmem_max": "67108864",
+   "wmem_max": "67108864",
+   "backlog": "250000",
+   "ipfrag_time": "1",
+   "ipfrag_high_thresh": "67108864",
+   "ipfrag_max_dist": "0",
+   "chrony_source": "2404:9400:3:0:216:3eff:fee8:bc1a",
+   "rungs": [
+    "2160p25",
+    "2160p80",
+    "2160p160",
+    "2160p240"
+   ],
+   "error": null
+  },
+  "lon-rx": {
+   "kernel": "7.2.11-arch1-1",
+   "glibc": "ldd (GNU libc) 2.44",
+   "cpu": "AMD EPYC 7713 64-Core Processor",
+   "nproc": "16",
+   "mem_kb": "32855468",
+   "chrony_offset_ms": -8.7e-05,
+   "chrony_rms_offset_ms": 0.033181,
+   "chrony_synced": true,
+   "full_upgrade": true,
+   "tb_sha256": "61511b551c410fd9608838df90bddc5286b15626ebc772cd7a79aa644fd70656",
+   "rmem_max": "67108864",
+   "wmem_max": "67108864",
+   "backlog": "250000",
+   "ipfrag_time": "1",
+   "ipfrag_high_thresh": "67108864",
+   "ipfrag_max_dist": "0",
+   "chrony_source": "10.78.1.10",
+   "rungs": [
+    "2160p5",
+    "2160p25",
+    "2160p80",
+    "2160p160",
+    "2160p240",
+    "2160p320"
+   ],
+   "error": null
+  }
+ },
+ "files": {
+  "count": 27894,
+  "note": "per-file list omitted here; full manifest with raw data in needletail-data/tbench-linode-20261124/ (R2 bucket needletail-data)"
+ },
+ "total_bytes": 1128361573
+}

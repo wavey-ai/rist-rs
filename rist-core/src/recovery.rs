@@ -1,5 +1,6 @@
 use crate::ReceivedPayload;
-use std::collections::BTreeMap;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -18,11 +19,18 @@ pub struct SavedPacket {
     pub payload: Vec<u8>,
 }
 
+/// The most packets a sender history grows to by time: requests carry
+/// 16-bit sequences that the sender extends near the newest sequence sent,
+/// so nothing more than 2^15 behind it can ever be named.
+pub const MAX_ADDRESSABLE_HISTORY: usize = 1 << 15;
+
 #[derive(Debug, Clone)]
 pub struct SenderHistory {
     slots: Vec<Option<SavedPacket>>,
     mask: usize,
     len: usize,
+    retention: Duration,
+    max_packets: usize,
 }
 
 /// Restores wire order before a recovered RIST payload is exposed as bytes.
@@ -32,13 +40,102 @@ pub struct SenderHistory {
 /// hold later packets behind a sequence gap; otherwise a retransmission is
 /// appended after the data that followed it and corrupts the reconstructed
 /// stream.
+///
+/// Sequences are extended to 64 bits relative to the release point, so the
+/// buffer is a `BTreeMap` walk (O(log n) per packet) and crosses the u32
+/// rollover like any other sequence. An in-order packet with nothing held
+/// takes a fast path that touches no map.
+///
+/// A packet behind the release point (a repair that arrives after its gap
+/// was skipped, or a copy of a packet already released) is dropped and
+/// counted as late; it is never held.
+///
+/// A stream that jumps backwards for good (a sender restart, or a receiver
+/// peer re-created after idle eviction, which restarts sequence extension)
+/// would otherwise be late forever. After [`RESYNC_LATE_RUN`] consecutive
+/// pushes that are each more than [`RESYNC_HORIZON`] (or the bound, if
+/// larger) behind and step forward from one another, a
+/// [`OverflowPolicy::SkipOldestGap`] buffer releases what it holds and
+/// restarts at the incoming sequence (counted in
+/// [`OrderedStats::resyncs`]); a [`OverflowPolicy::FailClosed`] buffer
+/// returns [`OrderedPayloadBufferError`] for each such push until
+/// [`OrderedPayloadBuffer::reset`]. A late repair is never that far behind
+/// and arrives among in-order packets, which end the run.
+///
+/// # Stream start
+///
+/// With a startup hold ([`OrderedPayloadBuffer::with_startup_hold`]; on by
+/// default in [`OrderedPayloadBuffer::with_deadline`]) the start of a stream
+/// is recovered like its middle:
+/// - A first payload at sequence 0 is released at once (librist and rist-rs
+///   number from 0, so nothing precedes it).
+/// - A first payload at sequence 1 to [`ZERO_START_REACH`] is held behind
+///   a gap back to 0, with the ordinary gap deadline: the receiver (with
+///   `RecoveryTuning::startup_recovery`) NACKs those sequences as holes.
+/// - Any other first payload is held (with what follows it) until the
+///   start is known or the hold expires. Meanwhile a payload up to
+///   [`STARTUP_REACH`] below the lowest held one becomes the new lowest
+///   instead of being dropped as late (reordering at the start, or the
+///   sender's retry-marked copy of a lost first packet). The start is known
+///   when the lowest held sequence is at most [`ZERO_START_REACH`] (then the
+///   gap back to 0 is an ordinary gap), or when the lowest held sequence
+///   arrives a second time (a rist-rs sender sends its first packet again,
+///   so a duplicate of it says nothing came before). When the hold ends the
+///   gaps above the lowest held payload are ordinary gaps, with deadlines
+///   from the arrival of their first successor.
+///
+/// Callers push duplicates too (they are counted and dropped): a duplicate
+/// of the first packet ends the hold early.
 #[derive(Debug, Clone)]
 pub struct OrderedPayloadBuffer {
-    next_sequence: Option<u32>,
-    pending: BTreeMap<u32, PendingPayload>,
+    /// The next extended sequence to release.
+    next: Option<u64>,
+    /// Held payloads by extended sequence; every key is above `next`.
+    /// Arrivals are non-decreasing in key: a payload inserted before a held
+    /// one takes the earlier arrival, so the first entry's arrival is when
+    /// the gap at `next` was first seen.
+    pending: BTreeMap<u64, PendingPayload>,
     max_pending_packets: usize,
     reorder_delay: Duration,
+    overflow: OverflowPolicy,
+    stats: OrderedStats,
+    /// Consecutive pushes far behind the release point, and the last of
+    /// them (see [`RESYNC_LATE_RUN`]).
+    late_run: u32,
+    late_run_last: u32,
+    /// How long the first payload of a stream may wait for what precedes
+    /// it (see [`OrderedPayloadBuffer::with_startup_hold`]); zero: not at
+    /// all. Capped at `reorder_delay` when applied.
+    startup_hold: Duration,
+    /// While the start of the stream is unknown: when the hold ends.
+    /// Nothing has been released, and `next` is the lowest held key.
+    startup_until: Option<Instant>,
 }
+
+/// How far below the lowest held payload an [`OrderedPayloadBuffer`] (and a
+/// receiver with `RecoveryTuning::startup_recovery`) still takes a packet as
+/// the start of the stream while the startup hold lasts.
+pub const STARTUP_REACH: u32 = 1 << 10;
+
+/// A stream whose lowest sequence seen at its start is at most this is
+/// taken to start at sequence 0: librist (0.2.20, `ctx->common.seq_rtp`
+/// starts at 0) and rist-rs senders number from 0, so the sequences below
+/// it were lost or are still on their way, and are recovered as holes.
+pub const ZERO_START_REACH: u32 = 16;
+
+/// The default first-payload hold of [`OrderedPayloadBuffer::with_deadline`]
+/// (capped at its gap deadline): it covers a rist-rs sender's late copy of
+/// its first packet (`RecoveryTuning::first_packet_late_copy`, 12 ms) and
+/// the reordering of a jittery path at the start.
+pub const DEFAULT_STARTUP_HOLD: Duration = Duration::from_millis(25);
+
+/// Consecutive far-behind pushes after which an [`OrderedPayloadBuffer`]
+/// takes the stream as restarted.
+pub const RESYNC_LATE_RUN: u32 = 8;
+
+/// How far behind the release point a push must be to count toward a
+/// resync: half the 16-bit horizon a NACK can reach back.
+pub const RESYNC_HORIZON: u32 = 1 << 15;
 
 #[derive(Debug, Clone)]
 struct PendingPayload {
@@ -46,26 +143,167 @@ struct PendingPayload {
     payload: ReceivedPayload,
 }
 
+/// What an [`OrderedPayloadBuffer`] does when more than its bound is held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverflowPolicy {
+    /// Refuse the packet with [`OrderedPayloadBufferError`] (after first
+    /// releasing any gap whose deadline has passed). The behaviour of
+    /// [`OrderedPayloadBuffer::new`] and
+    /// [`OrderedPayloadBuffer::with_reorder_delay`].
+    FailClosed,
+    /// Skip the oldest gap (counted in [`OrderedStats`]) until the bound
+    /// holds again, so a push never fails. The behaviour of
+    /// [`OrderedPayloadBuffer::with_deadline`].
+    SkipOldestGap,
+}
+
+/// What happened to one pushed payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderedPush {
+    /// The payload, or a gap's deadline, released at least one payload.
+    Released,
+    /// Held behind a gap; nothing was released.
+    Held,
+    /// Already held, or flagged as a duplicate by the receiver: dropped.
+    Duplicate,
+    /// Behind the release point: dropped and counted in
+    /// [`OrderedStats::late_dropped`].
+    Late,
+}
+
+/// Counters of an [`OrderedPayloadBuffer`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OrderedStats {
+    /// Payloads released in order.
+    pub released: u64,
+    /// Gaps given up (at their deadline, at the bound, or by `flush_all`).
+    pub gaps_skipped: u64,
+    /// Sequences inside the skipped gaps.
+    pub packets_skipped: u64,
+    /// Payloads that arrived behind the release point and were dropped.
+    pub late_dropped: u64,
+    /// Payloads dropped as duplicates.
+    pub duplicates: u64,
+    /// The most payloads held at once.
+    pub held_max: u64,
+    /// Times the buffer restarted at a stream that jumped backwards for
+    /// good (see [`OrderedPayloadBuffer`]).
+    pub resyncs: u64,
+    /// Streams whose first payload was held because their start was
+    /// unknown (see the stream start section of [`OrderedPayloadBuffer`]).
+    pub startup_holds: u64,
+    /// Of those, the holds that ended at their deadline rather than when
+    /// the start became known.
+    pub startup_timeouts: u64,
+    /// Payloads taken below the lowest held one during a startup hold.
+    pub startup_rebased: u64,
+    /// Streams taken to start at sequence 0 although their first payload
+    /// was a later sequence (at most [`ZERO_START_REACH`]).
+    pub zero_starts: u64,
+}
+
 impl OrderedPayloadBuffer {
+    /// Holds gaps without a deadline and fails closed past
+    /// `max_pending_packets` held payloads.
     pub fn new(max_pending_packets: usize) -> Self {
         Self::with_reorder_delay(max_pending_packets, Duration::MAX)
     }
 
+    /// Skips a gap once the first payload after it has waited
+    /// `reorder_delay`, and fails closed past `max_pending_packets` held
+    /// payloads when no gap is due.
     pub fn with_reorder_delay(max_pending_packets: usize, reorder_delay: Duration) -> Self {
+        Self::with_policy(
+            max_pending_packets,
+            reorder_delay,
+            OverflowPolicy::FailClosed,
+        )
+    }
+
+    /// Skips a gap once the first payload after it has waited
+    /// `reorder_delay`, and skips the oldest gap instead of failing when
+    /// more than `max_pending_packets` are held: pushes never fail. Use it
+    /// for a byte stream that should carry on past an unrecoverable loss
+    /// (an MPEG-TS demuxer sees a continuity-counter jump, as with librist).
+    ///
+    /// The start of the stream is recovered too: the startup hold is
+    /// [`DEFAULT_STARTUP_HOLD`] capped at `reorder_delay` (see the stream
+    /// start section of [`OrderedPayloadBuffer`]; it matches
+    /// `RecoveryTuning::default().ordered_startup_hold(reorder_delay)`).
+    /// [`Self::with_startup_hold`]`(Duration::ZERO)` turns it off.
+    pub fn with_deadline(max_pending_packets: usize, reorder_delay: Duration) -> Self {
+        Self::with_policy(
+            max_pending_packets,
+            reorder_delay,
+            OverflowPolicy::SkipOldestGap,
+        )
+        .with_startup_hold(DEFAULT_STARTUP_HOLD)
+    }
+
+    pub fn with_policy(
+        max_pending_packets: usize,
+        reorder_delay: Duration,
+        overflow: OverflowPolicy,
+    ) -> Self {
         Self {
-            next_sequence: None,
+            next: None,
             pending: BTreeMap::new(),
             max_pending_packets: max_pending_packets.max(1),
             reorder_delay,
+            overflow,
+            stats: OrderedStats::default(),
+            late_run: 0,
+            late_run_last: 0,
+            startup_hold: Duration::ZERO,
+            startup_until: None,
         }
+    }
+
+    /// Recovers the start of a stream as described in the stream start
+    /// section of [`OrderedPayloadBuffer`], holding a first payload whose
+    /// start is unknown for at most `hold` (capped at the gap deadline).
+    /// Zero releases the first payload at once, whatever its sequence (the
+    /// default of every constructor but [`Self::with_deadline`]).
+    pub fn with_startup_hold(mut self, hold: Duration) -> Self {
+        self.set_startup_hold(hold);
+        self
+    }
+
+    /// See [`Self::with_startup_hold`]; applies from the next stream start.
+    pub fn set_startup_hold(&mut self, hold: Duration) {
+        self.startup_hold = hold;
+    }
+
+    /// The startup hold in effect: the configured hold capped at the gap
+    /// deadline.
+    pub fn startup_hold(&self) -> Duration {
+        self.startup_hold.min(self.reorder_delay)
+    }
+
+    /// Whether the first payload is held because the start of the stream
+    /// is not known yet.
+    pub fn in_startup(&self) -> bool {
+        self.startup_until.is_some()
+    }
+
+    /// Forgets the release point and everything held (dropped, not
+    /// released); the next push starts the stream again. Counters are kept.
+    /// Call it when the stream is known to restart, for example when the
+    /// receiver re-creates an evicted peer.
+    pub fn reset(&mut self) {
+        self.next = None;
+        self.pending.clear();
+        self.late_run = 0;
+        self.startup_until = None;
     }
 
     /// Inserts one arrival and returns every newly contiguous payload in wire
     /// order. Already delivered and bonded-path duplicate packets are ignored.
     ///
-    /// The buffer fails closed when a gap grows beyond its configured bound.
-    /// Continuing by concatenating bytes across an unresolved gap would turn
-    /// packet loss into silent stream corruption.
+    /// With [`OverflowPolicy::FailClosed`] the buffer fails closed when a gap
+    /// grows beyond its configured bound. Continuing by concatenating bytes
+    /// across an unresolved gap would turn packet loss into silent stream
+    /// corruption.
     pub fn push(
         &mut self,
         payload: ReceivedPayload,
@@ -78,72 +316,364 @@ impl OrderedPayloadBuffer {
         payload: ReceivedPayload,
         now: Instant,
     ) -> Result<Vec<ReceivedPayload>, OrderedPayloadBufferError> {
-        if payload.duplicate {
-            return Ok(Vec::new());
-        }
-
-        let sequence = payload.sequence;
-        let next_sequence = *self.next_sequence.get_or_insert(sequence);
-        if self.pending.contains_key(&sequence) {
-            return Ok(Vec::new());
-        }
-
-        self.pending.insert(
-            sequence,
-            PendingPayload {
-                arrival: now,
-                payload,
-            },
-        );
-
-        let mut ready = self.drain_contiguous(next_sequence);
-
-        if self.pending.len() > self.max_pending_packets {
-            self.pending.remove(&sequence);
-            return Err(OrderedPayloadBufferError {
-                next_sequence: self.next_sequence.unwrap_or(next_sequence),
-                received_sequence: sequence,
-                max_pending_packets: self.max_pending_packets,
-            });
-        }
-
-        if ready.is_empty() {
-            ready.extend(self.release_expired(now));
-        }
+        let mut ready = Vec::new();
+        self.push_into(payload, now, &mut ready)?;
         Ok(ready)
     }
 
-    /// Releases the earliest packet after its reorder deadline and then drains
-    /// all contiguous successors. This turns an unrecoverable gap into an
-    /// explicit deadline decision rather than an indefinitely growing buffer.
-    pub fn release_expired(&mut self, now: Instant) -> Vec<ReceivedPayload> {
-        let Some(next) = self.next_sequence else {
-            return Vec::new();
-        };
-        let Some((&sequence, pending)) = self
-            .pending
-            .iter()
-            .filter(|(sequence, _)| sequence.wrapping_sub(next) < (1 << 31))
-            .min_by_key(|(sequence, _)| sequence.wrapping_sub(next))
-        else {
-            return Vec::new();
-        };
-        if now.saturating_duration_since(pending.arrival) < self.reorder_delay {
-            return Vec::new();
+    /// [`Self::push_at`] appending to `out`, so a caller that reuses `out`
+    /// allocates nothing per packet. On `Err` nothing was appended.
+    pub fn push_into(
+        &mut self,
+        payload: ReceivedPayload,
+        now: Instant,
+        out: &mut Vec<ReceivedPayload>,
+    ) -> Result<OrderedPush, OrderedPayloadBufferError> {
+        let before = out.len();
+        if payload.duplicate {
+            self.stats.duplicates += 1;
+            if self.is_lowest_held(payload.sequence) {
+                // The first packet again: nothing came before it.
+                self.end_startup(out);
+            }
+            return Ok(Self::outcome(out.len() > before, OrderedPush::Duplicate));
         }
-        self.next_sequence = Some(sequence);
-        self.drain_contiguous(sequence)
+        let sequence = payload.sequence;
+        if self.next.is_none() {
+            let key = u64::from(sequence) + (1u64 << 32);
+            let hold = self.startup_hold();
+            if hold.is_zero() || sequence == 0 {
+                self.next = Some(key);
+            } else if sequence <= ZERO_START_REACH {
+                // Numbered from 0: hold behind an ordinary gap back to 0.
+                self.next = Some(key - u64::from(sequence));
+                self.stats.zero_starts += 1;
+            } else {
+                self.next = Some(key);
+                self.startup_until = Some(now + hold);
+                self.stats.startup_holds += 1;
+            }
+        }
+        let payload = if self.startup_until.is_some() {
+            match self.push_startup(payload, now, out)? {
+                Ok(push) => return Ok(push),
+                // Not part of this start: the hold is over, carry on as usual.
+                Err(payload) => payload,
+            }
+        } else {
+            payload
+        };
+        let pushed = self.push_after_start(payload, now, out)?;
+        Ok(Self::outcome(out.len() > before, pushed))
     }
 
-    fn drain_contiguous(&mut self, start: u32) -> Vec<ReceivedPayload> {
-        let mut ready = Vec::new();
-        let mut next = start;
-        while let Some(pending) = self.pending.remove(&next) {
-            ready.push(pending.payload);
-            next = next.wrapping_add(1);
+    fn outcome(released: bool, otherwise: OrderedPush) -> OrderedPush {
+        if released {
+            OrderedPush::Released
+        } else {
+            otherwise
         }
-        self.next_sequence = Some(next);
+    }
+
+    /// Whether `sequence` is the lowest held payload of a startup hold.
+    fn is_lowest_held(&self, sequence: u32) -> bool {
+        self.startup_until.is_some() && self.next.is_some_and(|next| next as u32 == sequence)
+    }
+
+    /// Ends the startup hold: the lowest held payload is the start, and
+    /// what follows it is released up to the first gap.
+    fn end_startup(&mut self, out: &mut Vec<ReceivedPayload>) {
+        if self.startup_until.take().is_some() {
+            self.drain_into(out);
+        }
+    }
+
+    /// A push while the start is unknown (`next` is the lowest held key and
+    /// nothing was released). Gives the payload back when it lies too far
+    /// below the lowest held one to belong to this start; the hold is then
+    /// over.
+    fn push_startup(
+        &mut self,
+        payload: ReceivedPayload,
+        now: Instant,
+        out: &mut Vec<ReceivedPayload>,
+    ) -> Result<Result<OrderedPush, ReceivedPayload>, OrderedPayloadBufferError> {
+        let before = out.len();
+        let lowest = self.next.expect("a startup hold has a lowest held key");
+        let sequence = payload.sequence;
+        let distance = sequence.wrapping_sub(lowest as u32);
+        let key = if distance < 1 << 31 {
+            lowest + u64::from(distance)
+        } else {
+            let below = distance.wrapping_neg();
+            if below > STARTUP_REACH {
+                self.end_startup(out);
+                return Ok(Err(payload));
+            }
+            lowest - u64::from(below)
+        };
+        if self.pending.contains_key(&key) {
+            self.stats.duplicates += 1;
+            if key == lowest {
+                self.end_startup(out);
+            }
+            return Ok(Ok(Self::outcome(
+                out.len() > before,
+                OrderedPush::Duplicate,
+            )));
+        }
+        let arrival = self
+            .pending
+            .range(key..)
+            .next()
+            .map_or(now, |(_, held)| held.arrival.min(now));
+        self.pending
+            .insert(key, PendingPayload { arrival, payload });
+        self.stats.held_max = self.stats.held_max.max(self.pending.len() as u64);
+        if key < lowest {
+            self.next = Some(key);
+            self.stats.startup_rebased += 1;
+        }
+        let lowest = self.next.unwrap_or(key);
+        let lowest_sequence = lowest as u32;
+        if lowest_sequence <= ZERO_START_REACH {
+            // Numbered from 0: the start is known, and any gap back to 0
+            // is an ordinary gap.
+            if lowest_sequence > 0 {
+                self.stats.zero_starts += 1;
+            }
+            self.next = Some(lowest - u64::from(lowest_sequence));
+            self.startup_until = None;
+            self.drain_into(out);
+        } else if self.pending.len() > self.max_pending_packets
+            || self.startup_until.is_some_and(|until| now >= until)
+        {
+            if self.pending.len() <= self.max_pending_packets {
+                self.stats.startup_timeouts += 1;
+            }
+            self.end_startup(out);
+        }
+        if self.startup_until.is_none() {
+            self.bound_and_expire(key, sequence, now, out)?;
+        }
+        Ok(Ok(Self::outcome(out.len() > before, OrderedPush::Held)))
+    }
+
+    /// A push once the start of the stream is known.
+    fn push_after_start(
+        &mut self,
+        payload: ReceivedPayload,
+        now: Instant,
+        out: &mut Vec<ReceivedPayload>,
+    ) -> Result<OrderedPush, OrderedPayloadBufferError> {
+        let sequence = payload.sequence;
+        let mut next = *self.next.get_or_insert(u64::from(sequence) + (1u64 << 32));
+        let mut distance = sequence.wrapping_sub(next as u32);
+        if distance >= 1 << 31 {
+            if !self.far_behind_run(sequence, distance.wrapping_neg()) {
+                self.stats.late_dropped += 1;
+                return Ok(OrderedPush::Late);
+            }
+            match self.overflow {
+                OverflowPolicy::FailClosed => {
+                    self.stats.late_dropped += 1;
+                    return Err(OrderedPayloadBufferError {
+                        next_sequence: next as u32,
+                        received_sequence: sequence,
+                        max_pending_packets: self.max_pending_packets,
+                    });
+                }
+                OverflowPolicy::SkipOldestGap => {
+                    self.flush_all_into(out);
+                    next = u64::from(sequence) + (1u64 << 32);
+                    self.next = Some(next);
+                    distance = 0;
+                    self.late_run = 0;
+                    self.stats.resyncs += 1;
+                }
+            }
+        } else {
+            self.late_run = 0;
+        }
+        if distance == 0 && self.pending.is_empty() {
+            out.push(payload);
+            self.next = Some(next + 1);
+            self.stats.released += 1;
+            return Ok(OrderedPush::Released);
+        }
+        let key = next + u64::from(distance);
+        if self.pending.contains_key(&key) {
+            self.stats.duplicates += 1;
+            return Ok(OrderedPush::Duplicate);
+        }
+        let arrival = self
+            .pending
+            .range(key..)
+            .next()
+            .map_or(now, |(_, held)| held.arrival.min(now));
+        self.pending
+            .insert(key, PendingPayload { arrival, payload });
+        self.stats.held_max = self.stats.held_max.max(self.pending.len() as u64);
+
+        let before = out.len();
+        self.drain_into(out);
+        self.bound_and_expire(key, sequence, now, out)?;
+        Ok(if out.len() > before {
+            OrderedPush::Released
+        } else {
+            OrderedPush::Held
+        })
+    }
+
+    /// After an insert at `key`: enforces the bound (releasing expired gaps
+    /// first) and, when nothing was released yet by this push, releases
+    /// any gap whose deadline has passed.
+    fn bound_and_expire(
+        &mut self,
+        key: u64,
+        sequence: u32,
+        now: Instant,
+        out: &mut Vec<ReceivedPayload>,
+    ) -> Result<(), OrderedPayloadBufferError> {
+        let before = out.len();
+        if self.pending.len() > self.max_pending_packets {
+            // A gap whose deadline has passed is skipped before the bound
+            // decides.
+            self.release_expired_into(now, out);
+        }
+        while self.pending.len() > self.max_pending_packets {
+            match self.overflow {
+                OverflowPolicy::FailClosed => {
+                    // Nothing was released: a release would have shrunk
+                    // `pending` back under the bound.
+                    self.pending.remove(&key);
+                    return Err(OrderedPayloadBufferError {
+                        next_sequence: self.next.unwrap_or(key) as u32,
+                        received_sequence: sequence,
+                        max_pending_packets: self.max_pending_packets,
+                    });
+                }
+                OverflowPolicy::SkipOldestGap => {
+                    self.skip_to_first(out);
+                }
+            }
+        }
+        if out.len() == before {
+            self.release_expired_into(now, out);
+        }
+        Ok(())
+    }
+
+    /// Counts a push `behind` sequences behind the release point toward a
+    /// resync; true once the run is long enough. A push within the horizon,
+    /// or one that does not step forward from the last of the run, starts
+    /// it again.
+    fn far_behind_run(&mut self, sequence: u32, behind: u32) -> bool {
+        let horizon = RESYNC_HORIZON.max(self.max_pending_packets.min(1 << 30) as u32);
+        if behind <= horizon {
+            self.late_run = 0;
+            return false;
+        }
+        let step = sequence.wrapping_sub(self.late_run_last);
+        if self.late_run == 0 || step == 0 || step > horizon {
+            self.late_run = 0;
+        }
+        self.late_run += 1;
+        self.late_run_last = sequence;
+        self.late_run >= RESYNC_LATE_RUN
+    }
+
+    /// Skips every gap whose first held successor has waited the reorder
+    /// delay, and drains what follows each: several expired gaps go in one
+    /// call. O(log n) per gap.
+    pub fn release_expired(&mut self, now: Instant) -> Vec<ReceivedPayload> {
+        let mut ready = Vec::new();
+        self.release_expired_into(now, &mut ready);
         ready
+    }
+
+    /// [`Self::release_expired`] appending to `out`. Returns the number of
+    /// sequences skipped.
+    pub fn release_expired_into(&mut self, now: Instant, out: &mut Vec<ReceivedPayload>) -> u64 {
+        if self.startup_until.is_some_and(|until| now >= until) {
+            self.stats.startup_timeouts += 1;
+            self.end_startup(out);
+        }
+        let mut skipped = 0;
+        while let Some(Some(deadline)) = self.first_gap_deadline() {
+            if now < deadline {
+                break;
+            }
+            skipped += self.skip_to_first(out);
+        }
+        skipped
+    }
+
+    /// When the gap at the release point is given up (or the startup hold
+    /// ends): `None` when nothing is held, `Some(None)` when never.
+    fn first_gap_deadline(&self) -> Option<Option<Instant>> {
+        let (_, held) = self.pending.first_key_value()?;
+        if let Some(until) = self.startup_until {
+            return Some(Some(until));
+        }
+        Some(held.arrival.checked_add(self.reorder_delay))
+    }
+
+    /// Releases everything held in order, skipping every gap (counted): for
+    /// the end of a stream.
+    pub fn flush_all(&mut self) -> Vec<ReceivedPayload> {
+        let mut ready = Vec::new();
+        self.flush_all_into(&mut ready);
+        ready
+    }
+
+    pub fn flush_all_into(&mut self, out: &mut Vec<ReceivedPayload>) -> u64 {
+        let mut skipped = 0;
+        while !self.pending.is_empty() {
+            skipped += self.skip_to_first(out);
+        }
+        skipped
+    }
+
+    /// When [`Self::release_expired`] next skips a gap (the arrival of the
+    /// first payload after the gap plus the reorder delay) or ends the
+    /// startup hold. `None` when nothing is held or the delay is unbounded.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        self.first_gap_deadline().flatten()
+    }
+
+    /// Moves the release point to the first held payload and drains from
+    /// there. Returns the sequences skipped.
+    fn skip_to_first(&mut self, out: &mut Vec<ReceivedPayload>) -> u64 {
+        let Some((&first, _)) = self.pending.first_key_value() else {
+            return 0;
+        };
+        // A startup hold ends here; its lowest held key is `first`.
+        self.startup_until = None;
+        let next = self.next.unwrap_or(first);
+        let skipped = first.saturating_sub(next);
+        if skipped > 0 {
+            self.stats.gaps_skipped += 1;
+            self.stats.packets_skipped += skipped;
+        }
+        self.next = Some(first);
+        self.drain_into(out);
+        skipped
+    }
+
+    fn drain_into(&mut self, out: &mut Vec<ReceivedPayload>) {
+        let Some(mut next) = self.next else {
+            return;
+        };
+        while let Some(entry) = self.pending.first_entry() {
+            if *entry.key() != next {
+                break;
+            }
+            out.push(entry.remove().payload);
+            self.stats.released += 1;
+            next += 1;
+        }
+        self.next = Some(next);
     }
 
     pub fn pending_len(&self) -> usize {
@@ -151,7 +681,33 @@ impl OrderedPayloadBuffer {
     }
 
     pub fn next_sequence(&self) -> Option<u32> {
-        self.next_sequence
+        self.next.map(|next| next as u32)
+    }
+
+    pub fn reorder_delay(&self) -> Duration {
+        self.reorder_delay
+    }
+
+    pub fn overflow_policy(&self) -> OverflowPolicy {
+        self.overflow
+    }
+
+    pub fn stats(&self) -> OrderedStats {
+        self.stats
+    }
+
+    /// Sequences given up inside skipped gaps.
+    pub fn skipped_packets(&self) -> u64 {
+        self.stats.packets_skipped
+    }
+
+    pub fn gaps_skipped(&self) -> u64 {
+        self.stats.gaps_skipped
+    }
+
+    /// Payloads dropped because they arrived behind the release point.
+    pub fn late_dropped(&self) -> u64 {
+        self.stats.late_dropped
     }
 }
 
@@ -185,12 +741,36 @@ impl SenderHistory {
             slots: vec![None; capacity],
             mask: capacity.saturating_sub(1),
             len: 0,
+            retention: Duration::ZERO,
+            max_packets: capacity,
         }
+    }
+
+    /// Keeps every packet for at least `retention` after it was sent: an
+    /// insert that would evict a younger packet doubles the history first,
+    /// up to `max_packets` (rounded up to a power of two), and never past
+    /// [`MAX_ADDRESSABLE_HISTORY`]: a NACK names 16-bit sequences, so a
+    /// packet further behind the newest cannot be requested and a larger
+    /// table would only hold memory. Zero retention (the default) keeps the
+    /// fixed packet count of [`Self::new`], which is never shrunk. A
+    /// history created with zero packets stays disabled.
+    pub fn set_retention(&mut self, retention: Duration, max_packets: usize) {
+        self.retention = retention;
+        self.max_packets = max_packets
+            .min(MAX_ADDRESSABLE_HISTORY)
+            .max(self.slots.len());
+    }
+
+    pub fn retention(&self) -> Duration {
+        self.retention
     }
 
     pub fn insert(&mut self, sequence: u32, payload: impl Into<Vec<u8>>, now: Instant) {
         if self.slots.is_empty() {
             return;
+        }
+        while self.evicts_young(sequence, now) && self.slots.len() < self.max_packets {
+            self.grow();
         }
         let payload = payload.into();
         let slot = &mut self.slots[sequence as usize & self.mask];
@@ -205,6 +785,70 @@ impl SenderHistory {
             payload_len: payload.len(),
             payload,
         });
+    }
+
+    /// Stores the packet `encode` writes for `sequence` and returns it.
+    /// The buffer handed to `encode` is empty but keeps the capacity of the
+    /// packet the slot held before, so a warm history allocates nothing per
+    /// packet. `None` (and `encode` is not called) when the history is
+    /// disabled.
+    pub fn insert_with(
+        &mut self,
+        sequence: u32,
+        now: Instant,
+        encode: impl FnOnce(&mut Vec<u8>),
+    ) -> Option<&SavedPacket> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        while self.evicts_young(sequence, now) && self.slots.len() < self.max_packets {
+            self.grow();
+        }
+        let slot = &mut self.slots[sequence as usize & self.mask];
+        let mut buffer = match slot.take() {
+            Some(old) => {
+                let mut buffer = old.payload;
+                buffer.clear();
+                buffer
+            }
+            None => {
+                self.len += 1;
+                Vec::new()
+            }
+        };
+        encode(&mut buffer);
+        Some(slot.insert(SavedPacket {
+            sequence,
+            inserted_at: now,
+            retry_count: 0,
+            last_retry_at: None,
+            payload_len: buffer.len(),
+            payload: buffer,
+        }))
+    }
+
+    fn evicts_young(&self, sequence: u32, now: Instant) -> bool {
+        !self.retention.is_zero()
+            && self.slots[sequence as usize & self.mask]
+                .as_ref()
+                .is_some_and(|old| {
+                    old.sequence != sequence
+                        && now.saturating_duration_since(old.inserted_at) < self.retention
+                })
+    }
+
+    /// Doubles the slot table. Entries keep their low bits, so no two land
+    /// on the same new slot.
+    fn grow(&mut self) {
+        let capacity = self.slots.len() * 2;
+        let mask = capacity - 1;
+        let mut slots = vec![None; capacity];
+        for packet in self.slots.drain(..).flatten() {
+            let index = packet.sequence as usize & mask;
+            slots[index] = Some(packet);
+        }
+        self.slots = slots;
+        self.mask = mask;
     }
 
     pub fn get(&self, sequence: u32) -> Option<&SavedPacket> {
@@ -271,30 +915,200 @@ pub struct ReceiverObservation {
     pub newly_missing: Vec<u32>,
 }
 
+/// The furthest a hole may lie behind the highest received sequence and still
+/// be tracked.
+///
+/// NACK records carry only the low 16 bits of a sequence and the sender maps
+/// them back next to its own newest sequence, so a hole more than 32767 behind
+/// cannot be requested unambiguously. Holes beyond this horizon are counted in
+/// [`TrackerCounters::holes_unaddressable`], never dropped silently.
+pub const MAX_TRACKED_HOLE_DISTANCE: u32 = 0x7fff;
+
+/// Upper bound of the duplicate-detection ring of a [`MissingTracker`].
+pub const MAX_RECEIVER_WINDOW_PACKETS: usize = 1 << 20;
+
+/// Cumulative hole accounting of a [`MissingTracker`]. Every hole that is
+/// opened leaves through exactly one of: recovery, expiry, the address
+/// horizon, or a reset; each is counted. The counters survive
+/// [`MissingTracker::reset`] and [`MissingTracker::reconfigure`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TrackerCounters {
+    /// Holes opened (sequences detected as missing and tracked).
+    pub holes_opened: u64,
+    /// Holes closed by the arrival of their packet.
+    pub holes_recovered: u64,
+    /// Holes still missing when they reached the recovery age.
+    pub holes_expired: u64,
+    /// Missing sequences more than [`MAX_TRACKED_HOLE_DISTANCE`] behind the
+    /// highest sequence: the part of a gap beyond the horizon, and open holes
+    /// pushed past it by later packets.
+    pub holes_unaddressable: u64,
+    /// Open holes discarded by a reset (sender SSRC change or reconfiguration).
+    pub holes_reset: u64,
+    /// Packets that arrived after their hole had expired or left the horizon
+    /// (neither duplicates nor recoveries).
+    pub late_packets: u64,
+    /// Holes opened below the first sequence seen at the start of a stream
+    /// (see [`MissingTracker::set_startup_window`]); also in `holes_opened`.
+    pub startup_holes: u64,
+    /// Packets taken below the first sequence seen at the start of a
+    /// stream as its new start (not counted in `late_packets`).
+    pub startup_packets: u64,
+    /// Holes that reached `max_retries` NACKs and are no longer requested.
+    pub retries_exhausted: u64,
+    /// Holes no longer requested because a NACK could not arrive in time.
+    pub nack_too_late: u64,
+}
+
+/// NACK selection policy for one pass of [`MissingTracker::take_due_nacks`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NackSchedule {
+    /// Delay from detection to the first NACK of a hole (the reorder buffer).
+    pub initial_delay: Duration,
+    /// Delay between NACKs of the same hole. Used by the compatibility wrapper
+    /// [`MissingTracker::nacks_due`]; callers of the split API pass the repeat
+    /// delay to [`MissingTracker::commit_nacks`] per batch.
+    pub repeat_delay: Duration,
+    /// Holes that already received this many NACKs are not requested again.
+    pub max_retries: u32,
+    /// A hole is no longer requested when less than this is left before its
+    /// recovery deadline (detection + recovery age). Zero disables the check.
+    pub min_time_left: Duration,
+}
+
+impl Default for NackSchedule {
+    fn default() -> Self {
+        Self {
+            initial_delay: Duration::from_millis(15),
+            repeat_delay: Duration::from_millis(5),
+            max_retries: 20,
+            min_time_left: Duration::ZERO,
+        }
+    }
+}
+
+/// When the next NACK of a hole is due after one was sent; see
+/// [`MissingTracker::commit_nacks_with`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NackRepeat {
+    /// Delay from a NACK to the next NACK of the same hole.
+    pub delay: Duration,
+    /// Double the delay with every NACK of a hole: after its n-th NACK the
+    /// next is due `delay x 2^(n-1)` later. Used while the RTT is unknown,
+    /// so a long path is not flooded with re-requests.
+    pub backoff: bool,
+    /// Request every NACKed hole once more this long after the NACK (a
+    /// copy, see [`MissingTracker::take_due_copies`]); it does not count
+    /// as an attempt.
+    pub copy_gap: Option<Duration>,
+}
+
+impl NackRepeat {
+    pub fn fixed(delay: Duration) -> Self {
+        Self {
+            delay,
+            backoff: false,
+            copy_gap: None,
+        }
+    }
+
+    /// The delay after the `nack_count`-th NACK of a hole (1 for the first).
+    pub fn after(&self, nack_count: u32) -> Duration {
+        if !self.backoff {
+            return self.delay;
+        }
+        self.delay
+            .saturating_mul(1 << nack_count.saturating_sub(1).min(16))
+    }
+}
+
+/// Lifecycle of one tracked hole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoleStatus {
+    /// Missing and never requested; due at detection + initial delay.
+    Fresh,
+    /// Missing and scheduled for a NACK at [`HoleInfo::next_nack_at`].
+    Scheduled,
+    /// Returned by [`MissingTracker::take_due_nacks`] and not yet committed
+    /// or deferred.
+    Taken,
+    /// Missing, but no longer requested (retries exhausted or too late).
+    Abandoned,
+    /// Arrived; kept only until it reaches the front of the hole queue.
+    Recovered,
+}
+
+/// A snapshot of one tracked hole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HoleInfo {
+    pub sequence: u32,
+    pub status: HoleStatus,
+    pub first_missing_at: Instant,
+    pub last_nack_at: Option<Instant>,
+    pub nack_count: u32,
+    /// The next NACK instant of a scheduled hole.
+    pub next_nack_at: Option<Instant>,
+}
+
+/// The last hole closed by an arrival, for RTT sampling (Karn: use it only
+/// when `nack_count == 1` and the arrival was a retransmission).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveredHole {
+    pub sequence: u32,
+    pub first_missing_at: Instant,
+    /// When the hole's first NACK went out.
+    pub first_nack_at: Option<Instant>,
+    pub last_nack_at: Option<Instant>,
+    pub nack_count: u32,
+    pub recovered_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Hole {
+    sequence: u32,
+    status: HoleStatus,
+    nack_count: u32,
+    first_missing_at: Instant,
+    first_nack_at: Option<Instant>,
+    last_nack_at: Option<Instant>,
+    next_due: Instant,
+    /// When the copy of the last NACK is due, if one is pending.
+    copy_at: Option<Instant>,
+}
+
+/// Receiver-side loss tracker.
+///
+/// Holes live in a FIFO in detection order. Holes are only created when the
+/// highest sequence advances, so the FIFO is sorted both by (wrapping)
+/// sequence and by detection time: expiry pops from the front, and a repair
+/// finds its hole by binary search. A heap orders the holes that wait for a
+/// repeated (or deferred) NACK; holes that were never requested are taken in
+/// FIFO order from a cursor. The cost per packet is O(1) amortised (O(log
+/// holes) for a repair), a NACK pass costs O(due · log holes), and an idle
+/// check ([`Self::next_nack_at`]) is O(1), independent of the bitrate or the
+/// buffer length. Memory follows the actual loss, plus a 4-byte-per-slot
+/// ring used only to tell duplicates from late packets.
 #[derive(Debug, Clone)]
 pub struct MissingTracker {
-    slots: Vec<SequenceWindowSlot>,
-    mask: usize,
+    seen: Vec<u32>,
+    seen_ready: bool,
+    capacity: usize,
     highest: Option<u32>,
     recovery_age: Duration,
-    missing_count: usize,
-}
-
-#[derive(Debug, Clone)]
-struct SequenceWindowSlot {
-    sequence: u32,
-    state: SequenceState,
-}
-
-#[derive(Debug, Clone)]
-enum SequenceState {
-    Vacant,
-    Delivered,
-    Missing {
-        first_missing_at: Instant,
-        last_nack_at: Option<Instant>,
-        nack_count: u32,
-    },
+    initial_delay: Duration,
+    holes: VecDeque<Hole>,
+    live: usize,
+    fresh: usize,
+    schedule: BinaryHeap<Reverse<(Instant, u32)>>,
+    copies: BinaryHeap<Reverse<(Instant, u32)>>,
+    taken: Vec<u32>,
+    counters: TrackerCounters,
+    last_recovered: Option<RecoveredHole>,
+    /// See [`Self::set_startup_window`]; zero: off.
+    startup_window: Duration,
+    /// While the startup window is open: the lowest sequence taken as part
+    /// of the stream, and when the window closes.
+    startup: Option<(u32, Instant)>,
 }
 
 impl Default for MissingTracker {
@@ -312,193 +1126,731 @@ impl MissingTracker {
         self.observe_at(sequence, Instant::now())
     }
 
+    /// `window_packets` sizes the duplicate-detection ring (rounded up to a
+    /// power of two, at least 2, at most [`MAX_RECEIVER_WINDOW_PACKETS`]). It
+    /// no longer bounds the holes: every hole up to
+    /// [`MAX_TRACKED_HOLE_DISTANCE`] behind the highest sequence is tracked.
+    /// Nothing is allocated until the first packet is observed.
     pub fn with_limits(window_packets: usize, recovery_age: Duration) -> Self {
-        let capacity = window_packets.max(2).next_power_of_two();
         Self {
-            slots: (0..capacity)
-                .map(|_| SequenceWindowSlot {
-                    sequence: 0,
-                    state: SequenceState::Vacant,
-                })
-                .collect(),
-            mask: capacity - 1,
+            seen: Vec::new(),
+            seen_ready: false,
+            capacity: ring_capacity(window_packets),
             highest: None,
             recovery_age,
-            missing_count: 0,
+            initial_delay: NackSchedule::default().initial_delay,
+            holes: VecDeque::new(),
+            live: 0,
+            fresh: 0,
+            schedule: BinaryHeap::new(),
+            copies: BinaryHeap::new(),
+            taken: Vec::new(),
+            counters: TrackerCounters::default(),
+            last_recovered: None,
+            startup_window: Duration::ZERO,
+            startup: None,
         }
+    }
+
+    /// Recovers the start of a stream for `window` after its first packet
+    /// (zero, the default, turns it off; applies from the next stream
+    /// start):
+    /// - a first sequence of 1 to [`ZERO_START_REACH`] is taken as a stream
+    ///   numbered from 0, and the sequences before it are holes;
+    /// - while the window is open, a packet up to [`STARTUP_REACH`] below
+    ///   the lowest sequence taken so far (within the duplicate ring) becomes
+    ///   the new start, and the sequences between it and the old start are
+    ///   holes (all of them back to 0 when it is at most
+    ///   [`ZERO_START_REACH`]).
+    ///
+    /// These holes are requested like any other, first after the current
+    /// first-NACK delay, and counted in
+    /// [`TrackerCounters::startup_holes`].
+    pub fn set_startup_window(&mut self, window: Duration) {
+        self.startup_window = window;
+    }
+
+    pub fn startup_window(&self) -> Duration {
+        self.startup_window
+    }
+
+    /// Opens holes for `from..to` (wrapping, `to` excluded) except
+    /// `received`, in front of every tracked hole (they all lie above
+    /// `to`). They are scheduled for their first NACK after the current
+    /// first-NACK delay; their detection time is kept no later than the
+    /// front hole's, so the queue stays ordered by time.
+    fn open_startup_holes(
+        &mut self,
+        from: u32,
+        to: u32,
+        received: Option<u32>,
+        now: Instant,
+        newly_missing: &mut Vec<u32>,
+    ) {
+        let count = to.wrapping_sub(from);
+        if count == 0 || count > STARTUP_REACH + ZERO_START_REACH {
+            return;
+        }
+        let at = self
+            .holes
+            .front()
+            .map_or(now, |hole| hole.first_missing_at.min(now));
+        let due = now + self.initial_delay;
+        let first_new = newly_missing.len();
+        for offset in (0..count).rev() {
+            let missing = from.wrapping_add(offset);
+            if Some(missing) == received {
+                continue;
+            }
+            self.holes.push_front(Hole {
+                sequence: missing,
+                status: HoleStatus::Scheduled,
+                nack_count: 0,
+                first_missing_at: at,
+                first_nack_at: None,
+                last_nack_at: None,
+                next_due: due,
+                copy_at: None,
+            });
+            self.schedule.push(Reverse((due, missing)));
+            newly_missing.push(missing);
+        }
+        let opened = newly_missing.len() - first_new;
+        newly_missing[first_new..].reverse();
+        self.fresh += opened;
+        self.live += opened;
+        self.counters.holes_opened += opened as u64;
+        self.counters.startup_holes += opened as u64;
+    }
+
+    /// Discards the tracked state (counting open holes as reset) and applies
+    /// new limits. Counters are kept.
+    pub fn reconfigure(&mut self, window_packets: usize, recovery_age: Duration) {
+        self.reset();
+        let capacity = ring_capacity(window_packets);
+        if capacity != self.capacity {
+            self.capacity = capacity;
+            self.seen = Vec::new();
+        }
+        self.recovery_age = recovery_age;
+    }
+
+    /// Grows the duplicate-detection ring to at least `window_packets`
+    /// (rounded up to a power of two, at most
+    /// [`MAX_RECEIVER_WINDOW_PACKETS`]) without discarding any state; a
+    /// smaller value does nothing. Returns whether it grew.
+    ///
+    /// What the old ring knew is kept: a sequence within its reach is
+    /// seen or not as before. A sequence the old ring had already
+    /// forgotten (behind it, inside the new reach) is marked seen, so it is
+    /// still refused as a duplicate, as it was before the growth, unless an
+    /// open hole is tracked for it (holes are looked up first).
+    pub fn grow_capacity(&mut self, window_packets: usize) -> bool {
+        let capacity = ring_capacity(window_packets);
+        if capacity <= self.capacity {
+            return false;
+        }
+        self.capacity = capacity;
+        let Some(highest) = self.highest.filter(|_| self.seen_ready) else {
+            // Nothing observed yet: the ring is laid out at the first packet.
+            self.seen = Vec::new();
+            self.seen_ready = false;
+            return true;
+        };
+        let old = std::mem::take(&mut self.seen);
+        let old_mask = old.len().saturating_sub(1);
+        let mask = capacity - 1;
+        let mut seen = vec![0u32; capacity];
+        for behind in 0..capacity as u32 {
+            let sequence = highest.wrapping_sub(behind);
+            let tag = if (behind as usize) < old.len() {
+                if old[sequence as usize & old_mask] == sequence {
+                    sequence
+                } else {
+                    // Not seen: a tag of this slot about 2^31 away.
+                    sequence ^ 0x8000_0000
+                }
+            } else {
+                sequence
+            };
+            seen[sequence as usize & mask] = tag;
+        }
+        self.seen = seen;
+        true
+    }
+
+    /// Sets the first-NACK delay used by [`Self::next_nack_at`] until the next
+    /// [`Self::take_due_nacks`] call supplies one.
+    pub fn set_initial_nack_delay(&mut self, delay: Duration) {
+        self.initial_delay = delay;
+    }
+
+    pub fn recovery_age(&self) -> Duration {
+        self.recovery_age
     }
 
     pub fn observe_at(&mut self, sequence: u32, now: Instant) -> ReceiverObservation {
+        self.ensure_seen(sequence);
         self.expire(now);
-        let mut newly_missing = Vec::new();
-        let mut duplicate = false;
-        let mut recovered = false;
-
-        match self.highest {
-            None => {
-                self.highest = Some(sequence);
+        let Some(highest) = self.highest else {
+            self.highest = Some(sequence);
+            self.mark_seen(sequence);
+            let mut newly_missing = Vec::new();
+            if !self.startup_window.is_zero() {
+                let start = if (1..=ZERO_START_REACH).contains(&sequence) {
+                    0
+                } else {
+                    sequence
+                };
+                self.open_startup_holes(start, sequence, None, now, &mut newly_missing);
+                self.startup = Some((start, now + self.startup_window));
             }
-            Some(highest) => {
-                let distance = sequence.wrapping_sub(highest);
-                if distance != 0 && distance < (1 << 31) {
-                    let missing_to_add = usize::try_from(distance.saturating_sub(1))
-                        .unwrap_or(usize::MAX)
-                        .min(self.slots.len().saturating_sub(1));
-                    let first = sequence.wrapping_sub(missing_to_add as u32);
-                    for offset in 0..missing_to_add {
-                        let missing = first.wrapping_add(offset as u32);
-                        if self.mark_missing(missing, now) {
-                            newly_missing.push(missing);
-                        }
-                    }
-                    self.highest = Some(sequence);
-                } else if distance >= (1 << 31)
-                    && highest.wrapping_sub(sequence) as usize >= self.slots.len()
-                {
-                    return ReceiverObservation {
+            return observation(sequence, false, false, newly_missing);
+        };
+
+        let distance = sequence.wrapping_sub(highest);
+        if distance != 0 && distance < (1 << 31) {
+            let gap = distance - 1;
+            let mut newly_missing = Vec::new();
+            if gap > 0 {
+                let beyond = gap.saturating_sub(MAX_TRACKED_HOLE_DISTANCE);
+                self.counters.holes_unaddressable += u64::from(beyond);
+                let first = highest.wrapping_add(1).wrapping_add(beyond);
+                let count = gap - beyond;
+                // Detection times must stay monotone along the queue.
+                let at = self
+                    .holes
+                    .back()
+                    .map_or(now, |hole| hole.first_missing_at.max(now));
+                newly_missing.reserve_exact(count as usize);
+                self.holes.reserve(count as usize);
+                for offset in 0..count {
+                    let missing = first.wrapping_add(offset);
+                    self.holes.push_back(Hole {
+                        sequence: missing,
+                        status: HoleStatus::Fresh,
+                        nack_count: 0,
+                        first_missing_at: at,
+                        first_nack_at: None,
+                        last_nack_at: None,
+                        next_due: at,
+                        copy_at: None,
+                    });
+                    newly_missing.push(missing);
+                }
+                self.live += count as usize;
+                self.counters.holes_opened += u64::from(count);
+            }
+            self.highest = Some(sequence);
+            self.prune_unaddressable(sequence);
+            self.mark_seen(sequence);
+            return observation(sequence, false, false, newly_missing);
+        }
+
+        let behind = highest.wrapping_sub(sequence);
+        if behind <= MAX_TRACKED_HOLE_DISTANCE {
+            if let Some(index) = self.find_hole(sequence) {
+                let hole = &mut self.holes[index];
+                if hole.status != HoleStatus::Recovered {
+                    hole.status = HoleStatus::Recovered;
+                    self.last_recovered = Some(RecoveredHole {
                         sequence,
-                        duplicate: true,
-                        recovered: false,
-                        newly_missing,
-                    };
+                        first_missing_at: hole.first_missing_at,
+                        first_nack_at: hole.first_nack_at,
+                        last_nack_at: hole.last_nack_at,
+                        nack_count: hole.nack_count,
+                        recovered_at: now,
+                    });
+                    self.live -= 1;
+                    self.counters.holes_recovered += 1;
+                    if index == self.fresh {
+                        self.advance_fresh();
+                    }
+                    self.pop_recovered_front();
+                    self.mark_seen(sequence);
+                    return observation(sequence, false, true, Vec::new());
                 }
             }
         }
-
-        let index = sequence as usize & self.mask;
-        let slot = &mut self.slots[index];
-        if slot.sequence == sequence {
-            match slot.state {
-                SequenceState::Delivered => duplicate = true,
-                SequenceState::Missing { .. } => {
-                    recovered = true;
-                    self.missing_count = self.missing_count.saturating_sub(1);
-                }
-                SequenceState::Vacant => {}
+        if behind as usize >= self.seen.len() {
+            // Older than the duplicate-detection ring: as before, refuse it
+            // as a duplicate rather than deliver data of unknown status.
+            return observation(sequence, true, false, Vec::new());
+        }
+        if let Some((start, until)) = self.startup {
+            let below = start.wrapping_sub(sequence);
+            if now >= until {
+                self.startup = None;
+            } else if below != 0 && below <= STARTUP_REACH && behind <= MAX_TRACKED_HOLE_DISTANCE {
+                // Below the start so far, while the start is still open:
+                // the stream began earlier than the first packet seen.
+                let new_start = if sequence <= ZERO_START_REACH {
+                    0
+                } else {
+                    sequence
+                };
+                let mut newly_missing = Vec::new();
+                self.open_startup_holes(new_start, start, Some(sequence), now, &mut newly_missing);
+                self.startup = Some((new_start, until));
+                self.counters.startup_packets += 1;
+                self.mark_seen(sequence);
+                return observation(sequence, false, false, newly_missing);
             }
-        } else if matches!(slot.state, SequenceState::Missing { .. }) {
-            self.missing_count = self.missing_count.saturating_sub(1);
         }
-        slot.sequence = sequence;
-        slot.state = SequenceState::Delivered;
-
-        ReceiverObservation {
-            sequence,
-            duplicate,
-            recovered,
-            newly_missing,
+        let slot = sequence as usize & (self.seen.len() - 1);
+        if self.seen[slot] == sequence {
+            return observation(sequence, true, false, Vec::new());
         }
+        self.counters.late_packets += 1;
+        self.seen[slot] = sequence;
+        observation(sequence, false, false, Vec::new())
     }
 
+    /// Missing sequences, oldest first.
     pub fn missing_sequences(&self) -> impl Iterator<Item = u32> + '_ {
-        self.slots.iter().filter_map(|slot| {
-            matches!(slot.state, SequenceState::Missing { .. }).then_some(slot.sequence)
-        })
+        self.holes
+            .iter()
+            .filter(|hole| hole.status != HoleStatus::Recovered)
+            .map(|hole| hole.sequence)
     }
 
     pub fn missing_len(&self) -> usize {
-        self.missing_count
+        self.live
     }
 
+    /// Size of the duplicate-detection ring.
     pub fn capacity(&self) -> usize {
-        self.slots.len()
+        self.capacity
+    }
+
+    pub fn highest(&self) -> Option<u32> {
+        self.highest
+    }
+
+    pub fn counters(&self) -> TrackerCounters {
+        self.counters
+    }
+
+    pub fn last_recovered(&self) -> Option<RecoveredHole> {
+        self.last_recovered
+    }
+
+    pub fn hole(&self, sequence: u32) -> Option<HoleInfo> {
+        let hole = self.holes[self.find_hole(sequence)?];
+        Some(HoleInfo {
+            sequence: hole.sequence,
+            status: hole.status,
+            first_missing_at: hole.first_missing_at,
+            last_nack_at: hole.last_nack_at,
+            nack_count: hole.nack_count,
+            next_nack_at: matches!(hole.status, HoleStatus::Scheduled).then_some(hole.next_due),
+        })
     }
 
     pub fn reset(&mut self) {
-        for slot in &mut self.slots {
-            slot.state = SequenceState::Vacant;
-        }
+        self.counters.holes_reset += self.live as u64;
+        self.holes.clear();
+        self.schedule.clear();
+        self.copies.clear();
+        self.taken.clear();
+        self.live = 0;
+        self.fresh = 0;
         self.highest = None;
-        self.missing_count = 0;
+        self.seen_ready = false;
+        self.last_recovered = None;
+        self.startup = None;
     }
 
+    /// The earliest instant at which [`Self::take_due_nacks`] may return a
+    /// sequence, or `None` when no hole waits for a NACK. O(1). It can be
+    /// early (a scheduled hole recovered since), never late.
+    pub fn next_nack_at(&self) -> Option<Instant> {
+        let scheduled = self.schedule.peek().map(|Reverse((due, _))| *due);
+        let copy = self.copies.peek().map(|Reverse((due, _))| *due);
+        let fresh = self
+            .holes
+            .get(self.fresh)
+            .map(|hole| hole.first_missing_at + self.initial_delay);
+        [scheduled, copy, fresh].into_iter().flatten().min()
+    }
+
+    /// Appends up to `limit` holes whose NACK copy is due at `now`, oldest
+    /// first, and clears them: a copy is sent at most once, whether or not
+    /// it reaches the wire, and never changes a hole's NACK count or
+    /// schedule. Holes recovered, expired or abandoned since are skipped.
+    pub fn take_due_copies(&mut self, now: Instant, limit: usize, out: &mut Vec<u32>) {
+        let start = out.len();
+        while out.len() - start < limit {
+            let Some(&Reverse((due, sequence))) = self.copies.peek() else {
+                break;
+            };
+            if due > now {
+                break;
+            }
+            self.copies.pop();
+            let Some(index) = self.find_hole(sequence) else {
+                continue;
+            };
+            let hole = &mut self.holes[index];
+            if hole.copy_at != Some(due) {
+                continue;
+            }
+            hole.copy_at = None;
+            if matches!(hole.status, HoleStatus::Scheduled | HoleStatus::Taken) {
+                out.push(sequence);
+            }
+        }
+        let highest = self.highest.unwrap_or(0);
+        out[start..].sort_unstable_by_key(|sequence| Reverse(highest.wrapping_sub(*sequence)));
+    }
+
+    /// The instant at which the oldest open hole expires.
+    pub fn next_expiry_at(&self) -> Option<Instant> {
+        self.holes
+            .iter()
+            .find(|hole| hole.status != HoleStatus::Recovered)
+            .map(|hole| hole.first_missing_at + self.recovery_age)
+    }
+
+    /// Appends up to `limit` holes that are due for a NACK at `now` to `out`,
+    /// oldest first. Nothing is marked as requested here: the caller passes
+    /// every returned sequence either to [`Self::commit_nacks`] (it was put on
+    /// the wire) or to [`Self::defer_nacks`]. Holes taken and neither
+    /// committed nor deferred are due again at the next call.
+    pub fn take_due_nacks(
+        &mut self,
+        now: Instant,
+        schedule: &NackSchedule,
+        limit: usize,
+        out: &mut Vec<u32>,
+    ) {
+        self.initial_delay = schedule.initial_delay;
+        self.expire(now);
+        self.restore_taken(now);
+        let start = out.len();
+
+        while out.len() - start < limit {
+            let Some(&Reverse((due, sequence))) = self.schedule.peek() else {
+                break;
+            };
+            if due > now {
+                break;
+            }
+            self.schedule.pop();
+            let Some(index) = self.find_hole(sequence) else {
+                continue;
+            };
+            let recovery_age = self.recovery_age;
+            let hole = &mut self.holes[index];
+            if hole.status != HoleStatus::Scheduled || hole.next_due != due {
+                continue;
+            }
+            if hole.nack_count >= schedule.max_retries {
+                hole.status = HoleStatus::Abandoned;
+                self.counters.retries_exhausted += 1;
+                continue;
+            }
+            if too_late(hole, now, recovery_age, schedule.min_time_left) {
+                hole.status = HoleStatus::Abandoned;
+                self.counters.nack_too_late += 1;
+                continue;
+            }
+            hole.status = HoleStatus::Taken;
+            self.taken.push(sequence);
+            out.push(sequence);
+        }
+
+        let mut index = self.fresh;
+        while out.len() - start < limit && index < self.holes.len() {
+            let recovery_age = self.recovery_age;
+            let hole = &mut self.holes[index];
+            index += 1;
+            if hole.status != HoleStatus::Fresh {
+                continue;
+            }
+            if hole.first_missing_at + schedule.initial_delay > now {
+                break;
+            }
+            if hole.nack_count >= schedule.max_retries {
+                hole.status = HoleStatus::Abandoned;
+                self.counters.retries_exhausted += 1;
+                continue;
+            }
+            if too_late(hole, now, recovery_age, schedule.min_time_left) {
+                hole.status = HoleStatus::Abandoned;
+                self.counters.nack_too_late += 1;
+                continue;
+            }
+            out.push(hole.sequence);
+        }
+        self.advance_fresh();
+
+        let highest = self.highest.unwrap_or(0);
+        out[start..].sort_unstable_by_key(|sequence| Reverse(highest.wrapping_sub(*sequence)));
+    }
+
+    /// Records that NACKs for `sent` went on the wire at `now`; the next NACK
+    /// of each is due at `now + repeat_delay`.
+    pub fn commit_nacks(&mut self, sent: &[u32], now: Instant, repeat_delay: Duration) {
+        self.commit_nacks_with(sent, now, NackRepeat::fixed(repeat_delay));
+    }
+
+    /// [`Self::commit_nacks`] with a per-hole repeat policy (backoff while
+    /// the RTT is unknown).
+    pub fn commit_nacks_with(&mut self, sent: &[u32], now: Instant, repeat: NackRepeat) {
+        for &sequence in sent {
+            let Some(index) = self.find_hole(sequence) else {
+                continue;
+            };
+            let hole = &mut self.holes[index];
+            if matches!(hole.status, HoleStatus::Recovered | HoleStatus::Abandoned) {
+                continue;
+            }
+            hole.nack_count = hole.nack_count.saturating_add(1);
+            hole.first_nack_at.get_or_insert(now);
+            hole.last_nack_at = Some(now);
+            if let Some(gap) = repeat.copy_gap {
+                let copy_at = now + gap;
+                hole.copy_at = Some(copy_at);
+                self.copies.push(Reverse((copy_at, sequence)));
+            }
+            let next_due = now + repeat.after(hole.nack_count);
+            hole.next_due = next_due;
+            hole.status = HoleStatus::Scheduled;
+            self.schedule.push(Reverse((next_due, sequence)));
+        }
+        self.advance_fresh();
+    }
+
+    /// Keeps `unsent` holes due, but not before `at` (for example when the
+    /// return bandwidth refused their NACK). Their NACK count is unchanged.
+    pub fn defer_nacks(&mut self, unsent: &[u32], at: Instant) {
+        for &sequence in unsent {
+            let Some(index) = self.find_hole(sequence) else {
+                continue;
+            };
+            let hole = &mut self.holes[index];
+            if matches!(hole.status, HoleStatus::Recovered | HoleStatus::Abandoned) {
+                continue;
+            }
+            hole.next_due = at;
+            hole.status = HoleStatus::Scheduled;
+            self.schedule.push(Reverse((at, sequence)));
+        }
+        self.advance_fresh();
+    }
+
+    /// Compatibility wrapper: selects every due hole, marks it as requested
+    /// at `now`, and returns the sequences newest first (the historical
+    /// order). `min_retries` is accepted for source compatibility; as before,
+    /// a hole is requested until it expires or reaches `max_retries`.
     pub fn nacks_due(
         &mut self,
         now: Instant,
         initial_delay: Duration,
         repeat_delay: Duration,
-        min_retries: u32,
+        _min_retries: u32,
         max_retries: u32,
     ) -> Vec<u32> {
-        self.expire(now);
-        if self.missing_count == 0 {
-            return Vec::new();
-        }
-        let mut due = Vec::with_capacity(self.missing_count);
-        for slot in &mut self.slots {
-            let SequenceState::Missing {
-                first_missing_at,
-                last_nack_at,
-                nack_count,
-            } = &mut slot.state
-            else {
-                continue;
-            };
-            if *nack_count >= max_retries {
-                continue;
-            }
-            let delay = if last_nack_at.is_some() {
-                repeat_delay
-            } else {
-                initial_delay
-            };
-            let reference = last_nack_at.unwrap_or(*first_missing_at);
-            if now.saturating_duration_since(reference) < delay {
-                continue;
-            }
-            // The configured minimum controls the guaranteed attempts; after
-            // that, requests continue only while the packet remains inside
-            // the fixed recovery-age window, up to max_retries.
-            if *nack_count < min_retries
-                || now.duration_since(*first_missing_at) < self.recovery_age
-            {
-                due.push(slot.sequence);
-                *nack_count += 1;
-                *last_nack_at = Some(now);
-            }
-        }
-        due.sort_unstable_by_key(|sequence| {
-            self.highest.unwrap_or(*sequence).wrapping_sub(*sequence)
-        });
+        let schedule = NackSchedule {
+            initial_delay,
+            repeat_delay,
+            max_retries,
+            min_time_left: Duration::ZERO,
+        };
+        let mut due = Vec::new();
+        self.take_due_nacks(now, &schedule, usize::MAX, &mut due);
+        self.commit_nacks(&due, now, repeat_delay);
+        due.reverse();
         due
     }
 
-    fn mark_missing(&mut self, sequence: u32, now: Instant) -> bool {
-        let index = sequence as usize & self.mask;
-        let slot = &mut self.slots[index];
-        if slot.sequence == sequence && !matches!(slot.state, SequenceState::Vacant) {
-            return false;
+    fn ensure_seen(&mut self, first: u32) {
+        if self.seen_ready {
+            return;
         }
-        if matches!(slot.state, SequenceState::Missing { .. }) {
-            self.missing_count = self.missing_count.saturating_sub(1);
+        let mask = self.capacity - 1;
+        if self.seen.len() != self.capacity {
+            self.seen = vec![0; self.capacity];
         }
-        slot.sequence = sequence;
-        slot.state = SequenceState::Missing {
-            first_missing_at: now,
-            last_nack_at: None,
-            nack_count: 0,
-        };
-        self.missing_count += 1;
-        true
+        // Vacant tags map to their own slot but lie about 2^31 away from the
+        // first sequence, so they cannot match a real arrival.
+        let far = (first ^ 0x8000_0000) & !(mask as u32);
+        for (index, tag) in self.seen.iter_mut().enumerate() {
+            *tag = far | index as u32;
+        }
+        self.seen_ready = true;
+    }
+
+    fn mark_seen(&mut self, sequence: u32) {
+        let mask = self.seen.len() - 1;
+        self.seen[sequence as usize & mask] = sequence;
+    }
+
+    fn find_hole(&self, sequence: u32) -> Option<usize> {
+        let base = self.holes.front()?.sequence;
+        let key = sequence.wrapping_sub(base);
+        let last = self.holes.back()?.sequence.wrapping_sub(base);
+        if key > last {
+            return None;
+        }
+        self.holes
+            .binary_search_by_key(&key, |hole| hole.sequence.wrapping_sub(base))
+            .ok()
     }
 
     fn expire(&mut self, now: Instant) {
-        if self.missing_count == 0 {
-            return;
-        }
-        for slot in &mut self.slots {
-            let expired = match slot.state {
-                SequenceState::Missing {
-                    first_missing_at, ..
-                } => now.saturating_duration_since(first_missing_at) >= self.recovery_age,
-                _ => false,
-            };
-            if expired {
-                slot.state = SequenceState::Vacant;
-                self.missing_count = self.missing_count.saturating_sub(1);
+        while let Some(front) = self.holes.front() {
+            if front.status != HoleStatus::Recovered {
+                if now.saturating_duration_since(front.first_missing_at) < self.recovery_age {
+                    break;
+                }
+                self.live -= 1;
+                self.counters.holes_expired += 1;
             }
+            self.pop_front_hole();
+        }
+        self.advance_fresh();
+    }
+
+    fn prune_unaddressable(&mut self, highest: u32) {
+        while let Some(front) = self.holes.front() {
+            if highest.wrapping_sub(front.sequence) <= MAX_TRACKED_HOLE_DISTANCE {
+                break;
+            }
+            if front.status != HoleStatus::Recovered {
+                self.live -= 1;
+                self.counters.holes_unaddressable += 1;
+            }
+            self.pop_front_hole();
+        }
+        self.advance_fresh();
+    }
+
+    fn pop_recovered_front(&mut self) {
+        while self
+            .holes
+            .front()
+            .is_some_and(|hole| hole.status == HoleStatus::Recovered)
+        {
+            self.pop_front_hole();
+        }
+        self.advance_fresh();
+    }
+
+    fn pop_front_hole(&mut self) {
+        self.holes.pop_front();
+        self.fresh = self.fresh.saturating_sub(1);
+    }
+
+    fn advance_fresh(&mut self) {
+        while self
+            .holes
+            .get(self.fresh)
+            .is_some_and(|hole| hole.status != HoleStatus::Fresh)
+        {
+            self.fresh += 1;
         }
     }
+
+    /// Holes taken by an earlier pass and never committed or deferred are due
+    /// again now, so a caller mistake cannot lose a hole.
+    fn restore_taken(&mut self, now: Instant) {
+        if self.taken.is_empty() {
+            return;
+        }
+        let taken = std::mem::take(&mut self.taken);
+        for &sequence in &taken {
+            let Some(index) = self.find_hole(sequence) else {
+                continue;
+            };
+            let hole = &mut self.holes[index];
+            if hole.status == HoleStatus::Taken {
+                hole.status = HoleStatus::Scheduled;
+                hole.next_due = now;
+                self.schedule.push(Reverse((now, sequence)));
+            }
+        }
+        self.taken = taken;
+        self.taken.clear();
+    }
+}
+
+#[cfg(test)]
+impl MissingTracker {
+    /// Structural invariants, checked by the tests after each operation.
+    fn check_invariants(&self) {
+        let live = self
+            .holes
+            .iter()
+            .filter(|hole| hole.status != HoleStatus::Recovered)
+            .count();
+        assert_eq!(live, self.live, "live hole count");
+        if let Some(front) = self.holes.front() {
+            let base = front.sequence;
+            for pair in self.holes.iter().collect::<Vec<_>>().windows(2) {
+                assert!(
+                    pair[0].sequence.wrapping_sub(base) < pair[1].sequence.wrapping_sub(base),
+                    "holes ascend"
+                );
+                assert!(pair[0].first_missing_at <= pair[1].first_missing_at);
+            }
+            let highest = self.highest.expect("holes imply a highest sequence");
+            assert!(highest.wrapping_sub(base) <= MAX_TRACKED_HOLE_DISTANCE);
+            assert_ne!(
+                front.status,
+                HoleStatus::Recovered,
+                "front tombstones are popped"
+            );
+        }
+        for (index, hole) in self.holes.iter().enumerate() {
+            if index < self.fresh {
+                assert_ne!(
+                    hole.status,
+                    HoleStatus::Fresh,
+                    "fresh cursor skipped a hole"
+                );
+            }
+            if hole.status == HoleStatus::Scheduled {
+                assert!(
+                    self.schedule
+                        .iter()
+                        .any(|Reverse((due, sequence))| *sequence == hole.sequence
+                            && *due == hole.next_due),
+                    "scheduled hole {} has a heap entry",
+                    hole.sequence
+                );
+            }
+        }
+        if let Some(hole) = self.holes.get(self.fresh) {
+            assert_eq!(hole.status, HoleStatus::Fresh);
+        }
+    }
+}
+
+fn observation(
+    sequence: u32,
+    duplicate: bool,
+    recovered: bool,
+    newly_missing: Vec<u32>,
+) -> ReceiverObservation {
+    ReceiverObservation {
+        sequence,
+        duplicate,
+        recovered,
+        newly_missing,
+    }
+}
+
+fn ring_capacity(window_packets: usize) -> usize {
+    window_packets
+        .clamp(2, MAX_RECEIVER_WINDOW_PACKETS)
+        .next_power_of_two()
+}
+
+fn too_late(hole: &Hole, now: Instant, recovery_age: Duration, min_time_left: Duration) -> bool {
+    !min_time_left.is_zero()
+        && (hole.first_missing_at + recovery_age).saturating_duration_since(now) < min_time_left
 }
 
 #[cfg(test)]
@@ -541,6 +1893,39 @@ mod tests {
     }
 
     #[test]
+    fn sender_history_insert_with_reuses_the_evicted_buffer() {
+        let now = Instant::now();
+        let mut history = SenderHistory::new(2);
+        assert!(SenderHistory::new(0)
+            .insert_with(1, now, |_| panic!("disabled history must not encode"))
+            .is_none());
+        let stored = history
+            .insert_with(1, now, |out| {
+                assert!(out.is_empty());
+                out.extend_from_slice(&[1; 1_400]);
+            })
+            .unwrap();
+        assert_eq!((stored.sequence, stored.payload_len), (1, 1_400));
+        let first = stored.payload.as_ptr();
+        history.insert_with(2, now, |out| out.push(2));
+        assert_eq!(history.len(), 2);
+        // 3 takes 1's slot: same allocation, cleared before encoding.
+        let stored = history
+            .insert_with(3, now, |out| {
+                assert!(out.is_empty());
+                assert!(out.capacity() >= 1_400);
+                out.extend_from_slice(&[3; 1_000]);
+            })
+            .unwrap();
+        assert_eq!(stored.payload.as_ptr(), first);
+        assert_eq!(stored.payload, vec![3; 1_000]);
+        assert_eq!(stored.retry_count, 0);
+        assert_eq!(history.len(), 2);
+        assert!(history.get(1).is_none());
+        assert_eq!(history.get(2).unwrap().payload, vec![2]);
+    }
+
+    #[test]
     fn sender_history_is_bounded_and_correct_across_u32_rollover() {
         let now = Instant::now();
         let mut history = SenderHistory::new(4);
@@ -560,12 +1945,24 @@ mod tests {
         let mut tracker = MissingTracker::with_limits(8, Duration::from_millis(100));
         tracker.observe_at(10, start);
         let observation = tracker.observe_at(1_000_000, start);
-        assert_eq!(observation.newly_missing.len(), 7);
+        // Every hole a 16-bit NACK can still address is tracked, whatever the
+        // ring size; the rest of the gap is counted, not dropped silently.
+        let tracked = MAX_TRACKED_HOLE_DISTANCE as usize;
+        assert_eq!(observation.newly_missing.len(), tracked);
+        assert_eq!(observation.newly_missing[0], 1_000_000 - tracked as u32);
+        assert_eq!(*observation.newly_missing.last().unwrap(), 999_999);
         assert_eq!(tracker.capacity(), 8);
-        assert_eq!(tracker.missing_len(), 7);
+        assert_eq!(tracker.missing_len(), tracked);
+        assert_eq!(
+            tracker.counters().holes_unaddressable,
+            999_989 - tracked as u64
+        );
+        tracker.check_invariants();
 
         tracker.observe_at(1_000_001, start + Duration::from_millis(101));
         assert_eq!(tracker.missing_len(), 0);
+        assert_eq!(tracker.counters().holes_expired, tracked as u64);
+        tracker.check_invariants();
     }
 
     #[test]
@@ -636,5 +2033,1254 @@ mod tests {
             vec![payload(1, 3)]
         );
         assert_eq!(buffer.next_sequence(), Some(2));
+    }
+
+    fn ms(value: u64) -> Duration {
+        Duration::from_millis(value)
+    }
+
+    fn sequences(payloads: &[ReceivedPayload]) -> Vec<u32> {
+        payloads.iter().map(|payload| payload.sequence).collect()
+    }
+
+    #[test]
+    fn ordered_in_order_packets_take_the_fast_path() {
+        let start = Instant::now();
+        let mut buffer = OrderedPayloadBuffer::with_deadline(4, Duration::from_millis(10))
+            .with_startup_hold(Duration::ZERO);
+        let mut out = Vec::new();
+        for sequence in 100..110 {
+            assert_eq!(
+                buffer.push_into(payload(sequence, 0), start, &mut out),
+                Ok(OrderedPush::Released)
+            );
+            assert_eq!(buffer.pending_len(), 0);
+        }
+        assert_eq!(sequences(&out), (100..110).collect::<Vec<_>>());
+        assert_eq!(buffer.stats().released, 10);
+        assert_eq!(buffer.stats().held_max, 0);
+        assert_eq!(buffer.next_deadline(), None);
+    }
+
+    #[test]
+    fn ordered_late_packet_after_skip_is_dropped_not_held() {
+        let start = Instant::now();
+        let mut buffer = OrderedPayloadBuffer::with_reorder_delay(8, Duration::from_millis(10));
+        buffer.push_at(payload(1, 1), start).unwrap();
+        assert!(buffer.push_at(payload(3, 3), start).unwrap().is_empty());
+        assert_eq!(sequences(&buffer.release_expired(start + ms(10))), vec![3]);
+        assert_eq!(buffer.pending_len(), 0);
+        assert_eq!(buffer.skipped_packets(), 1);
+        assert_eq!(buffer.gaps_skipped(), 1);
+
+        // The repair of 2 comes after its gap was given up.
+        let mut out = Vec::new();
+        assert_eq!(
+            buffer.push_into(payload(2, 2), start + ms(11), &mut out),
+            Ok(OrderedPush::Late)
+        );
+        assert!(out.is_empty());
+        assert_eq!(buffer.pending_len(), 0);
+        assert_eq!(buffer.late_dropped(), 1);
+        assert_eq!(buffer.next_sequence(), Some(4));
+        // A copy of a released packet is late as well.
+        assert!(buffer
+            .push_at(payload(1, 1), start + ms(12))
+            .unwrap()
+            .is_empty());
+        assert_eq!(buffer.late_dropped(), 2);
+        assert_eq!(buffer.pending_len(), 0);
+    }
+
+    /// A stream that restarts far behind the release point (a sender
+    /// restart, or a receiver peer re-created after eviction) is taken up
+    /// again after a run of far-behind pushes, with what was held released.
+    #[test]
+    fn ordered_deadline_buffer_resyncs_to_a_stream_that_jumped_back() {
+        let start = Instant::now();
+        let mut buffer = OrderedPayloadBuffer::with_deadline(64, Duration::from_millis(10))
+            .with_startup_hold(Duration::ZERO);
+        let mut out = Vec::new();
+        buffer
+            .push_into(payload(100_000, 0), start, &mut out)
+            .unwrap();
+        // 100_002 is held behind the gap at 100_001.
+        assert_eq!(
+            buffer.push_into(payload(100_002, 0), start, &mut out),
+            Ok(OrderedPush::Held)
+        );
+        out.clear();
+        let restart = 5u32;
+        for sequence in restart..restart + RESYNC_LATE_RUN - 1 {
+            assert_eq!(
+                buffer.push_into(payload(sequence, 0), start, &mut out),
+                Ok(OrderedPush::Late),
+                "{sequence}"
+            );
+        }
+        assert!(out.is_empty());
+        let resync = restart + RESYNC_LATE_RUN - 1;
+        assert_eq!(
+            buffer.push_into(payload(resync, 0), start, &mut out),
+            Ok(OrderedPush::Released)
+        );
+        assert_eq!(sequences(&out), vec![100_002, resync]);
+        assert_eq!(buffer.next_sequence(), Some(resync + 1));
+        assert_eq!(buffer.pending_len(), 0);
+        let stats = buffer.stats();
+        assert_eq!(stats.resyncs, 1);
+        assert_eq!(stats.late_dropped, u64::from(RESYNC_LATE_RUN - 1));
+        assert_eq!(stats.gaps_skipped, 1);
+        // The restarted stream carries on in order.
+        out.clear();
+        buffer
+            .push_into(payload(resync + 1, 0), start, &mut out)
+            .unwrap();
+        assert_eq!(sequences(&out), vec![resync + 1]);
+    }
+
+    /// Late repairs among in-order packets, a near-behind run, or far-behind
+    /// pushes that do not move forward never resync.
+    #[test]
+    fn ordered_late_repairs_do_not_resync() {
+        let start = Instant::now();
+        let mut buffer = OrderedPayloadBuffer::with_deadline(64, Duration::from_millis(10))
+            .with_startup_hold(Duration::ZERO);
+        let mut out = Vec::new();
+        let mut next = 200_000u32;
+        buffer.push_into(payload(next, 0), start, &mut out).unwrap();
+        // Far-behind arrivals interleaved with the live stream.
+        for n in 0..4 * RESYNC_LATE_RUN {
+            next += 1;
+            buffer.push_into(payload(next, 0), start, &mut out).unwrap();
+            assert_eq!(
+                buffer.push_into(payload(1_000 + n, 0), start, &mut out),
+                Ok(OrderedPush::Late)
+            );
+        }
+        // A long run only just behind the release point (late repairs).
+        let behind = next - 1_000;
+        for sequence in behind..behind + 4 * RESYNC_LATE_RUN {
+            assert_eq!(
+                buffer.push_into(payload(sequence, 0), start, &mut out),
+                Ok(OrderedPush::Late)
+            );
+        }
+        // Far behind, but the same sequence over and over.
+        for _ in 0..4 * RESYNC_LATE_RUN {
+            assert_eq!(
+                buffer.push_into(payload(7, 0), start, &mut out),
+                Ok(OrderedPush::Late)
+            );
+        }
+        assert_eq!(buffer.stats().resyncs, 0);
+        assert_eq!(buffer.next_sequence(), Some(next + 1));
+    }
+
+    /// A fail-closed buffer reports the jump instead of dropping silently,
+    /// and `reset` starts it again.
+    #[test]
+    fn ordered_fail_closed_buffer_reports_a_backward_jump_until_reset() {
+        let start = Instant::now();
+        let mut buffer = OrderedPayloadBuffer::new(64);
+        buffer.push_at(payload(100_000, 0), start).unwrap();
+        for sequence in 0..RESYNC_LATE_RUN - 1 {
+            assert!(buffer
+                .push_at(payload(sequence, 0), start)
+                .unwrap()
+                .is_empty());
+        }
+        let error = buffer
+            .push_at(payload(RESYNC_LATE_RUN - 1, 0), start)
+            .unwrap_err();
+        assert_eq!(error.next_sequence, 100_001);
+        assert_eq!(error.received_sequence, RESYNC_LATE_RUN - 1);
+        assert!(buffer.push_at(payload(RESYNC_LATE_RUN, 0), start).is_err());
+        assert_eq!(buffer.stats().resyncs, 0);
+
+        buffer.reset();
+        assert_eq!(buffer.next_sequence(), None);
+        assert_eq!(
+            sequences(&buffer.push_at(payload(9, 0), start).unwrap()),
+            vec![9]
+        );
+        assert_eq!(buffer.next_sequence(), Some(10));
+    }
+
+    #[test]
+    fn ordered_startup_hold_waits_for_a_lost_first_packet() {
+        let start = Instant::now();
+        // The first copy of 100 was lost; 101.. arrive, then the second copy.
+        let mut buffer = OrderedPayloadBuffer::with_deadline(64, ms(50)).with_startup_hold(ms(5));
+        let mut out = Vec::new();
+        for sequence in 101..104 {
+            let push = buffer
+                .push_into(payload(sequence, 0), start, &mut out)
+                .unwrap();
+            assert_eq!(push, OrderedPush::Held);
+        }
+        assert!(buffer.in_startup());
+        assert_eq!(buffer.next_deadline(), Some(start + ms(5)));
+        buffer
+            .push_into(payload(100, 0), start + ms(1), &mut out)
+            .unwrap();
+        // Still unknown: something may precede 100 too.
+        assert!(out.is_empty());
+        // The third copy says 100 was the first packet.
+        let push = buffer
+            .push_into(duplicate(100), start + ms(2), &mut out)
+            .unwrap();
+        assert_eq!(push, OrderedPush::Released);
+        assert_eq!(sequences(&out), vec![100, 101, 102, 103]);
+        assert_eq!(buffer.gaps_skipped(), 0);
+        assert_eq!(buffer.stats().startup_rebased, 1);
+        assert_eq!(buffer.stats().startup_timeouts, 0);
+
+        // Nothing before the first packet: released after the hold, and
+        // nothing is counted as skipped.
+        let mut buffer = OrderedPayloadBuffer::with_deadline(64, ms(50)).with_startup_hold(ms(5));
+        let mut out = Vec::new();
+        buffer.push_into(payload(700, 0), start, &mut out).unwrap();
+        buffer.push_into(payload(701, 0), start, &mut out).unwrap();
+        assert!(buffer.release_expired(start + ms(4)).is_empty());
+        assert_eq!(
+            sequences(&buffer.release_expired(start + ms(5))),
+            vec![700, 701]
+        );
+        assert_eq!(buffer.gaps_skipped(), 0);
+        assert_eq!(buffer.skipped_packets(), 0);
+        assert_eq!(buffer.stats().startup_timeouts, 1);
+        // A real gap later is still held for the full delay and counted.
+        buffer
+            .push_into(payload(703, 0), start + ms(6), &mut out)
+            .unwrap();
+        assert_eq!(buffer.next_deadline(), Some(start + ms(56)));
+        assert_eq!(
+            sequences(&buffer.release_expired(start + ms(56))),
+            vec![703]
+        );
+        assert_eq!(buffer.gaps_skipped(), 1);
+        // And a packet below the start is late once the hold is over.
+        assert_eq!(
+            buffer.push_into(payload(699, 0), start + ms(57), &mut out),
+            Ok(OrderedPush::Late)
+        );
+
+        // Without a hold the first packet goes at once, as before.
+        let mut buffer =
+            OrderedPayloadBuffer::with_deadline(64, ms(50)).with_startup_hold(Duration::ZERO);
+        let mut out = Vec::new();
+        buffer.push_into(payload(7, 0), start, &mut out).unwrap();
+        assert_eq!(sequences(&out), vec![7]);
+    }
+
+    fn duplicate(sequence: u32) -> ReceivedPayload {
+        ReceivedPayload {
+            duplicate: true,
+            ..payload(sequence, 0)
+        }
+    }
+
+    /// `with_deadline` recovers the start by default: sequence 0 goes at
+    /// once, a first payload at 1..=16 waits behind an ordinary gap back to
+    /// 0, and the hold is capped at the gap deadline.
+    #[test]
+    fn ordered_default_buffer_recovers_a_stream_numbered_from_zero() {
+        let start = Instant::now();
+        let mut buffer = OrderedPayloadBuffer::with_deadline(64, ms(1_000));
+        assert_eq!(buffer.startup_hold(), DEFAULT_STARTUP_HOLD);
+        assert_eq!(
+            OrderedPayloadBuffer::with_deadline(64, ms(10)).startup_hold(),
+            ms(10)
+        );
+        let mut out = Vec::new();
+        assert_eq!(
+            buffer.push_into(payload(0, 0), start, &mut out),
+            Ok(OrderedPush::Released)
+        );
+        assert_eq!(buffer.stats().startup_holds, 0);
+
+        // The first five packets were lost: 5 waits for their repairs for
+        // the whole gap deadline, not just the startup hold.
+        let mut buffer = OrderedPayloadBuffer::with_deadline(64, ms(1_000));
+        let mut out = Vec::new();
+        assert_eq!(
+            buffer.push_into(payload(5, 0), start, &mut out),
+            Ok(OrderedPush::Held)
+        );
+        assert_eq!(buffer.next_sequence(), Some(0));
+        assert_eq!(buffer.next_deadline(), Some(start + ms(1_000)));
+        assert!(buffer.release_expired(start + ms(300)).is_empty());
+        for sequence in 0..5 {
+            buffer
+                .push_into(payload(sequence, 0), start + ms(260), &mut out)
+                .unwrap();
+        }
+        assert_eq!(sequences(&out), (0..6).collect::<Vec<_>>());
+        assert_eq!(buffer.stats().zero_starts, 1);
+        assert_eq!(buffer.gaps_skipped(), 0);
+    }
+
+    /// Reordering at the start: packets below the first one seen are taken
+    /// while the hold lasts, the start is known once the lowest sequence is
+    /// within the zero-start reach, and the gaps that remain are ordinary.
+    #[test]
+    fn ordered_startup_takes_reordered_packets_below_the_first() {
+        let start = Instant::now();
+        let mut buffer = OrderedPayloadBuffer::with_deadline(4_096, ms(120));
+        let mut out = Vec::new();
+        buffer.push_into(payload(263, 0), start, &mut out).unwrap();
+        assert!(buffer.in_startup());
+        assert_eq!(buffer.next_deadline(), Some(start + DEFAULT_STARTUP_HOLD));
+        // 100..263 arrive in reverse, then 40..100 in order.
+        for sequence in (100..263).rev() {
+            assert_eq!(
+                buffer.push_into(payload(sequence, 0), start + ms(1), &mut out),
+                Ok(OrderedPush::Held)
+            );
+        }
+        for sequence in 40..100 {
+            buffer
+                .push_into(payload(sequence, 0), start + ms(2), &mut out)
+                .unwrap();
+        }
+        assert!(out.is_empty());
+        assert_eq!(buffer.next_sequence(), Some(40));
+        // 3 arrives: numbered from 0, the start is known; 0..3 and 4..40
+        // are ordinary gaps.
+        buffer
+            .push_into(payload(3, 0), start + ms(3), &mut out)
+            .unwrap();
+        assert!(!buffer.in_startup());
+        assert!(out.is_empty());
+        assert_eq!(buffer.next_sequence(), Some(0));
+        for sequence in (0..40).filter(|sequence| *sequence != 3) {
+            buffer
+                .push_into(payload(sequence, 0), start + ms(4), &mut out)
+                .unwrap();
+        }
+        assert_eq!(sequences(&out), (0..264).collect::<Vec<_>>());
+        assert_eq!(buffer.late_dropped(), 0);
+        // 262..100 one by one, then 40, then 3.
+        assert_eq!(buffer.stats().startup_rebased, 163 + 1 + 1);
+
+        // Too far below the first packet: not this start, dropped late, and
+        // the hold is over.
+        let mut buffer = OrderedPayloadBuffer::with_deadline(4_096, ms(120));
+        let mut out = Vec::new();
+        buffer
+            .push_into(payload(5_000, 0), start, &mut out)
+            .unwrap();
+        assert_eq!(
+            buffer.push_into(payload(5_000 - STARTUP_REACH - 1, 0), start, &mut out),
+            Ok(OrderedPush::Released)
+        );
+        assert_eq!(sequences(&out), vec![5_000]);
+        assert_eq!(buffer.late_dropped(), 1);
+    }
+
+    /// A stream that does not start near 0 and is not reordered (a
+    /// mid-stream join) is released when the hold ends; nothing is
+    /// skipped, and the steady state is as without a hold.
+    #[test]
+    fn ordered_startup_hold_ends_at_its_deadline_for_a_mid_stream_join() {
+        let start = Instant::now();
+        let mut held = OrderedPayloadBuffer::with_deadline(64, ms(1_000));
+        let mut plain =
+            OrderedPayloadBuffer::with_deadline(64, ms(1_000)).with_startup_hold(Duration::ZERO);
+        let mut out_held = Vec::new();
+        let mut out_plain = Vec::new();
+        for (index, sequence) in (40_000..40_100).enumerate() {
+            let at = start + Duration::from_micros(index as u64 * 500);
+            held.release_expired_into(at, &mut out_held);
+            held.push_into(payload(sequence, 0), at, &mut out_held)
+                .unwrap();
+            plain
+                .push_into(payload(sequence, 0), at, &mut out_plain)
+                .unwrap();
+            if at >= start + DEFAULT_STARTUP_HOLD {
+                assert_eq!(sequences(&out_held), sequences(&out_plain), "{index}");
+            } else {
+                assert!(out_held.is_empty());
+            }
+        }
+        assert_eq!(held.stats().startup_timeouts, 1);
+        assert_eq!(held.gaps_skipped(), 0);
+        assert_eq!(held.late_dropped(), 0);
+    }
+
+    #[test]
+    fn ordered_reset_drops_what_is_held() {
+        let start = Instant::now();
+        let mut buffer = OrderedPayloadBuffer::with_deadline(8, Duration::from_millis(10))
+            .with_startup_hold(Duration::ZERO);
+        buffer.push_at(payload(1, 0), start).unwrap();
+        assert!(buffer.push_at(payload(3, 0), start).unwrap().is_empty());
+        buffer.reset();
+        assert_eq!(buffer.pending_len(), 0);
+        assert!(buffer.flush_all().is_empty());
+        assert_eq!(
+            sequences(&buffer.push_at(payload(50, 0), start).unwrap()),
+            vec![50]
+        );
+    }
+
+    #[test]
+    fn ordered_two_expired_gaps_release_in_one_call() {
+        let start = Instant::now();
+        let mut buffer = OrderedPayloadBuffer::with_reorder_delay(16, Duration::from_millis(10));
+        buffer.push_at(payload(10, 0), start).unwrap();
+        // Gaps at 11 and 14.
+        assert!(buffer.push_at(payload(12, 0), start).unwrap().is_empty());
+        assert!(buffer
+            .push_at(payload(13, 0), start + ms(1))
+            .unwrap()
+            .is_empty());
+        assert!(buffer
+            .push_at(payload(15, 0), start + ms(2))
+            .unwrap()
+            .is_empty());
+        assert_eq!(buffer.next_deadline(), Some(start + ms(10)));
+        assert!(buffer.release_expired(start + ms(9)).is_empty());
+        assert_eq!(
+            sequences(&buffer.release_expired(start + ms(12))),
+            vec![12, 13, 15]
+        );
+        assert_eq!(buffer.gaps_skipped(), 2);
+        assert_eq!(buffer.skipped_packets(), 2);
+        assert_eq!(buffer.pending_len(), 0);
+        assert_eq!(buffer.next_sequence(), Some(16));
+    }
+
+    #[test]
+    fn ordered_gap_deadline_counts_from_its_first_successor() {
+        // 11 is missing; 13 arrives first, then 12 (a repair or reordering)
+        // later: the gap at 11 has been open since 13 arrived.
+        let start = Instant::now();
+        let mut buffer = OrderedPayloadBuffer::with_reorder_delay(8, Duration::from_millis(10));
+        buffer.push_at(payload(10, 0), start).unwrap();
+        assert!(buffer.push_at(payload(13, 0), start).unwrap().is_empty());
+        assert!(buffer
+            .push_at(payload(12, 0), start + ms(8))
+            .unwrap()
+            .is_empty());
+        assert_eq!(buffer.next_deadline(), Some(start + ms(10)));
+        assert_eq!(
+            sequences(&buffer.release_expired(start + ms(10))),
+            vec![12, 13]
+        );
+    }
+
+    #[test]
+    fn ordered_keys_cross_the_u32_rollover() {
+        let start = Instant::now();
+        let mut buffer = OrderedPayloadBuffer::with_reorder_delay(8, Duration::from_millis(10));
+        buffer.push_at(payload(u32::MAX - 1, 0), start).unwrap();
+        assert!(buffer.push_at(payload(1, 0), start).unwrap().is_empty());
+        assert!(buffer.push_at(payload(0, 0), start).unwrap().is_empty());
+        assert_eq!(
+            sequences(&buffer.push_at(payload(u32::MAX, 0), start).unwrap()),
+            vec![u32::MAX, 0, 1]
+        );
+        assert_eq!(buffer.next_sequence(), Some(2));
+        // Behind the first packet, across the boundary of the first
+        // extension: late, not held.
+        let mut fresh = OrderedPayloadBuffer::new(8);
+        fresh.push_at(payload(0, 0), start).unwrap();
+        assert!(fresh
+            .push_at(payload(u32::MAX, 0), start)
+            .unwrap()
+            .is_empty());
+        assert_eq!(fresh.late_dropped(), 1);
+        assert_eq!(fresh.pending_len(), 0);
+    }
+
+    #[test]
+    fn ordered_overflow_with_an_expired_gap_releases_instead_of_failing() {
+        let start = Instant::now();
+        let mut buffer = OrderedPayloadBuffer::with_reorder_delay(2, Duration::from_millis(10));
+        buffer.push_at(payload(30, 0), start).unwrap();
+        assert!(buffer.push_at(payload(32, 0), start).unwrap().is_empty());
+        assert!(buffer.push_at(payload(33, 0), start).unwrap().is_empty());
+        // The bound trips at 34, but the gap at 31 is due by then.
+        assert_eq!(
+            sequences(&buffer.push_at(payload(34, 0), start + ms(10)).unwrap()),
+            vec![32, 33, 34]
+        );
+        assert_eq!(buffer.skipped_packets(), 1);
+    }
+
+    #[test]
+    fn ordered_with_deadline_skips_the_oldest_gap_at_its_bound() {
+        let start = Instant::now();
+        let mut buffer = OrderedPayloadBuffer::with_deadline(2, Duration::from_secs(1))
+            .with_startup_hold(Duration::ZERO);
+        assert_eq!(buffer.overflow_policy(), OverflowPolicy::SkipOldestGap);
+        buffer.push_at(payload(30, 0), start).unwrap();
+        assert!(buffer.push_at(payload(32, 0), start).unwrap().is_empty());
+        assert!(buffer.push_at(payload(34, 0), start).unwrap().is_empty());
+        // Three held: the gap at 31 goes, 32 is released; 33 still waits.
+        assert_eq!(
+            sequences(&buffer.push_at(payload(35, 0), start).unwrap()),
+            vec![32]
+        );
+        assert_eq!(buffer.pending_len(), 2);
+        assert_eq!(buffer.gaps_skipped(), 1);
+        for sequence in 36..1_000 {
+            buffer.push_at(payload(sequence, 0), start).unwrap();
+            assert!(buffer.pending_len() <= 2);
+        }
+        assert_eq!(buffer.skipped_packets(), 2);
+    }
+
+    #[test]
+    fn ordered_flush_all_releases_in_order() {
+        let start = Instant::now();
+        let mut buffer = OrderedPayloadBuffer::new(8);
+        buffer.push_at(payload(1, 0), start).unwrap();
+        for sequence in [5, 3, 4, 8] {
+            assert!(buffer
+                .push_at(payload(sequence, 0), start)
+                .unwrap()
+                .is_empty());
+        }
+        assert_eq!(buffer.next_deadline(), None);
+        assert_eq!(sequences(&buffer.flush_all()), vec![3, 4, 5, 8]);
+        assert_eq!(buffer.skipped_packets(), 3);
+        assert_eq!(buffer.gaps_skipped(), 2);
+        assert_eq!(buffer.pending_len(), 0);
+        assert_eq!(buffer.next_sequence(), Some(9));
+    }
+
+    #[test]
+    fn ordered_duplicates_are_counted_and_dropped() {
+        let start = Instant::now();
+        let mut buffer = OrderedPayloadBuffer::new(8);
+        buffer.push_at(payload(1, 0), start).unwrap();
+        let mut out = Vec::new();
+        assert_eq!(
+            buffer.push_into(payload(3, 0), start, &mut out),
+            Ok(OrderedPush::Held)
+        );
+        assert_eq!(
+            buffer.push_into(payload(3, 0), start, &mut out),
+            Ok(OrderedPush::Duplicate)
+        );
+        let mut flagged = payload(2, 0);
+        flagged.duplicate = true;
+        assert_eq!(
+            buffer.push_into(flagged, start, &mut out),
+            Ok(OrderedPush::Duplicate)
+        );
+        assert_eq!(buffer.stats().duplicates, 2);
+        assert!(out.is_empty());
+    }
+
+    /// Every payload the buffer accepts comes out once, in strictly
+    /// increasing extended order, and the skipped count fills the gaps.
+    #[test]
+    fn ordered_random_streams_keep_the_invariants() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rand = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..20u32 {
+            let start = Instant::now();
+            let mut buffer = if round % 2 == 0 {
+                OrderedPayloadBuffer::with_deadline(64, Duration::from_millis(20))
+            } else {
+                OrderedPayloadBuffer::with_reorder_delay(4_096, Duration::from_millis(20))
+            };
+            let base = u32::MAX - 500 + round * 7;
+            let mut out = Vec::new();
+            let mut accepted = 0u64;
+            let mut late = 0u64;
+            let mut repairs: Vec<(u64, u32)> = Vec::new();
+            for step in 0..3_000u64 {
+                let now = start + Duration::from_micros(step * 100);
+                let sequence = base.wrapping_add(step as u32);
+                let roll = rand() % 100;
+                if roll < 5 {
+                    // Lost; repaired 2-40 ms later, or never.
+                    if rand() % 4 != 0 {
+                        repairs.push((step + 20 + rand() % 380, sequence));
+                    }
+                } else {
+                    match buffer.push_into(payload(sequence, 0), now, &mut out) {
+                        Ok(OrderedPush::Released | OrderedPush::Held) => accepted += 1,
+                        Ok(OrderedPush::Late) => late += 1,
+                        Ok(OrderedPush::Duplicate) => {}
+                        Err(error) => panic!("{error}"),
+                    }
+                }
+                repairs.sort_unstable();
+                while repairs.first().is_some_and(|&(due, _)| due <= step) {
+                    let (_, repaired) = repairs.remove(0);
+                    match buffer.push_into(payload(repaired, 0), now, &mut out) {
+                        Ok(OrderedPush::Released | OrderedPush::Held) => accepted += 1,
+                        Ok(OrderedPush::Late) => late += 1,
+                        Ok(OrderedPush::Duplicate) => {}
+                        Err(error) => panic!("{error}"),
+                    }
+                }
+                if step % 10 == 0 {
+                    buffer.release_expired_into(now, &mut out);
+                }
+            }
+            buffer.flush_all_into(&mut out);
+            let stats = buffer.stats();
+            assert_eq!(out.len() as u64, accepted);
+            assert_eq!(stats.released, accepted);
+            assert_eq!(stats.late_dropped, late);
+            let first = u64::from(out[0].sequence);
+            let mut previous = first;
+            for released in &out[1..] {
+                let distance = released.sequence.wrapping_sub(previous as u32);
+                assert!((1..1 << 31).contains(&distance));
+                previous += u64::from(distance);
+            }
+            assert_eq!(
+                previous - first + 1,
+                out.len() as u64 + stats.packets_skipped
+            );
+        }
+    }
+
+    fn schedule(initial: u64, max_retries: u32) -> NackSchedule {
+        NackSchedule {
+            initial_delay: ms(initial),
+            repeat_delay: ms(20),
+            max_retries,
+            min_time_left: Duration::ZERO,
+        }
+    }
+
+    fn take(
+        tracker: &mut MissingTracker,
+        now: Instant,
+        plan: &NackSchedule,
+        limit: usize,
+    ) -> Vec<u32> {
+        let mut out = Vec::new();
+        tracker.take_due_nacks(now, plan, limit, &mut out);
+        tracker.check_invariants();
+        out
+    }
+
+    #[test]
+    fn backoff_doubles_the_repeat_delay_per_attempt() {
+        let repeat = NackRepeat {
+            delay: ms(5),
+            backoff: true,
+            copy_gap: None,
+        };
+        assert_eq!(repeat.after(1), ms(5));
+        assert_eq!(repeat.after(2), ms(10));
+        assert_eq!(repeat.after(4), ms(40));
+        assert_eq!(NackRepeat::fixed(ms(5)).after(4), ms(5));
+
+        let t0 = Instant::now();
+        let mut tracker = MissingTracker::with_limits(64, Duration::from_secs(10));
+        tracker.observe_at(0, t0);
+        tracker.observe_at(2, t0);
+        let plan = schedule(0, 20);
+        let mut at = t0;
+        let mut gaps = Vec::new();
+        for _ in 0..4 {
+            assert_eq!(take(&mut tracker, at, &plan, 8), vec![1]);
+            tracker.commit_nacks_with(&[1], at, repeat);
+            tracker.check_invariants();
+            let next = tracker.next_nack_at().unwrap();
+            gaps.push(next - at);
+            at = next;
+        }
+        assert_eq!(gaps, vec![ms(5), ms(10), ms(20), ms(40)]);
+    }
+
+    #[test]
+    fn nack_copies_are_due_once_and_do_not_count_as_attempts() {
+        let t0 = Instant::now();
+        let mut tracker = MissingTracker::with_limits(64, Duration::from_secs(10));
+        tracker.observe_at(0, t0);
+        tracker.observe_at(3, t0);
+        let plan = schedule(0, 20);
+        assert_eq!(take(&mut tracker, t0, &plan, 8), vec![1, 2]);
+        let repeat = NackRepeat {
+            delay: ms(20),
+            backoff: false,
+            copy_gap: Some(ms(2)),
+        };
+        tracker.commit_nacks_with(&[1, 2], t0, repeat);
+        assert_eq!(tracker.next_nack_at(), Some(t0 + ms(2)));
+        let mut copies = Vec::new();
+        tracker.take_due_copies(t0 + ms(1), 8, &mut copies);
+        assert!(copies.is_empty());
+        // Hole 2 is recovered before its copy is due: only 1 is copied.
+        tracker.observe_at(2, t0 + ms(1));
+        tracker.take_due_copies(t0 + ms(2), 8, &mut copies);
+        assert_eq!(copies, vec![1]);
+        tracker.check_invariants();
+        assert_eq!(tracker.hole(1).unwrap().nack_count, 1);
+        assert_eq!(tracker.hole(1).unwrap().next_nack_at, Some(t0 + ms(20)));
+        copies.clear();
+        tracker.take_due_copies(t0 + ms(3), 8, &mut copies);
+        assert!(copies.is_empty(), "a copy is sent once");
+        assert_eq!(tracker.next_nack_at(), Some(t0 + ms(20)));
+    }
+
+    #[test]
+    fn tracker_allocates_nothing_until_the_first_packet() {
+        let mut tracker = MissingTracker::with_limits(1 << 20, Duration::from_secs(1));
+        assert_eq!(tracker.capacity(), 1 << 20);
+        assert!(tracker.seen.is_empty());
+        tracker.observe_at(5, Instant::now());
+        assert_eq!(tracker.seen.len(), 1 << 20);
+    }
+
+    #[test]
+    fn growing_the_ring_keeps_what_it_knew() {
+        let now = Instant::now();
+        let mut tracker = MissingTracker::with_limits(8, Duration::from_secs(1));
+        assert!(!tracker.grow_capacity(4));
+        for sequence in (0..40).filter(|sequence| *sequence != 37 && *sequence != 20) {
+            tracker.observe_at(sequence, now);
+        }
+        // 37 and 20 are holes; 36 was seen; 3 is long forgotten.
+        assert!(tracker.grow_capacity(40));
+        assert_eq!(tracker.capacity(), 64);
+        tracker.check_invariants();
+        assert!(tracker.observe_at(36, now).duplicate);
+        assert!(tracker.observe_at(37, now).recovered);
+        assert!(tracker.observe_at(20, now).recovered);
+        // Behind the old ring: refused as before the growth.
+        assert!(tracker.observe_at(3, now).duplicate);
+        // A late arrival inside the old reach that was not seen stays late.
+        let mut tracker = MissingTracker::with_limits(8, Duration::from_millis(1));
+        for sequence in (0..40).filter(|sequence| *sequence != 37) {
+            tracker.observe_at(sequence, now);
+        }
+        let later = now + Duration::from_millis(5);
+        tracker.observe_at(40, later); // 37 expires
+        assert!(tracker.grow_capacity(64));
+        let late = tracker.observe_at(37, later);
+        assert!(!late.duplicate && !late.recovered);
+        assert!(tracker.observe_at(37, later).duplicate);
+        // Growing before the first packet only changes the size.
+        let mut fresh = MissingTracker::with_limits(8, Duration::from_secs(1));
+        assert!(fresh.grow_capacity(1_000));
+        assert_eq!(fresh.capacity(), 1_024);
+        fresh.observe_at(5, now);
+        assert!(fresh.observe_at(5, now).duplicate);
+    }
+
+    #[test]
+    fn a_burst_larger_than_the_ring_keeps_every_hole() {
+        let start = Instant::now();
+        let mut tracker = MissingTracker::with_limits(8, Duration::from_secs(1));
+        tracker.observe_at(10, start);
+        assert_eq!(
+            tracker.observe_at(30, start).newly_missing,
+            (11..30).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            tracker.observe_at(40, start).newly_missing,
+            (31..40).collect::<Vec<_>>()
+        );
+        assert_eq!(tracker.missing_len(), 28);
+        // Slot collisions (11 and 19 share a slot of the 8-entry ring) no
+        // longer drop holes.
+        assert!(tracker.observe_at(11, start).recovered);
+        assert!(tracker.observe_at(19, start).recovered);
+        assert!(tracker.observe_at(35, start).recovered);
+        assert_eq!(tracker.missing_len(), 25);
+        assert_eq!(
+            tracker.missing_sequences().collect::<Vec<_>>(),
+            (12..19)
+                .chain(20..30)
+                .chain(31..35)
+                .chain(36..40)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(tracker.counters().holes_opened, 28);
+        assert_eq!(tracker.counters().holes_recovered, 3);
+        tracker.check_invariants();
+    }
+
+    #[test]
+    fn a_full_16_bit_gap_is_tracked_and_the_horizon_is_counted() {
+        let start = Instant::now();
+        let mut tracker = MissingTracker::with_limits(1024, Duration::from_secs(1));
+        tracker.observe_at(0, start);
+        let observation = tracker.observe_at(MAX_TRACKED_HOLE_DISTANCE + 1, start);
+        assert_eq!(
+            observation.newly_missing.len(),
+            MAX_TRACKED_HOLE_DISTANCE as usize
+        );
+        assert_eq!(tracker.counters().holes_unaddressable, 0);
+        // The next packet pushes the oldest hole past the 16-bit horizon.
+        tracker.observe_at(MAX_TRACKED_HOLE_DISTANCE + 2, start);
+        assert_eq!(tracker.counters().holes_unaddressable, 1);
+        assert_eq!(
+            tracker.missing_len(),
+            MAX_TRACKED_HOLE_DISTANCE as usize - 1
+        );
+        assert_eq!(tracker.missing_sequences().next(), Some(2));
+        // A repair for the far end of the horizon is still recognised.
+        assert!(tracker.observe_at(2, start).recovered);
+        tracker.check_invariants();
+    }
+
+    /// A stream whose first sequence seen is 1..=16 is taken to start at 0:
+    /// the packets before it are holes, requested like any other.
+    #[test]
+    fn startup_window_takes_a_low_first_sequence_as_numbered_from_zero() {
+        let start = Instant::now();
+        let mut tracker = MissingTracker::with_limits(1_024, ms(1_000));
+        tracker.set_startup_window(ms(25));
+        let first = tracker.observe_at(3, start);
+        assert_eq!(first.newly_missing, vec![0, 1, 2]);
+        tracker.check_invariants();
+        assert_eq!(tracker.counters().startup_holes, 3);
+        let plan = schedule(5, 10);
+        assert!(take(&mut tracker, start + ms(4), &plan, 64).is_empty());
+        let due = take(&mut tracker, start + ms(15), &plan, 64);
+        assert_eq!(due, vec![0, 1, 2]);
+        tracker.commit_nacks(&due, start + ms(15), ms(20));
+        tracker.check_invariants();
+        // A later hole goes behind them; repairs close them.
+        assert_eq!(tracker.observe_at(5, start + ms(16)).newly_missing, vec![4]);
+        assert!(tracker.observe_at(1, start + ms(270)).recovered);
+        assert_eq!(
+            tracker.hole(1).map(|hole| hole.status),
+            Some(HoleStatus::Recovered)
+        );
+        assert_eq!(
+            tracker.missing_sequences().collect::<Vec<_>>(),
+            vec![0, 2, 4]
+        );
+        tracker.check_invariants();
+
+        // Off (the default): nothing before the first packet.
+        let mut tracker = MissingTracker::with_limits(1_024, ms(1_000));
+        assert!(tracker.observe_at(3, start).newly_missing.is_empty());
+        let late = tracker.observe_at(1, start + ms(1));
+        assert!(!late.duplicate && !late.recovered);
+        assert_eq!(tracker.counters().late_packets, 1);
+        assert_eq!(tracker.missing_len(), 0);
+    }
+
+    /// While the startup window is open, a packet below the start becomes
+    /// the new start and the sequences in between are holes; after the
+    /// window, or too far below, it is late as before.
+    #[test]
+    fn startup_window_takes_packets_below_the_first_as_the_new_start() {
+        let start = Instant::now();
+        let mut tracker = MissingTracker::with_limits(4_096, ms(1_000));
+        tracker.set_startup_window(ms(25));
+        assert!(tracker.observe_at(500, start).newly_missing.is_empty());
+        assert_eq!(tracker.observe_at(502, start).newly_missing, vec![501]);
+        // A retry-marked copy of the first packet, 10 below.
+        let below = tracker.observe_at(490, start + ms(12));
+        assert!(!below.duplicate && !below.recovered);
+        assert_eq!(below.newly_missing, (491..500).collect::<Vec<_>>());
+        tracker.check_invariants();
+        // Arrivals in between close holes; a copy of 490 is a duplicate.
+        assert!(tracker.observe_at(495, start + ms(13)).recovered);
+        assert!(tracker.observe_at(490, start + ms(13)).duplicate);
+        // Within the zero-start reach: back to 0.
+        let low = tracker.observe_at(7, start + ms(14));
+        assert_eq!(low.newly_missing.len(), 490 - 1);
+        assert_eq!(low.newly_missing.first(), Some(&0));
+        assert!(!low.newly_missing.contains(&7));
+        tracker.check_invariants();
+        let counters = tracker.counters();
+        assert_eq!(counters.startup_packets, 2);
+        assert_eq!(counters.startup_holes, 9 + 489);
+        assert_eq!(counters.late_packets, 0);
+        // They are requested oldest first, after the first-NACK delay.
+        let plan = schedule(5, 10);
+        let due = take(&mut tracker, start + ms(40), &plan, 1_024);
+        assert_eq!(due.len(), 489 + 8 + 1);
+        assert_eq!(due[..4], [0, 1, 2, 3]);
+
+        // After the window: late, as before.
+        let mut tracker = MissingTracker::with_limits(4_096, ms(1_000));
+        tracker.set_startup_window(ms(25));
+        tracker.observe_at(500, start);
+        let late = tracker.observe_at(490, start + ms(25));
+        assert!(late.newly_missing.is_empty());
+        assert_eq!(tracker.counters().late_packets, 1);
+        // Too far below: late.
+        let mut tracker = MissingTracker::with_limits(4_096, ms(1_000));
+        tracker.set_startup_window(ms(25));
+        tracker.observe_at(5_000, start);
+        let late = tracker.observe_at(5_000 - STARTUP_REACH - 1, start + ms(1));
+        assert!(late.newly_missing.is_empty());
+        assert_eq!(tracker.counters().late_packets, 1);
+        // A reset (new sender) opens the window again.
+        tracker.reset();
+        assert_eq!(
+            tracker.observe_at(2, start + ms(100)).newly_missing,
+            vec![0, 1]
+        );
+        tracker.check_invariants();
+    }
+
+    #[test]
+    fn a_late_packet_after_expiry_is_neither_duplicate_nor_recovered() {
+        let start = Instant::now();
+        let mut tracker = MissingTracker::with_limits(64, ms(100));
+        tracker.observe_at(1, start);
+        assert_eq!(tracker.observe_at(3, start).newly_missing, vec![2]);
+        tracker.observe_at(4, start + ms(101));
+        assert_eq!(tracker.missing_len(), 0);
+        assert_eq!(tracker.counters().holes_expired, 1);
+
+        let late = tracker.observe_at(2, start + ms(102));
+        assert!(!late.duplicate);
+        assert!(!late.recovered);
+        assert_eq!(tracker.counters().late_packets, 1);
+        assert!(tracker.observe_at(2, start + ms(103)).duplicate);
+        assert!(tracker.observe_at(4, start + ms(103)).duplicate);
+        tracker.check_invariants();
+    }
+
+    #[test]
+    fn take_due_nacks_is_oldest_first_and_respects_the_limit() {
+        let start = Instant::now();
+        let mut tracker = MissingTracker::with_limits(4096, Duration::from_secs(1));
+        // 1000 isolated holes: 1, 3, 5, ..., 1999.
+        for sequence in (0..=2000).step_by(2) {
+            tracker.observe_at(sequence, start);
+        }
+        assert_eq!(tracker.missing_len(), 1000);
+        let plan = schedule(15, 20);
+        assert!(take(&mut tracker, start + ms(14), &plan, 200).is_empty());
+
+        let now = start + ms(15);
+        let mut all = Vec::new();
+        for _ in 0..5 {
+            let batch = take(&mut tracker, now, &plan, 200);
+            assert_eq!(batch.len(), 200);
+            assert!(batch.windows(2).all(|pair| pair[0] < pair[1]));
+            if let Some(&last) = all.last() {
+                assert!(batch[0] > last);
+            }
+            tracker.commit_nacks(&batch, now, ms(20));
+            tracker.check_invariants();
+            all.extend(batch);
+        }
+        assert_eq!(all, (1..2000).step_by(2).collect::<Vec<_>>());
+        assert!(take(&mut tracker, now, &plan, 200).is_empty());
+    }
+
+    #[test]
+    fn only_committed_holes_count_as_requested() {
+        let start = Instant::now();
+        let mut tracker = MissingTracker::with_limits(64, Duration::from_secs(1));
+        tracker.observe_at(0, start);
+        tracker.observe_at(11, start);
+        let plan = schedule(0, 20);
+        let due = take(&mut tracker, start, &plan, usize::MAX);
+        assert_eq!(due, (1..11).collect::<Vec<_>>());
+
+        tracker.commit_nacks(&due[..4], start, ms(20));
+        tracker.check_invariants();
+        for sequence in 1..5 {
+            let hole = tracker.hole(sequence).unwrap();
+            assert_eq!(hole.nack_count, 1);
+            assert_eq!(hole.last_nack_at, Some(start));
+            assert_eq!(hole.next_nack_at, Some(start + ms(20)));
+        }
+        for sequence in 5..11 {
+            let hole = tracker.hole(sequence).unwrap();
+            assert_eq!(hole.nack_count, 0);
+            assert_eq!(hole.status, HoleStatus::Fresh);
+        }
+        // Not committed: still due, at the same instant.
+        assert_eq!(
+            take(&mut tracker, start, &plan, usize::MAX),
+            (5..11).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn deferred_holes_stay_due_from_the_deferral_instant() {
+        let start = Instant::now();
+        let mut tracker = MissingTracker::with_limits(64, Duration::from_secs(1));
+        tracker.observe_at(0, start);
+        tracker.observe_at(4, start);
+        let plan = schedule(15, 20);
+        let now = start + ms(15);
+        let due = take(&mut tracker, now, &plan, usize::MAX);
+        assert_eq!(due, vec![1, 2, 3]);
+        tracker.defer_nacks(&due, now + ms(100));
+        tracker.check_invariants();
+        assert_eq!(tracker.next_nack_at(), Some(now + ms(100)));
+        assert!(take(&mut tracker, now + ms(99), &plan, usize::MAX).is_empty());
+        assert_eq!(
+            take(&mut tracker, now + ms(100), &plan, usize::MAX),
+            vec![1, 2, 3]
+        );
+        assert_eq!(tracker.hole(2).unwrap().nack_count, 0);
+    }
+
+    #[test]
+    fn taken_holes_that_are_neither_committed_nor_deferred_come_back() {
+        let start = Instant::now();
+        let mut tracker = MissingTracker::with_limits(64, Duration::from_secs(1));
+        tracker.observe_at(0, start);
+        tracker.observe_at(2, start);
+        let plan = schedule(0, 20);
+        let due = take(&mut tracker, start, &plan, usize::MAX);
+        tracker.commit_nacks(&due, start, ms(20));
+        let later = start + ms(20);
+        assert_eq!(take(&mut tracker, later, &plan, usize::MAX), vec![1]);
+        assert_eq!(tracker.hole(1).unwrap().status, HoleStatus::Taken);
+        // The caller dropped the batch: the hole is due again.
+        assert_eq!(take(&mut tracker, later, &plan, usize::MAX), vec![1]);
+        assert_eq!(tracker.hole(1).unwrap().nack_count, 1);
+    }
+
+    #[test]
+    fn repeats_follow_the_commit_time_delay_and_stop_at_max_retries() {
+        let start = Instant::now();
+        let mut tracker = MissingTracker::with_limits(64, Duration::from_secs(1));
+        tracker.observe_at(0, start);
+        tracker.observe_at(2, start);
+        let plan = schedule(15, 2);
+        assert_eq!(tracker.next_nack_at(), Some(start + ms(15)));
+
+        let first = start + ms(15);
+        assert_eq!(take(&mut tracker, first, &plan, usize::MAX), vec![1]);
+        tracker.commit_nacks(&[1], first, ms(30));
+        assert_eq!(tracker.next_nack_at(), Some(first + ms(30)));
+        assert!(take(&mut tracker, first + ms(29), &plan, usize::MAX).is_empty());
+
+        let second = first + ms(30);
+        assert_eq!(take(&mut tracker, second, &plan, usize::MAX), vec![1]);
+        tracker.commit_nacks(&[1], second, ms(10));
+        assert_eq!(tracker.hole(1).unwrap().nack_count, 2);
+        assert_eq!(tracker.hole(1).unwrap().last_nack_at, Some(second));
+
+        assert!(take(&mut tracker, second + ms(10), &plan, usize::MAX).is_empty());
+        assert_eq!(tracker.counters().retries_exhausted, 1);
+        assert_eq!(tracker.hole(1).unwrap().status, HoleStatus::Abandoned);
+        assert_eq!(tracker.missing_len(), 1);
+        assert_eq!(tracker.next_nack_at(), None);
+
+        // An abandoned hole can still be repaired, and the repair reports
+        // what an RTT estimator needs.
+        let arrival = tracker.observe_at(1, second + ms(12));
+        assert!(arrival.recovered);
+        assert_eq!(
+            tracker.last_recovered(),
+            Some(RecoveredHole {
+                sequence: 1,
+                first_missing_at: start,
+                first_nack_at: Some(start + ms(15)),
+                last_nack_at: Some(second),
+                nack_count: 2,
+                recovered_at: second + ms(12),
+            })
+        );
+        tracker.check_invariants();
+    }
+
+    #[test]
+    fn holes_too_close_to_their_deadline_are_skipped_and_counted() {
+        let start = Instant::now();
+        let mut tracker = MissingTracker::with_limits(64, ms(100));
+        tracker.observe_at(0, start);
+        tracker.observe_at(2, start);
+        tracker.observe_at(4, start + ms(40));
+        let plan = NackSchedule {
+            min_time_left: ms(50),
+            ..schedule(15, 20)
+        };
+        // Hole 1 was detected at +0 (deadline +100) and hole 3 at +40
+        // (deadline +140): at +60 only hole 3 has 50 ms left.
+        assert_eq!(
+            take(&mut tracker, start + ms(60), &plan, usize::MAX),
+            vec![3]
+        );
+        assert_eq!(tracker.counters().nack_too_late, 1);
+        assert_eq!(tracker.hole(1).unwrap().status, HoleStatus::Abandoned);
+        assert_eq!(tracker.missing_len(), 2);
+        assert!(tracker.observe_at(1, start + ms(61)).recovered);
+    }
+
+    #[test]
+    fn next_nack_at_is_idle_or_in_the_future_after_a_pass() {
+        let start = Instant::now();
+        let mut tracker = MissingTracker::with_limits(64, Duration::from_secs(1));
+        tracker.set_initial_nack_delay(ms(15));
+        assert_eq!(tracker.next_nack_at(), None);
+        tracker.observe_at(0, start);
+        tracker.observe_at(1, start);
+        assert_eq!(tracker.next_nack_at(), None);
+        tracker.observe_at(5, start + ms(3));
+        assert_eq!(tracker.next_nack_at(), Some(start + ms(18)));
+        let now = start + ms(18);
+        let due = take(&mut tracker, now, &schedule(15, 20), usize::MAX);
+        tracker.commit_nacks(&due, now, ms(20));
+        assert!(tracker.next_nack_at().unwrap() > now);
+        for sequence in 2..5 {
+            tracker.observe_at(sequence, now + ms(1));
+        }
+        // The stale heap entries may make the hint early, never late; one
+        // pass clears them.
+        assert!(take(&mut tracker, now + ms(20), &schedule(15, 20), usize::MAX).is_empty());
+        assert_eq!(tracker.next_nack_at(), None);
+    }
+
+    #[test]
+    fn holes_and_schedule_cross_the_u32_rollover() {
+        let start = Instant::now();
+        let mut tracker = MissingTracker::with_limits(16, Duration::from_secs(1));
+        tracker.observe_at(u32::MAX - 3, start);
+        assert_eq!(
+            tracker.observe_at(2, start).newly_missing,
+            vec![u32::MAX - 2, u32::MAX - 1, u32::MAX, 0, 1]
+        );
+        let plan = schedule(0, 20);
+        let due = take(&mut tracker, start, &plan, 3);
+        assert_eq!(due, vec![u32::MAX - 2, u32::MAX - 1, u32::MAX]);
+        tracker.commit_nacks(&due, start, ms(20));
+        assert_eq!(take(&mut tracker, start, &plan, 3), vec![0, 1]);
+        tracker.commit_nacks(&[0, 1], start, ms(20));
+        assert!(tracker.observe_at(u32::MAX, start).recovered);
+        assert!(tracker.observe_at(0, start).recovered);
+        assert_eq!(
+            take(&mut tracker, start + ms(20), &plan, usize::MAX),
+            vec![u32::MAX - 2, u32::MAX - 1, 1]
+        );
+        assert!(tracker.observe_at(0, start).duplicate);
+        tracker.check_invariants();
+    }
+
+    #[test]
+    fn nacks_due_wrapper_keeps_its_historical_contract() {
+        let start = Instant::now();
+        let mut tracker = MissingTracker::with_limits(64, Duration::from_secs(1));
+        tracker.observe_at(0, start);
+        tracker.observe_at(4, start);
+        assert!(tracker
+            .nacks_due(start + ms(14), ms(15), ms(20), 6, 20)
+            .is_empty());
+        let now = start + ms(15);
+        assert_eq!(tracker.nacks_due(now, ms(15), ms(20), 6, 20), vec![3, 2, 1]);
+        assert!(tracker
+            .nacks_due(now + ms(19), ms(15), ms(20), 6, 20)
+            .is_empty());
+        assert_eq!(
+            tracker.nacks_due(now + ms(20), ms(15), ms(20), 6, 20),
+            vec![3, 2, 1]
+        );
+        assert_eq!(tracker.hole(1).unwrap().nack_count, 2);
+    }
+
+    #[test]
+    fn reset_and_reconfigure_count_discarded_holes() {
+        let start = Instant::now();
+        let mut tracker = MissingTracker::with_limits(64, Duration::from_secs(1));
+        tracker.observe_at(100, start);
+        tracker.observe_at(104, start);
+        tracker.reset();
+        assert_eq!(tracker.counters().holes_reset, 3);
+        assert_eq!(tracker.missing_len(), 0);
+        // After a reset the ring is re-armed around the new first sequence.
+        assert!(!tracker.observe_at(7, start).duplicate);
+        assert!(!tracker.observe_at(5, start).duplicate);
+        tracker.observe_at(9, start);
+        tracker.reconfigure(128, ms(50));
+        assert_eq!(tracker.counters().holes_reset, 4);
+        assert_eq!(tracker.capacity(), 128);
+        assert_eq!(tracker.recovery_age(), ms(50));
+        tracker.check_invariants();
+    }
+
+    /// Deterministic model check: a seeded stream with loss, bursts,
+    /// reordering and duplicates, starting just below the u32 rollover, is
+    /// compared with a plain set-based model of the same rules.
+    #[test]
+    fn tracker_matches_a_set_model_under_loss_reorder_and_duplicates() {
+        use std::collections::{BTreeSet, HashSet};
+        let start = Instant::now();
+        let mut tracker = MissingTracker::with_limits(1 << 16, Duration::from_secs(3600));
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let base = u32::MAX - 5_000;
+        let mut arrivals = Vec::new();
+        let mut held = Vec::new();
+        for offset in 0..20_000_u32 {
+            let roll = next() % 1000;
+            if roll < 30 {
+                held.push(offset);
+            } else if roll < 35 {
+                continue;
+            } else {
+                arrivals.push(offset);
+                if roll >= 990 {
+                    arrivals.push(offset);
+                }
+            }
+            if next() % 64 == 0 {
+                arrivals.append(&mut held);
+            }
+        }
+        arrivals.append(&mut held);
+
+        let mut highest: Option<u32> = None;
+        let mut missing = BTreeSet::new();
+        let mut seen = HashSet::new();
+        for (step, offset) in arrivals.into_iter().enumerate() {
+            let sequence = base.wrapping_add(offset);
+            let now = start + Duration::from_micros(step as u64);
+            let got = tracker.observe_at(sequence, now);
+            let mut newly = Vec::new();
+            let (duplicate, recovered);
+            if highest.map_or(true, |high| offset > high) {
+                if let Some(high) = highest {
+                    for gap in high + 1..offset {
+                        missing.insert(gap);
+                        newly.push(base.wrapping_add(gap));
+                    }
+                }
+                highest = Some(offset);
+                duplicate = false;
+                recovered = false;
+            } else if missing.remove(&offset) {
+                duplicate = false;
+                recovered = true;
+            } else {
+                duplicate = seen.contains(&offset);
+                recovered = false;
+            }
+            seen.insert(offset);
+            assert_eq!(got.duplicate, duplicate, "duplicate at {offset}");
+            assert_eq!(got.recovered, recovered, "recovered at {offset}");
+            assert_eq!(got.newly_missing, newly, "newly missing at {offset}");
+            assert_eq!(tracker.missing_len(), missing.len());
+            if step % 997 == 0 {
+                assert_eq!(
+                    tracker.missing_sequences().collect::<Vec<_>>(),
+                    missing
+                        .iter()
+                        .map(|gap| base.wrapping_add(*gap))
+                        .collect::<Vec<_>>()
+                );
+                tracker.check_invariants();
+            }
+        }
+        assert_eq!(tracker.counters().late_packets, 0);
     }
 }

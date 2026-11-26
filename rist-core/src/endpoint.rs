@@ -46,6 +46,142 @@ impl Default for RecoveryConfig {
     }
 }
 
+/// When a sender resends the last packet of a burst on its own (B4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TailProbe {
+    /// Never.
+    Off,
+    /// Only while the peer is losing packets: within
+    /// [`RecoveryTuning::tail_probe_loss_window`] of the last NACK received.
+    #[default]
+    Auto,
+    /// After every burst.
+    On,
+}
+
+/// Recovery behaviour beyond what [`RecoveryConfig`] (the librist URL
+/// parameters) describes. Every field keeps the wire format: a librist peer
+/// sees only packets it already understands (echo requests, NACKs,
+/// retransmissions marked with the SSRC retry bit, duplicates). The defaults
+/// are the settings that win under loss with the product configuration;
+/// `RecoveryTuning::librist_like()` turns the extras off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryTuning {
+    /// Receiver: send echo requests (every `RtcpIntervals::echo`, first one
+    /// with the first report) and take RTT samples from echo responses and
+    /// from retry-marked repairs of holes NACKed once (Karn's rule). The
+    /// re-NACK interval follows the measured RTT.
+    pub measure_rtt: bool,
+    /// Receiver: added to every re-NACK interval, so a re-request clears a
+    /// sender's spacing check measured with a slightly larger RTT.
+    pub renack_margin: Duration,
+    /// Receiver: first NACK after `clamp(1.5 x observed reordering + 1 ms,
+    /// first_nack_floor, reorder_buffer)` instead of always `reorder_buffer`.
+    pub adaptive_first_nack: bool,
+    pub first_nack_floor: Duration,
+    /// Receiver: delay the re-NACK of a hole by the time the sender needs to
+    /// send the repairs NACKed ahead of it in the same batch (its place in
+    /// the batch x the packet gap measured inside bursts, at most twice the
+    /// re-NACK interval), so the holes at the back of a large batch are not
+    /// asked for again while their first repair is still queued.
+    pub renack_drain: bool,
+    /// Receiver: send every NACK attempt a second time a few milliseconds
+    /// later (not counted as an attempt), unless congestion control is off.
+    /// The sender's spacing check discards the copy when the first arrived.
+    pub redundant_nacks: bool,
+    /// Sender: send a repair twice, `duplicate_gap` apart, when the previous
+    /// repair of that sequence was lost or no later attempt could arrive in
+    /// time.
+    pub duplicate_late_repairs: bool,
+    pub duplicate_gap: Duration,
+    /// Sender (with `duplicate_late_repairs`): the first data packet of a
+    /// flow goes out again, retry-marked, `duplicate_gap` after it and once
+    /// more this long after it, so a loss burst that takes the first packets
+    /// and the first copy still leaves one. Zero: only the first copy.
+    pub first_packet_late_copy: Duration,
+    /// Receiver: during the first
+    /// [`crate::recovery::DEFAULT_STARTUP_HOLD`] of a stream (at most the
+    /// recovery buffer), take a packet up to
+    /// [`crate::recovery::STARTUP_REACH`] below the first sequence seen as
+    /// the new start of the stream and NACK the sequences between it and
+    /// the old start like any hole; a stream whose first sequence seen is
+    /// at most [`crate::recovery::ZERO_START_REACH`] is taken to start at 0
+    /// (librist and rist-rs number from 0), so a loss of its first packets
+    /// is NACKed too. [`Self::ordered_startup_hold`] is the matching hold
+    /// for an [`crate::OrderedPayloadBuffer`].
+    pub startup_recovery: bool,
+    /// Sender: resend the last packet of a burst once the sender has been
+    /// idle for a few packet gaps, so a lost frame tail is repaired without
+    /// waiting for the next frame. While the sender stays idle the probe is
+    /// repeated with backoff (idle, 2 x idle, 4 x idle after the last
+    /// packet, three at most), so a short outage that takes the first probe
+    /// does not hide the tail until the next burst.
+    pub tail_probe: TailProbe,
+    /// Upper bound of tail probes, per mille of the data packets sent.
+    pub tail_probe_max_per_mille: u32,
+    /// [`TailProbe::Auto`]: how long after the last NACK probes stay on.
+    pub tail_probe_loss_window: Duration,
+    /// Sender: keep packets for at least `L + 2 x rtt_max` by growing the
+    /// history (up to `max_history_packets`, itself capped at
+    /// [`crate::recovery::MAX_ADDRESSABLE_HISTORY`], the 16-bit NACK
+    /// horizon) instead of evicting by count.
+    pub history_by_time: bool,
+    pub max_history_packets: usize,
+}
+
+impl Default for RecoveryTuning {
+    fn default() -> Self {
+        Self {
+            measure_rtt: true,
+            renack_margin: Duration::from_millis(1),
+            adaptive_first_nack: true,
+            first_nack_floor: Duration::from_millis(2),
+            renack_drain: true,
+            redundant_nacks: true,
+            duplicate_late_repairs: true,
+            duplicate_gap: Duration::from_millis(1),
+            first_packet_late_copy: Duration::from_millis(12),
+            startup_recovery: true,
+            tail_probe: TailProbe::Auto,
+            tail_probe_max_per_mille: 20,
+            tail_probe_loss_window: Duration::from_secs(10),
+            history_by_time: true,
+            max_history_packets: crate::recovery::MAX_ADDRESSABLE_HISTORY,
+        }
+    }
+}
+
+impl RecoveryTuning {
+    /// RTT measurement and history by time stay on; the extras (adaptive
+    /// first NACK, re-NACK drain, NACK copies, duplicate repairs, copies of
+    /// the first packet, startup recovery, tail probes) are off.
+    pub fn librist_like() -> Self {
+        Self {
+            adaptive_first_nack: false,
+            renack_drain: false,
+            redundant_nacks: false,
+            duplicate_late_repairs: false,
+            first_packet_late_copy: Duration::ZERO,
+            startup_recovery: false,
+            tail_probe: TailProbe::Off,
+            ..Self::default()
+        }
+    }
+
+    /// The first-payload hold for an [`crate::OrderedPayloadBuffer`] that
+    /// delivers this receiver's payloads with gap deadline `reorder_delay`:
+    /// [`crate::recovery::DEFAULT_STARTUP_HOLD`] capped at `reorder_delay`
+    /// with `startup_recovery`, zero without. It is what
+    /// [`crate::OrderedPayloadBuffer::with_deadline`] uses by default.
+    pub fn ordered_startup_hold(&self, reorder_delay: Duration) -> Duration {
+        if self.startup_recovery {
+            crate::recovery::DEFAULT_STARTUP_HOLD.min(reorder_delay)
+        } else {
+            Duration::ZERO
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryMode {
     Disabled,

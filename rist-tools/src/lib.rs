@@ -45,6 +45,7 @@ pub struct LossProxy {
     target: SocketAddr,
     source: Option<SocketAddr>,
     drop_every: u64,
+    drop_first: u64,
     highest_media_sequence: Option<u32>,
     dropped_sequences: HashSet<u32>,
     dropped_sequence_order: VecDeque<u32>,
@@ -67,6 +68,7 @@ impl LossProxy {
             target: config.target,
             source: None,
             drop_every: config.drop_every,
+            drop_first: 0,
             highest_media_sequence: None,
             dropped_sequences: HashSet::new(),
             dropped_sequence_order: VecDeque::new(),
@@ -74,6 +76,13 @@ impl LossProxy {
             stats: LossProxyStats::default(),
             receive_buffer: vec![0; MAX_DATAGRAM_SIZE],
         })
+    }
+
+    /// Also drops the first `count` media first transmissions (the start
+    /// of the stream); their retransmissions are forwarded like any other.
+    pub fn with_drop_first(mut self, count: u64) -> Self {
+        self.drop_first = count;
+        self
     }
 
     pub fn listen_addr(&self) -> io::Result<SocketAddr> {
@@ -174,8 +183,8 @@ impl LossProxy {
 
         self.highest_media_sequence = Some(extended);
         self.stats.media_first_transmissions += 1;
-        let drop =
-            self.drop_every > 0 && self.stats.media_first_transmissions % self.drop_every == 0;
+        let drop = self.stats.media_first_transmissions <= self.drop_first
+            || (self.drop_every > 0 && self.stats.media_first_transmissions % self.drop_every == 0);
         if drop {
             self.expire_oldest_drop_if_full();
             self.dropped_sequences.insert(extended);
@@ -308,6 +317,13 @@ mod tests {
         assert!(proxy_stats.all_injected_drops_recovered());
         assert_eq!(receiver.stats().recovered_packets, 4);
         assert_eq!(receiver.stats().currently_missing_packets, 0);
-        assert_eq!(sender.stats().retransmitted_packets, 4);
+        // Four NACKed repairs, plus whatever copies of the first packet
+        // fell due on the wall clock (1 ms and 12 ms after it).
+        let sender_stats = sender.stats();
+        assert_eq!(
+            sender_stats.retransmitted_packets - sender_stats.duplicate_repairs,
+            4,
+            "{sender_stats:?}"
+        );
     }
 }

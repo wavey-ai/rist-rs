@@ -15,6 +15,7 @@ pub mod mpegts;
 pub mod packet;
 pub mod profile;
 pub mod recovery;
+pub mod rtt;
 pub mod sequence;
 pub mod simple;
 pub mod stats;
@@ -29,24 +30,28 @@ pub use bonding::{PeerSelection, WeightedPeerSelector};
 pub use crypto::{AesKeySize, PskKey};
 pub use endpoint::{
     AdvancedUrlConfig, CongestionControlMode, ConnectionConfig, EncryptionConfig, Endpoint,
-    MultiplexMode, PeerConfig, RecoveryConfig, RecoveryMode, TimingMode, VirtualPorts,
+    MultiplexMode, PeerConfig, RecoveryConfig, RecoveryMode, RecoveryTuning, TailProbe, TimingMode,
+    VirtualPorts,
 };
 pub use error::Error;
 pub use main_profile::{
-    MainControlPacket, MainOutboundPacket, MainReceiverCore, MainReceiverFeedback, MainSenderCore,
-    MainSenderPeerState, MainSessionConfig, MainSessionPoll, MainSessionTimers,
+    MainControlPacket, MainFeedbackOutcome, MainOutboundPacket, MainPacketMeta, MainReceiverCore,
+    MainReceiverFeedback, MainSenderCore, MainSenderPeerState, MainSessionConfig, MainSessionPoll,
+    MainSessionTimers,
 };
 pub use mpegts::{expand_null_packets, suppress_null_packets, NullPacketSuppression};
 pub use packet::gre::MainPacket;
 pub use profile::Profile;
 pub use recovery::{
-    MissingTracker, OrderedPayloadBuffer, OrderedPayloadBufferError, ReceiverObservation,
-    SenderHistory,
+    HoleInfo, HoleStatus, MissingTracker, NackRepeat, NackSchedule, OrderedPayloadBuffer,
+    OrderedPayloadBufferError, OrderedPush, OrderedStats, OverflowPolicy, ReceiverObservation,
+    RecoveredHole, SenderHistory, TrackerCounters, MAX_ADDRESSABLE_HISTORY,
 };
+pub use rtt::RttEstimator;
 pub use sequence::SequenceExtender;
 pub use simple::{
-    OutboundPacket, ReceivedPayload, RtcpIntervals, SimpleReceiverCore, SimpleSenderCore,
-    SimpleSenderPeerState,
+    FeedbackOutcome, OutboundPacket, ReceivedPayload, RtcpIntervals, SimpleReceiverCore,
+    SimpleSenderCore, SimpleSenderPeerState,
 };
 pub use stats::{ReceiverStats, SenderStats};
 
