@@ -4,6 +4,7 @@ use ctr::cipher::{KeyIvInit, StreamCipher};
 use pbkdf2::pbkdf2_hmac;
 use sha2::Sha256;
 use std::fmt;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
@@ -11,6 +12,18 @@ pub const PBKDF2_HMAC_SHA256_ITERATIONS: u32 = 1024;
 pub const AES_BLOCK_SIZE: usize = 16;
 pub const DEFAULT_KEY_ROTATION_PACKETS: u64 = 1_000_000;
 const MAX_RECEIVE_REKEYS_PER_SECOND: u8 = 8;
+/// Nonce changes (each one a PBKDF2 derivation) that all receive copies of
+/// one key may make together in one second: every session of a listening
+/// receiver and every candidate source of a listening sender draws on it.
+/// It bounds the CPU a flood of new nonces costs, and how often a forger,
+/// who needs no key and may pick a new nonce for every packet, gets a try
+/// at the checks, however many source addresses and ports it uses.
+pub const MAX_SHARED_RECEIVE_REKEYS_PER_SECOND: u32 = 64;
+/// Packets a transmit key encrypts under one nonce at most, whatever its
+/// `key_rotation` (also 0, no rotation): the AES-CTR counter comes from
+/// the 32-bit GRE sequence, so a nonce must change before the sequence
+/// wraps or the keystream would repeat.
+pub const MAX_PACKETS_PER_NONCE: u64 = 1 << 32;
 /// Consecutive packets of one nonce that may fail the checks after
 /// decryption before that nonce is shut out, once the nonce has carried a
 /// packet that passed them. librist latches on the seventh failure in a
@@ -113,6 +126,46 @@ struct NonceHealth {
     latched: bool,
 }
 
+/// The receive-wide budget of [`MAX_SHARED_RECEIVE_REKEYS_PER_SECOND`],
+/// shared by every clone of a key (so by every session's and candidate's
+/// copy). It is not part of a key's identity: it never affects equality.
+#[derive(Clone, Default)]
+struct SharedRekeyBudget(Arc<Mutex<RekeyWindow>>);
+
+#[derive(Default)]
+struct RekeyWindow {
+    start: Option<Instant>,
+    used: u32,
+}
+
+impl SharedRekeyBudget {
+    fn take(&self, now: Instant) -> bool {
+        let mut window = match self.0.lock() {
+            Ok(window) => window,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if window.start.map_or(true, |start| {
+            now.duration_since(start) >= Duration::from_secs(1)
+        }) {
+            window.start = Some(now);
+            window.used = 0;
+        }
+        if window.used >= MAX_SHARED_RECEIVE_REKEYS_PER_SECOND {
+            return false;
+        }
+        window.used += 1;
+        true
+    }
+}
+
+impl PartialEq for SharedRekeyBudget {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for SharedRekeyBudget {}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct PskKey {
     key_size: AesKeySize,
@@ -127,6 +180,7 @@ pub struct PskKey {
     rekeys_in_window: u8,
     nonce_health: [Option<NonceHealth>; TRACKED_NONCES],
     counters: PskReceiveCounters,
+    shared_rekeys: SharedRekeyBudget,
 }
 
 impl PskKey {
@@ -169,8 +223,18 @@ impl PskKey {
         }
         let key_size = AesKeySize::from_bits(key_size_bits)?;
         let password = Zeroizing::new(password.as_ref().to_vec());
+        Ok(Self::build(key_size, password, key_rotation, nonce))
+    }
+
+    /// A key with a fresh history and its own receive-wide budget.
+    fn build(
+        key_size: AesKeySize,
+        password: Zeroizing<Vec<u8>>,
+        key_rotation: u64,
+        nonce: [u8; 4],
+    ) -> Self {
         let aes_key = Zeroizing::new(derive_aes_key(key_size, &password, &nonce));
-        Ok(Self {
+        Self {
             key_size,
             password,
             nonce,
@@ -183,25 +247,26 @@ impl PskKey {
             rekeys_in_window: 0,
             nonce_health: [None; TRACKED_NONCES],
             counters: PskReceiveCounters::default(),
-        })
+            shared_rekeys: SharedRekeyBudget::default(),
+        }
     }
 
     /// A transmit key for the same passphrase and key size, with a fresh
-    /// random nonce and the default rotation: what an endpoint that was
-    /// given only a receive key encrypts with, so it never sends clear.
-    pub fn sender_for(&self) -> Result<Self> {
-        Self::with_key_rotation(
-            self.key_size.bits(),
-            DEFAULT_KEY_ROTATION_PACKETS,
-            self.password.as_slice(),
-        )
+    /// nonce and the default rotation: what an endpoint that was given only
+    /// a receive key encrypts with, so it never sends clear. It cannot
+    /// fail: without the operating-system random source the nonce comes
+    /// from a process-wide counter (see [`Self::fresh_sender_copy`]).
+    pub fn sender_for(&self) -> Self {
+        let mut key = self.fresh_sender_copy();
+        key.key_rotation = DEFAULT_KEY_ROTATION_PACKETS;
+        key
     }
 
-    /// A receive key for the same passphrase and key size: what an
-    /// endpoint that was given only a transmit key decrypts with, so it
-    /// drops clear packets from its peer.
-    pub fn receiver_for(&self) -> Result<Self> {
-        Self::receiver(self.key_size.bits(), self.password.as_slice())
+    /// A receive key for the same passphrase and key size, with its own
+    /// receive-wide budget: what an endpoint that was given only a
+    /// transmit key decrypts with, so it drops clear packets from its peer.
+    pub fn receiver_for(&self) -> Self {
+        Self::build(self.key_size, self.password.clone(), 0, [0; 4])
     }
 
     /// A transmit key for a new peer or session: the same passphrase, key
@@ -243,11 +308,14 @@ impl PskKey {
             rekeys_in_window: 0,
             nonce_health: [None; TRACKED_NONCES],
             counters: PskReceiveCounters::default(),
+            shared_rekeys: self.shared_rekeys.clone(),
         }
     }
 
     /// This key with its receive history and counters cleared, for a new
-    /// session.
+    /// session. The copy draws on the same receive-wide budget of nonce
+    /// changes ([`MAX_SHARED_RECEIVE_REKEYS_PER_SECOND`]) as this key and
+    /// every other copy of it.
     pub fn fresh_copy(&self) -> Self {
         let mut key = self.clone();
         key.nonce_health = [None; TRACKED_NONCES];
@@ -258,6 +326,12 @@ impl PskKey {
     /// What this key turned away as a receive key.
     pub fn receive_counters(&self) -> PskReceiveCounters {
         self.counters
+    }
+
+    /// Adds counters from another copy of this key (a receive state that
+    /// is being dropped or replaced), so they are not lost.
+    pub fn absorb_counters(&mut self, counters: PskReceiveCounters) {
+        self.counters.add(counters);
     }
 
     /// Counts a clear packet dropped because this key is configured.
@@ -354,7 +428,9 @@ impl PskKey {
                 self.rekey_window_start = now;
                 self.rekeys_in_window = 0;
             }
-            if self.rekeys_in_window >= MAX_RECEIVE_REKEYS_PER_SECOND {
+            if self.rekeys_in_window >= MAX_RECEIVE_REKEYS_PER_SECOND
+                || !self.shared_rekeys.take(now)
+            {
                 return Err(Error::PskRekeyRateLimited);
             }
             self.rekeys_in_window += 1;
@@ -395,11 +471,28 @@ impl PskKey {
             ));
         }
         self.set_nonce(nonce)?;
-        Ok(self.crypt(gre_version, sequence, input))
+        // A receive key follows the sender's nonce: it never rotates its own.
+        Ok(crypt_with_key(
+            self.key_size,
+            &self.aes_key,
+            gre_version,
+            sequence,
+            input,
+        ))
+    }
+
+    /// Packets this key encrypts under one nonce before it renews it:
+    /// `key_rotation`, but never more than [`MAX_PACKETS_PER_NONCE`].
+    fn packets_per_nonce(&self) -> u64 {
+        if self.key_rotation == 0 {
+            MAX_PACKETS_PER_NONCE
+        } else {
+            self.key_rotation.min(MAX_PACKETS_PER_NONCE)
+        }
     }
 
     fn crypt(&mut self, gre_version: u8, sequence: u32, input: &[u8]) -> Vec<u8> {
-        if self.key_rotation > 0 && self.used_times >= self.key_rotation {
+        if self.used_times >= self.packets_per_nonce() {
             self.advance_nonce();
             self.aes_key =
                 Zeroizing::new(derive_aes_key(self.key_size, &self.password, &self.nonce));
@@ -420,8 +513,11 @@ impl PskKey {
                 return;
             }
         }
-        // Retaining the existing random nonce is safer than switching to a
-        // predictable nonce when the operating-system CSPRNG is unavailable.
+        // The operating-system CSPRNG is unavailable. Keeping the nonce
+        // would repeat keystream (the GRE sequence goes on from where it
+        // is, and may wrap); a counter-derived nonce keeps it unique, which
+        // is what CTR needs.
+        self.nonce = fallback_distinct_nonce(current);
     }
 }
 
@@ -607,7 +703,7 @@ mod tests {
     #[test]
     fn sender_for_a_receive_key_encrypts_for_the_same_passphrase() {
         let rx_template = PskKey::receiver(192, b"secret").unwrap();
-        let mut tx = rx_template.sender_for().unwrap();
+        let mut tx = rx_template.sender_for();
         assert_eq!(tx.key_size(), AesKeySize::Aes192);
         assert_ne!(tx.nonce(), [0; 4]);
         let nonce = tx.nonce();
@@ -646,6 +742,113 @@ mod tests {
         for _ in 0..64 {
             assert!(nonces.insert(base.fresh_sender_copy().nonce()));
         }
+    }
+
+    /// `sender_for` never fails and never hands back a key that sends
+    /// clear: it is a real transmit key with the default rotation and its
+    /// own nonce; `receiver_for` decrypts what a transmit key sends.
+    #[test]
+    fn sender_for_and_receiver_for_cannot_fail() {
+        let tx = PskKey::with_key_rotation(256, 7, b"secret").unwrap();
+        let mut rx = tx.receiver_for();
+        assert_eq!(rx.key_size(), AesKeySize::Aes256);
+        assert_eq!(rx.nonce(), [0; 4]);
+        let mut tx = tx;
+        let nonce = tx.nonce();
+        let encrypted = tx.encrypt(2, 1, b"payload");
+        assert_eq!(rx.decrypt(nonce, 2, 1, &encrypted).unwrap(), b"payload");
+        let sender = rx.sender_for();
+        assert_eq!(sender.key_rotation, DEFAULT_KEY_ROTATION_PACKETS);
+        assert_ne!(sender.nonce(), [0; 4]);
+        assert_eq!(sender.key_size(), AesKeySize::Aes256);
+    }
+
+    /// Whatever `key_rotation` says (0, no rotation, or more than the
+    /// 32-bit GRE sequence holds), a transmit key renews its nonce before
+    /// 2^32 packets, so the sequence never wraps under one nonce.
+    #[test]
+    fn transmit_nonce_renews_before_the_gre_sequence_wraps() {
+        for rotation in [0, MAX_PACKETS_PER_NONCE + 1, u64::MAX] {
+            let mut tx = PskKey::with_key_rotation(128, rotation, b"secret").unwrap();
+            let first = tx.nonce();
+            tx.used_times = MAX_PACKETS_PER_NONCE - 1;
+            tx.encrypt(2, u32::MAX, b"last under this nonce");
+            assert_eq!(tx.nonce(), first, "rotation {rotation}");
+            tx.encrypt(2, 0, b"sequence wrapped");
+            assert_ne!(tx.nonce(), first, "rotation {rotation}");
+            assert_ne!(tx.nonce(), [0; 4]);
+            assert_eq!(tx.used_times, 1);
+        }
+        // A smaller rotation still applies as set.
+        let mut tx = PskKey::with_key_rotation(128, 3, b"secret").unwrap();
+        let first = tx.nonce();
+        for sequence in 0..3 {
+            tx.encrypt(2, sequence, b"x");
+        }
+        assert_eq!(tx.nonce(), first);
+        tx.encrypt(2, 3, b"x");
+        assert_ne!(tx.nonce(), first);
+    }
+
+    /// A receive key never rotates its own nonce, even one made with a
+    /// rotation: it follows the sender's, with one derivation for it.
+    #[test]
+    fn receive_key_follows_the_sender_nonce_without_rotating() {
+        let mut tx = PskKey::with_key_rotation(128, 1_000_000, b"secret").unwrap();
+        let mut rx = PskKey::with_key_rotation(128, 2, b"secret").unwrap();
+        let nonce = tx.nonce();
+        for sequence in 0..32 {
+            let encrypted = tx.encrypt(2, sequence, b"payload");
+            assert_eq!(
+                rx.decrypt(nonce, 2, sequence, &encrypted).unwrap(),
+                b"payload"
+            );
+        }
+        assert_eq!(rx.nonce(), nonce);
+        assert_eq!(rx.rekeys_in_window, 1);
+    }
+
+    /// Every copy of one receive key (every session or candidate source)
+    /// draws on one budget of nonce changes a second: a forger that spreads
+    /// new nonces over many sessions gets no more tries, and costs no more
+    /// derivations, than the budget allows.
+    #[test]
+    fn copies_of_a_receive_key_share_one_budget_of_nonce_changes() {
+        let template = PskKey::receiver(128, b"secret").unwrap();
+        let per_key = u32::from(MAX_RECEIVE_REKEYS_PER_SECOND);
+        let sessions = MAX_SHARED_RECEIVE_REKEYS_PER_SECOND / per_key + 2;
+        let mut accepted = 0;
+        let mut refused = 0;
+        let mut next = 1u32;
+        for _ in 0..sessions {
+            let mut session = template.fresh_copy();
+            for _ in 0..per_key {
+                match session.set_nonce(next.to_be_bytes()) {
+                    Ok(()) => accepted += 1,
+                    Err(Error::PskRekeyRateLimited) => refused += 1,
+                    Err(other) => panic!("unexpected {other:?}"),
+                }
+                next += 1;
+            }
+        }
+        assert_eq!(accepted, MAX_SHARED_RECEIVE_REKEYS_PER_SECOND);
+        assert_eq!(
+            refused,
+            sessions * per_key - MAX_SHARED_RECEIVE_REKEYS_PER_SECOND
+        );
+        // A key made on its own (another endpoint) has its own budget.
+        let mut other = PskKey::receiver(128, b"secret").unwrap();
+        other.set_nonce([9, 9, 9, 9]).unwrap();
+        // So does a receive key derived for an endpoint given only a
+        // transmit key.
+        let mut derived = PskKey::new(128, b"secret").unwrap().receiver_for();
+        derived.set_nonce([9, 9, 9, 9]).unwrap();
+        // The budget refills after a second.
+        let mut late = template.fresh_copy();
+        late.shared_rekeys.0.lock().unwrap().start = Some(Instant::now() - Duration::from_secs(2));
+        late.set_nonce([8, 8, 8, 8]).unwrap();
+        // It is not part of a key's identity.
+        assert_eq!(template.fresh_copy(), template.fresh_copy());
     }
 
     #[test]

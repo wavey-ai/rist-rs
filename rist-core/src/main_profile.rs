@@ -808,6 +808,49 @@ impl MainSenderCore {
         decode_main_packet(packet, self.rx_key.as_mut())
     }
 
+    /// Whether a receive key is configured (then every packet but EAPOL
+    /// must arrive encrypted).
+    pub fn has_rx_key(&self) -> bool {
+        self.rx_key.is_some()
+    }
+
+    /// A copy of the receive key with no history, for one candidate
+    /// source: a listening sender decrypts each source's packets with its
+    /// own copy until it has chosen its peer, so packets from one source
+    /// can never shut out another's nonce. Copies share one budget of
+    /// nonce changes ([`crate::crypto::MAX_SHARED_RECEIVE_REKEYS_PER_SECOND`]).
+    pub fn fresh_rx_key(&self) -> Option<PskKey> {
+        self.rx_key.as_ref().map(PskKey::fresh_copy)
+    }
+
+    /// [`Self::decode_datagram`] with a receive key of the caller's (one
+    /// from [`Self::fresh_rx_key`]).
+    pub fn decode_datagram_with_rx_key(
+        &self,
+        key: &mut PskKey,
+        packet: &[u8],
+    ) -> Result<MainPacket> {
+        decode_main_packet(packet, Some(key))
+    }
+
+    /// Makes `key` (a candidate's copy from [`Self::fresh_rx_key`]) the
+    /// receive key, keeping the counters of the one it replaces. Does
+    /// nothing without a receive key.
+    pub fn adopt_rx_key(&mut self, mut key: PskKey) {
+        if let Some(current) = &self.rx_key {
+            key.absorb_counters(current.receive_counters());
+            self.rx_key = Some(key);
+        }
+    }
+
+    /// Adds the counters of a receive-key copy that is being dropped to
+    /// the receive key's, so stats keep them.
+    pub fn absorb_psk_counters(&mut self, counters: PskReceiveCounters) {
+        if let Some(key) = &mut self.rx_key {
+            key.absorb_counters(counters);
+        }
+    }
+
     pub fn stats(&self) -> SenderStats {
         let mut stats = self.simple.stats();
         add_psk_counters_to_sender(&mut stats, self.rx_key.as_ref());
@@ -968,13 +1011,13 @@ fn accept_buffer_negotiation_with(
 /// The transmit key an endpoint uses when it was given only a receive key:
 /// one for the same passphrase, so nothing but EAPOL goes out clear.
 fn tx_key_for(rx_key: &PskKey) -> Option<PskKey> {
-    rx_key.sender_for().ok()
+    Some(rx_key.sender_for())
 }
 
 /// The receive key an endpoint uses when it was given only a transmit key:
 /// one for the same passphrase, so it drops clear packets from its peer.
 fn rx_key_for(tx_key: &PskKey) -> Option<PskKey> {
-    tx_key.receiver_for().ok()
+    Some(tx_key.receiver_for())
 }
 
 fn add_psk_counters_to_receiver(stats: &mut ReceiverStats, key: Option<&PskKey>) {
