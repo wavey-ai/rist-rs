@@ -61,6 +61,31 @@ pub struct SenderHistory {
 /// returns [`OrderedPayloadBufferError`] for each such push until
 /// [`OrderedPayloadBuffer::reset`]. A late repair is never that far behind
 /// and arrives among in-order packets, which end the run.
+///
+/// # Stream start
+///
+/// With a startup hold ([`OrderedPayloadBuffer::with_startup_hold`]; on by
+/// default in [`OrderedPayloadBuffer::with_deadline`]) the start of a stream
+/// is recovered like its middle:
+/// - A first payload at sequence 0 is released at once (librist and rist-rs
+///   number from 0, so nothing precedes it).
+/// - A first payload at sequence 1 to [`ZERO_START_REACH`] is held behind
+///   a gap back to 0, with the ordinary gap deadline: the receiver (with
+///   `RecoveryTuning::startup_recovery`) NACKs those sequences as holes.
+/// - Any other first payload is held (with what follows it) until the
+///   start is known or the hold expires. Meanwhile a payload up to
+///   [`STARTUP_REACH`] below the lowest held one becomes the new lowest
+///   instead of being dropped as late (reordering at the start, or the
+///   sender's retry-marked copy of a lost first packet). The start is known
+///   when the lowest held sequence is at most [`ZERO_START_REACH`] (then the
+///   gap back to 0 is an ordinary gap), or when the lowest held sequence
+///   arrives a second time (a rist-rs sender sends its first packet again,
+///   so a duplicate of it says nothing came before). When the hold ends the
+///   gaps above the lowest held payload are ordinary gaps, with deadlines
+///   from the arrival of their first successor.
+///
+/// Callers push duplicates too (they are counted and dropped): a duplicate
+/// of the first packet ends the hold early.
 #[derive(Debug, Clone)]
 pub struct OrderedPayloadBuffer {
     /// The next extended sequence to release.
@@ -78,12 +103,31 @@ pub struct OrderedPayloadBuffer {
     /// them (see [`RESYNC_LATE_RUN`]).
     late_run: u32,
     late_run_last: u32,
-    /// How long the first payload of a stream waits for its predecessor
-    /// (see [`OrderedPayloadBuffer::with_startup_hold`]); zero: not at all.
+    /// How long the first payload of a stream may wait for what precedes
+    /// it (see [`OrderedPayloadBuffer::with_startup_hold`]); zero: not at
+    /// all. Capped at `reorder_delay` when applied.
     startup_hold: Duration,
-    /// The virtual gap before the first payload, and when it is given up.
-    startup_gap: Option<(u64, Instant)>,
+    /// While the start of the stream is unknown: when the hold ends.
+    /// Nothing has been released, and `next` is the lowest held key.
+    startup_until: Option<Instant>,
 }
+
+/// How far below the lowest held payload an [`OrderedPayloadBuffer`] (and a
+/// receiver with `RecoveryTuning::startup_recovery`) still takes a packet as
+/// the start of the stream while the startup hold lasts.
+pub const STARTUP_REACH: u32 = 1 << 10;
+
+/// A stream whose lowest sequence seen at its start is at most this is
+/// taken to start at sequence 0: librist (0.2.20, `ctx->common.seq_rtp`
+/// starts at 0) and rist-rs senders number from 0, so the sequences below
+/// it were lost or are still on their way, and are recovered as holes.
+pub const ZERO_START_REACH: u32 = 16;
+
+/// The default first-payload hold of [`OrderedPayloadBuffer::with_deadline`]
+/// (capped at its gap deadline): it covers a rist-rs sender's late copy of
+/// its first packet (`RecoveryTuning::first_packet_late_copy`, 12 ms) and
+/// the reordering of a jittery path at the start.
+pub const DEFAULT_STARTUP_HOLD: Duration = Duration::from_millis(25);
 
 /// Consecutive far-behind pushes after which an [`OrderedPayloadBuffer`]
 /// takes the stream as restarted.
@@ -145,6 +189,17 @@ pub struct OrderedStats {
     /// Times the buffer restarted at a stream that jumped backwards for
     /// good (see [`OrderedPayloadBuffer`]).
     pub resyncs: u64,
+    /// Streams whose first payload was held because their start was
+    /// unknown (see the stream start section of [`OrderedPayloadBuffer`]).
+    pub startup_holds: u64,
+    /// Of those, the holds that ended at their deadline rather than when
+    /// the start became known.
+    pub startup_timeouts: u64,
+    /// Payloads taken below the lowest held one during a startup hold.
+    pub startup_rebased: u64,
+    /// Streams taken to start at sequence 0 although their first payload
+    /// was a later sequence (at most [`ZERO_START_REACH`]).
+    pub zero_starts: u64,
 }
 
 impl OrderedPayloadBuffer {
@@ -170,12 +225,19 @@ impl OrderedPayloadBuffer {
     /// more than `max_pending_packets` are held: pushes never fail. Use it
     /// for a byte stream that should carry on past an unrecoverable loss
     /// (an MPEG-TS demuxer sees a continuity-counter jump, as with librist).
+    ///
+    /// The start of the stream is recovered too: the startup hold is
+    /// [`DEFAULT_STARTUP_HOLD`] capped at `reorder_delay` (see the stream
+    /// start section of [`OrderedPayloadBuffer`]; it matches
+    /// `RecoveryTuning::default().ordered_startup_hold(reorder_delay)`).
+    /// [`Self::with_startup_hold`]`(Duration::ZERO)` turns it off.
     pub fn with_deadline(max_pending_packets: usize, reorder_delay: Duration) -> Self {
         Self::with_policy(
             max_pending_packets,
             reorder_delay,
             OverflowPolicy::SkipOldestGap,
         )
+        .with_startup_hold(DEFAULT_STARTUP_HOLD)
     }
 
     pub fn with_policy(
@@ -193,17 +255,15 @@ impl OrderedPayloadBuffer {
             late_run: 0,
             late_run_last: 0,
             startup_hold: Duration::ZERO,
-            startup_gap: None,
+            startup_until: None,
         }
     }
 
-    /// Holds the first payload of a stream (and what follows it) for up
-    /// to `hold`, waiting for the packet just before it: a sender that
-    /// sends its first packet twice (rist-rs with
-    /// `RecoveryTuning::duplicate_late_repairs`) gets it through even when
-    /// the first copy is lost and the second arrives after a few later
-    /// packets. Giving up that virtual gap is not counted as a skip. Zero
-    /// (the default) releases the first payload at once.
+    /// Recovers the start of a stream as described in the stream start
+    /// section of [`OrderedPayloadBuffer`], holding a first payload whose
+    /// start is unknown for at most `hold` (capped at the gap deadline).
+    /// Zero releases the first payload at once, whatever its sequence (the
+    /// default of every constructor but [`Self::with_deadline`]).
     pub fn with_startup_hold(mut self, hold: Duration) -> Self {
         self.set_startup_hold(hold);
         self
@@ -214,6 +274,18 @@ impl OrderedPayloadBuffer {
         self.startup_hold = hold;
     }
 
+    /// The startup hold in effect: the configured hold capped at the gap
+    /// deadline.
+    pub fn startup_hold(&self) -> Duration {
+        self.startup_hold.min(self.reorder_delay)
+    }
+
+    /// Whether the first payload is held because the start of the stream
+    /// is not known yet.
+    pub fn in_startup(&self) -> bool {
+        self.startup_until.is_some()
+    }
+
     /// Forgets the release point and everything held (dropped, not
     /// released); the next push starts the stream again. Counters are kept.
     /// Call it when the stream is known to restart, for example when the
@@ -222,7 +294,7 @@ impl OrderedPayloadBuffer {
         self.next = None;
         self.pending.clear();
         self.late_run = 0;
-        self.startup_gap = None;
+        self.startup_until = None;
     }
 
     /// Inserts one arrival and returns every newly contiguous payload in wire
@@ -257,17 +329,144 @@ impl OrderedPayloadBuffer {
         now: Instant,
         out: &mut Vec<ReceivedPayload>,
     ) -> Result<OrderedPush, OrderedPayloadBufferError> {
+        let before = out.len();
         if payload.duplicate {
             self.stats.duplicates += 1;
-            return Ok(OrderedPush::Duplicate);
+            if self.is_lowest_held(payload.sequence) {
+                // The first packet again: nothing came before it.
+                self.end_startup(out);
+            }
+            return Ok(Self::outcome(out.len() > before, OrderedPush::Duplicate));
         }
         let sequence = payload.sequence;
-        if self.next.is_none() && !self.startup_hold.is_zero() {
-            // Start one before the first payload, as if it were missing.
-            let gap = u64::from(sequence) + (1u64 << 32) - 1;
-            self.next = Some(gap);
-            self.startup_gap = Some((gap, now + self.startup_hold));
+        if self.next.is_none() {
+            let key = u64::from(sequence) + (1u64 << 32);
+            let hold = self.startup_hold();
+            if hold.is_zero() || sequence == 0 {
+                self.next = Some(key);
+            } else if sequence <= ZERO_START_REACH {
+                // Numbered from 0: hold behind an ordinary gap back to 0.
+                self.next = Some(key - u64::from(sequence));
+                self.stats.zero_starts += 1;
+            } else {
+                self.next = Some(key);
+                self.startup_until = Some(now + hold);
+                self.stats.startup_holds += 1;
+            }
         }
+        let payload = if self.startup_until.is_some() {
+            match self.push_startup(payload, now, out)? {
+                Ok(push) => return Ok(push),
+                // Not part of this start: the hold is over, carry on as usual.
+                Err(payload) => payload,
+            }
+        } else {
+            payload
+        };
+        let pushed = self.push_after_start(payload, now, out)?;
+        Ok(Self::outcome(out.len() > before, pushed))
+    }
+
+    fn outcome(released: bool, otherwise: OrderedPush) -> OrderedPush {
+        if released {
+            OrderedPush::Released
+        } else {
+            otherwise
+        }
+    }
+
+    /// Whether `sequence` is the lowest held payload of a startup hold.
+    fn is_lowest_held(&self, sequence: u32) -> bool {
+        self.startup_until.is_some() && self.next.is_some_and(|next| next as u32 == sequence)
+    }
+
+    /// Ends the startup hold: the lowest held payload is the start, and
+    /// what follows it is released up to the first gap.
+    fn end_startup(&mut self, out: &mut Vec<ReceivedPayload>) {
+        if self.startup_until.take().is_some() {
+            self.drain_into(out);
+        }
+    }
+
+    /// A push while the start is unknown (`next` is the lowest held key and
+    /// nothing was released). Gives the payload back when it lies too far
+    /// below the lowest held one to belong to this start; the hold is then
+    /// over.
+    fn push_startup(
+        &mut self,
+        payload: ReceivedPayload,
+        now: Instant,
+        out: &mut Vec<ReceivedPayload>,
+    ) -> Result<Result<OrderedPush, ReceivedPayload>, OrderedPayloadBufferError> {
+        let before = out.len();
+        let lowest = self.next.expect("a startup hold has a lowest held key");
+        let sequence = payload.sequence;
+        let distance = sequence.wrapping_sub(lowest as u32);
+        let key = if distance < 1 << 31 {
+            lowest + u64::from(distance)
+        } else {
+            let below = distance.wrapping_neg();
+            if below > STARTUP_REACH {
+                self.end_startup(out);
+                return Ok(Err(payload));
+            }
+            lowest - u64::from(below)
+        };
+        if self.pending.contains_key(&key) {
+            self.stats.duplicates += 1;
+            if key == lowest {
+                self.end_startup(out);
+            }
+            return Ok(Ok(Self::outcome(
+                out.len() > before,
+                OrderedPush::Duplicate,
+            )));
+        }
+        let arrival = self
+            .pending
+            .range(key..)
+            .next()
+            .map_or(now, |(_, held)| held.arrival.min(now));
+        self.pending
+            .insert(key, PendingPayload { arrival, payload });
+        self.stats.held_max = self.stats.held_max.max(self.pending.len() as u64);
+        if key < lowest {
+            self.next = Some(key);
+            self.stats.startup_rebased += 1;
+        }
+        let lowest = self.next.unwrap_or(key);
+        let lowest_sequence = lowest as u32;
+        if lowest_sequence <= ZERO_START_REACH {
+            // Numbered from 0: the start is known, and any gap back to 0
+            // is an ordinary gap.
+            if lowest_sequence > 0 {
+                self.stats.zero_starts += 1;
+            }
+            self.next = Some(lowest - u64::from(lowest_sequence));
+            self.startup_until = None;
+            self.drain_into(out);
+        } else if self.pending.len() > self.max_pending_packets
+            || self.startup_until.is_some_and(|until| now >= until)
+        {
+            if self.pending.len() <= self.max_pending_packets {
+                self.stats.startup_timeouts += 1;
+            }
+            self.end_startup(out);
+        }
+        if self.startup_until.is_none() {
+            self.bound_and_expire(key, sequence, now, out)?;
+        }
+        Ok(Ok(Self::outcome(out.len() > before, OrderedPush::Held)))
+    }
+
+    /// A push once the start of the stream is known.
+    fn push_after_start(
+        &mut self,
+        payload: ReceivedPayload,
+        now: Instant,
+        out: &mut Vec<ReceivedPayload>,
+    ) -> Result<OrderedPush, OrderedPayloadBufferError> {
+        let sequence = payload.sequence;
         let mut next = *self.next.get_or_insert(u64::from(sequence) + (1u64 << 32));
         let mut distance = sequence.wrapping_sub(next as u32);
         if distance >= 1 << 31 {
@@ -318,6 +517,25 @@ impl OrderedPayloadBuffer {
 
         let before = out.len();
         self.drain_into(out);
+        self.bound_and_expire(key, sequence, now, out)?;
+        Ok(if out.len() > before {
+            OrderedPush::Released
+        } else {
+            OrderedPush::Held
+        })
+    }
+
+    /// After an insert at `key`: enforces the bound (releasing expired gaps
+    /// first) and, when nothing was released yet by this push, releases
+    /// any gap whose deadline has passed.
+    fn bound_and_expire(
+        &mut self,
+        key: u64,
+        sequence: u32,
+        now: Instant,
+        out: &mut Vec<ReceivedPayload>,
+    ) -> Result<(), OrderedPayloadBufferError> {
+        let before = out.len();
         if self.pending.len() > self.max_pending_packets {
             // A gap whose deadline has passed is skipped before the bound
             // decides.
@@ -330,7 +548,7 @@ impl OrderedPayloadBuffer {
                     // `pending` back under the bound.
                     self.pending.remove(&key);
                     return Err(OrderedPayloadBufferError {
-                        next_sequence: self.next.unwrap_or(next) as u32,
+                        next_sequence: self.next.unwrap_or(key) as u32,
                         received_sequence: sequence,
                         max_pending_packets: self.max_pending_packets,
                     });
@@ -343,11 +561,7 @@ impl OrderedPayloadBuffer {
         if out.len() == before {
             self.release_expired_into(now, out);
         }
-        Ok(if out.len() > before {
-            OrderedPush::Released
-        } else {
-            OrderedPush::Held
-        })
+        Ok(())
     }
 
     /// Counts a push `behind` sequences behind the release point toward a
@@ -381,6 +595,10 @@ impl OrderedPayloadBuffer {
     /// [`Self::release_expired`] appending to `out`. Returns the number of
     /// sequences skipped.
     pub fn release_expired_into(&mut self, now: Instant, out: &mut Vec<ReceivedPayload>) -> u64 {
+        if self.startup_until.is_some_and(|until| now >= until) {
+            self.stats.startup_timeouts += 1;
+            self.end_startup(out);
+        }
         let mut skipped = 0;
         while let Some(Some(deadline)) = self.first_gap_deadline() {
             if now < deadline {
@@ -391,22 +609,14 @@ impl OrderedPayloadBuffer {
         skipped
     }
 
-    /// When the gap at the release point is given up: `None` when nothing
-    /// is held, `Some(None)` when never.
+    /// When the gap at the release point is given up (or the startup hold
+    /// ends): `None` when nothing is held, `Some(None)` when never.
     fn first_gap_deadline(&self) -> Option<Option<Instant>> {
         let (_, held) = self.pending.first_key_value()?;
-        let deadline = held.arrival.checked_add(self.reorder_delay);
-        Some(match self.startup_gap() {
-            Some(startup) => Some(deadline.map_or(startup, |deadline| deadline.min(startup))),
-            None => deadline,
-        })
-    }
-
-    /// The startup gap's deadline while it is the gap at the release point.
-    fn startup_gap(&self) -> Option<Instant> {
-        self.startup_gap
-            .filter(|(gap, _)| self.next == Some(*gap))
-            .map(|(_, at)| at)
+        if let Some(until) = self.startup_until {
+            return Some(Some(until));
+        }
+        Some(held.arrival.checked_add(self.reorder_delay))
     }
 
     /// Releases everything held in order, skipping every gap (counted): for
@@ -425,9 +635,9 @@ impl OrderedPayloadBuffer {
         skipped
     }
 
-    /// When [`Self::release_expired`] next skips a gap: the arrival of the
-    /// first payload after the gap plus the reorder delay. `None` when
-    /// nothing is held or the delay is unbounded.
+    /// When [`Self::release_expired`] next skips a gap (the arrival of the
+    /// first payload after the gap plus the reorder delay) or ends the
+    /// startup hold. `None` when nothing is held or the delay is unbounded.
     pub fn next_deadline(&self) -> Option<Instant> {
         self.first_gap_deadline().flatten()
     }
@@ -438,13 +648,10 @@ impl OrderedPayloadBuffer {
         let Some((&first, _)) = self.pending.first_key_value() else {
             return 0;
         };
+        // A startup hold ends here; its lowest held key is `first`.
+        self.startup_until = None;
         let next = self.next.unwrap_or(first);
-        let mut skipped = first.saturating_sub(next);
-        if self.startup_gap().is_some() {
-            // Only the virtual gap before the first payload: nothing lost.
-            self.startup_gap = None;
-            skipped = skipped.saturating_sub(1);
-        }
+        let skipped = first.saturating_sub(next);
         if skipped > 0 {
             self.stats.gaps_skipped += 1;
             self.stats.packets_skipped += skipped;
@@ -741,6 +948,12 @@ pub struct TrackerCounters {
     /// Packets that arrived after their hole had expired or left the horizon
     /// (neither duplicates nor recoveries).
     pub late_packets: u64,
+    /// Holes opened below the first sequence seen at the start of a stream
+    /// (see [`MissingTracker::set_startup_window`]); also in `holes_opened`.
+    pub startup_holes: u64,
+    /// Packets taken below the first sequence seen at the start of a
+    /// stream as its new start (not counted in `late_packets`).
+    pub startup_packets: u64,
     /// Holes that reached `max_retries` NACKs and are no longer requested.
     pub retries_exhausted: u64,
     /// Holes no longer requested because a NACK could not arrive in time.
@@ -891,6 +1104,11 @@ pub struct MissingTracker {
     taken: Vec<u32>,
     counters: TrackerCounters,
     last_recovered: Option<RecoveredHole>,
+    /// See [`Self::set_startup_window`]; zero: off.
+    startup_window: Duration,
+    /// While the startup window is open: the lowest sequence taken as part
+    /// of the stream, and when the window closes.
+    startup: Option<(u32, Instant)>,
 }
 
 impl Default for MissingTracker {
@@ -929,7 +1147,80 @@ impl MissingTracker {
             taken: Vec::new(),
             counters: TrackerCounters::default(),
             last_recovered: None,
+            startup_window: Duration::ZERO,
+            startup: None,
         }
+    }
+
+    /// Recovers the start of a stream for `window` after its first packet
+    /// (zero, the default, turns it off; applies from the next stream
+    /// start):
+    /// - a first sequence of 1 to [`ZERO_START_REACH`] is taken as a stream
+    ///   numbered from 0, and the sequences before it are holes;
+    /// - while the window is open, a packet up to [`STARTUP_REACH`] below
+    ///   the lowest sequence taken so far (within the duplicate ring) becomes
+    ///   the new start, and the sequences between it and the old start are
+    ///   holes (all of them back to 0 when it is at most
+    ///   [`ZERO_START_REACH`]).
+    ///
+    /// These holes are requested like any other, first after the current
+    /// first-NACK delay, and counted in
+    /// [`TrackerCounters::startup_holes`].
+    pub fn set_startup_window(&mut self, window: Duration) {
+        self.startup_window = window;
+    }
+
+    pub fn startup_window(&self) -> Duration {
+        self.startup_window
+    }
+
+    /// Opens holes for `from..to` (wrapping, `to` excluded) except
+    /// `received`, in front of every tracked hole (they all lie above
+    /// `to`). They are scheduled for their first NACK after the current
+    /// first-NACK delay; their detection time is kept no later than the
+    /// front hole's, so the queue stays ordered by time.
+    fn open_startup_holes(
+        &mut self,
+        from: u32,
+        to: u32,
+        received: Option<u32>,
+        now: Instant,
+        newly_missing: &mut Vec<u32>,
+    ) {
+        let count = to.wrapping_sub(from);
+        if count == 0 || count > STARTUP_REACH + ZERO_START_REACH {
+            return;
+        }
+        let at = self
+            .holes
+            .front()
+            .map_or(now, |hole| hole.first_missing_at.min(now));
+        let due = now + self.initial_delay;
+        let first_new = newly_missing.len();
+        for offset in (0..count).rev() {
+            let missing = from.wrapping_add(offset);
+            if Some(missing) == received {
+                continue;
+            }
+            self.holes.push_front(Hole {
+                sequence: missing,
+                status: HoleStatus::Scheduled,
+                nack_count: 0,
+                first_missing_at: at,
+                first_nack_at: None,
+                last_nack_at: None,
+                next_due: due,
+                copy_at: None,
+            });
+            self.schedule.push(Reverse((due, missing)));
+            newly_missing.push(missing);
+        }
+        let opened = newly_missing.len() - first_new;
+        newly_missing[first_new..].reverse();
+        self.fresh += opened;
+        self.live += opened;
+        self.counters.holes_opened += opened as u64;
+        self.counters.startup_holes += opened as u64;
     }
 
     /// Discards the tracked state (counting open holes as reset) and applies
@@ -1004,7 +1295,17 @@ impl MissingTracker {
         let Some(highest) = self.highest else {
             self.highest = Some(sequence);
             self.mark_seen(sequence);
-            return observation(sequence, false, false, Vec::new());
+            let mut newly_missing = Vec::new();
+            if !self.startup_window.is_zero() {
+                let start = if (1..=ZERO_START_REACH).contains(&sequence) {
+                    0
+                } else {
+                    sequence
+                };
+                self.open_startup_holes(start, sequence, None, now, &mut newly_missing);
+                self.startup = Some((start, now + self.startup_window));
+            }
+            return observation(sequence, false, false, newly_missing);
         };
 
         let distance = sequence.wrapping_sub(highest);
@@ -1076,6 +1377,26 @@ impl MissingTracker {
             // as a duplicate rather than deliver data of unknown status.
             return observation(sequence, true, false, Vec::new());
         }
+        if let Some((start, until)) = self.startup {
+            let below = start.wrapping_sub(sequence);
+            if now >= until {
+                self.startup = None;
+            } else if below != 0 && below <= STARTUP_REACH && behind <= MAX_TRACKED_HOLE_DISTANCE {
+                // Below the start so far, while the start is still open:
+                // the stream began earlier than the first packet seen.
+                let new_start = if sequence <= ZERO_START_REACH {
+                    0
+                } else {
+                    sequence
+                };
+                let mut newly_missing = Vec::new();
+                self.open_startup_holes(new_start, start, Some(sequence), now, &mut newly_missing);
+                self.startup = Some((new_start, until));
+                self.counters.startup_packets += 1;
+                self.mark_seen(sequence);
+                return observation(sequence, false, false, newly_missing);
+            }
+        }
         let slot = sequence as usize & (self.seen.len() - 1);
         if self.seen[slot] == sequence {
             return observation(sequence, true, false, Vec::new());
@@ -1137,6 +1458,7 @@ impl MissingTracker {
         self.highest = None;
         self.seen_ready = false;
         self.last_recovered = None;
+        self.startup = None;
     }
 
     /// The earliest instant at which [`Self::take_due_nacks`] may return a
@@ -1724,7 +2046,8 @@ mod tests {
     #[test]
     fn ordered_in_order_packets_take_the_fast_path() {
         let start = Instant::now();
-        let mut buffer = OrderedPayloadBuffer::with_deadline(4, Duration::from_millis(10));
+        let mut buffer = OrderedPayloadBuffer::with_deadline(4, Duration::from_millis(10))
+            .with_startup_hold(Duration::ZERO);
         let mut out = Vec::new();
         for sequence in 100..110 {
             assert_eq!(
@@ -1775,7 +2098,8 @@ mod tests {
     #[test]
     fn ordered_deadline_buffer_resyncs_to_a_stream_that_jumped_back() {
         let start = Instant::now();
-        let mut buffer = OrderedPayloadBuffer::with_deadline(64, Duration::from_millis(10));
+        let mut buffer = OrderedPayloadBuffer::with_deadline(64, Duration::from_millis(10))
+            .with_startup_hold(Duration::ZERO);
         let mut out = Vec::new();
         buffer
             .push_into(payload(100_000, 0), start, &mut out)
@@ -1820,7 +2144,8 @@ mod tests {
     #[test]
     fn ordered_late_repairs_do_not_resync() {
         let start = Instant::now();
-        let mut buffer = OrderedPayloadBuffer::with_deadline(64, Duration::from_millis(10));
+        let mut buffer = OrderedPayloadBuffer::with_deadline(64, Duration::from_millis(10))
+            .with_startup_hold(Duration::ZERO);
         let mut out = Vec::new();
         let mut next = 200_000u32;
         buffer.push_into(payload(next, 0), start, &mut out).unwrap();
@@ -1894,45 +2219,201 @@ mod tests {
                 .unwrap();
             assert_eq!(push, OrderedPush::Held);
         }
+        assert!(buffer.in_startup());
         assert_eq!(buffer.next_deadline(), Some(start + ms(5)));
         buffer
             .push_into(payload(100, 0), start + ms(1), &mut out)
             .unwrap();
+        // Still unknown: something may precede 100 too.
+        assert!(out.is_empty());
+        // The third copy says 100 was the first packet.
+        let push = buffer
+            .push_into(duplicate(100), start + ms(2), &mut out)
+            .unwrap();
+        assert_eq!(push, OrderedPush::Released);
         assert_eq!(sequences(&out), vec![100, 101, 102, 103]);
         assert_eq!(buffer.gaps_skipped(), 0);
+        assert_eq!(buffer.stats().startup_rebased, 1);
+        assert_eq!(buffer.stats().startup_timeouts, 0);
 
-        // Nothing before the first packet: released after the hold, and the
-        // virtual gap is not counted as a skip.
+        // Nothing before the first packet: released after the hold, and
+        // nothing is counted as skipped.
         let mut buffer = OrderedPayloadBuffer::with_deadline(64, ms(50)).with_startup_hold(ms(5));
         let mut out = Vec::new();
-        buffer.push_into(payload(7, 0), start, &mut out).unwrap();
-        buffer.push_into(payload(8, 0), start, &mut out).unwrap();
+        buffer.push_into(payload(700, 0), start, &mut out).unwrap();
+        buffer.push_into(payload(701, 0), start, &mut out).unwrap();
         assert!(buffer.release_expired(start + ms(4)).is_empty());
         assert_eq!(
             sequences(&buffer.release_expired(start + ms(5))),
-            vec![7, 8]
+            vec![700, 701]
         );
         assert_eq!(buffer.gaps_skipped(), 0);
         assert_eq!(buffer.skipped_packets(), 0);
+        assert_eq!(buffer.stats().startup_timeouts, 1);
         // A real gap later is still held for the full delay and counted.
         buffer
-            .push_into(payload(10, 0), start + ms(6), &mut out)
+            .push_into(payload(703, 0), start + ms(6), &mut out)
             .unwrap();
         assert_eq!(buffer.next_deadline(), Some(start + ms(56)));
-        assert_eq!(sequences(&buffer.release_expired(start + ms(56))), vec![10]);
+        assert_eq!(
+            sequences(&buffer.release_expired(start + ms(56))),
+            vec![703]
+        );
         assert_eq!(buffer.gaps_skipped(), 1);
+        // And a packet below the start is late once the hold is over.
+        assert_eq!(
+            buffer.push_into(payload(699, 0), start + ms(57), &mut out),
+            Ok(OrderedPush::Late)
+        );
 
         // Without a hold the first packet goes at once, as before.
-        let mut buffer = OrderedPayloadBuffer::with_deadline(64, ms(50));
+        let mut buffer =
+            OrderedPayloadBuffer::with_deadline(64, ms(50)).with_startup_hold(Duration::ZERO);
         let mut out = Vec::new();
         buffer.push_into(payload(7, 0), start, &mut out).unwrap();
         assert_eq!(sequences(&out), vec![7]);
     }
 
+    fn duplicate(sequence: u32) -> ReceivedPayload {
+        ReceivedPayload {
+            duplicate: true,
+            ..payload(sequence, 0)
+        }
+    }
+
+    /// `with_deadline` recovers the start by default: sequence 0 goes at
+    /// once, a first payload at 1..=16 waits behind an ordinary gap back to
+    /// 0, and the hold is capped at the gap deadline.
+    #[test]
+    fn ordered_default_buffer_recovers_a_stream_numbered_from_zero() {
+        let start = Instant::now();
+        let mut buffer = OrderedPayloadBuffer::with_deadline(64, ms(1_000));
+        assert_eq!(buffer.startup_hold(), DEFAULT_STARTUP_HOLD);
+        assert_eq!(
+            OrderedPayloadBuffer::with_deadline(64, ms(10)).startup_hold(),
+            ms(10)
+        );
+        let mut out = Vec::new();
+        assert_eq!(
+            buffer.push_into(payload(0, 0), start, &mut out),
+            Ok(OrderedPush::Released)
+        );
+        assert_eq!(buffer.stats().startup_holds, 0);
+
+        // The first five packets were lost: 5 waits for their repairs for
+        // the whole gap deadline, not just the startup hold.
+        let mut buffer = OrderedPayloadBuffer::with_deadline(64, ms(1_000));
+        let mut out = Vec::new();
+        assert_eq!(
+            buffer.push_into(payload(5, 0), start, &mut out),
+            Ok(OrderedPush::Held)
+        );
+        assert_eq!(buffer.next_sequence(), Some(0));
+        assert_eq!(buffer.next_deadline(), Some(start + ms(1_000)));
+        assert!(buffer.release_expired(start + ms(300)).is_empty());
+        for sequence in 0..5 {
+            buffer
+                .push_into(payload(sequence, 0), start + ms(260), &mut out)
+                .unwrap();
+        }
+        assert_eq!(sequences(&out), (0..6).collect::<Vec<_>>());
+        assert_eq!(buffer.stats().zero_starts, 1);
+        assert_eq!(buffer.gaps_skipped(), 0);
+    }
+
+    /// Reordering at the start: packets below the first one seen are taken
+    /// while the hold lasts, the start is known once the lowest sequence is
+    /// within the zero-start reach, and the gaps that remain are ordinary.
+    #[test]
+    fn ordered_startup_takes_reordered_packets_below_the_first() {
+        let start = Instant::now();
+        let mut buffer = OrderedPayloadBuffer::with_deadline(4_096, ms(120));
+        let mut out = Vec::new();
+        buffer.push_into(payload(263, 0), start, &mut out).unwrap();
+        assert!(buffer.in_startup());
+        assert_eq!(buffer.next_deadline(), Some(start + DEFAULT_STARTUP_HOLD));
+        // 100..263 arrive in reverse, then 40..100 in order.
+        for sequence in (100..263).rev() {
+            assert_eq!(
+                buffer.push_into(payload(sequence, 0), start + ms(1), &mut out),
+                Ok(OrderedPush::Held)
+            );
+        }
+        for sequence in 40..100 {
+            buffer
+                .push_into(payload(sequence, 0), start + ms(2), &mut out)
+                .unwrap();
+        }
+        assert!(out.is_empty());
+        assert_eq!(buffer.next_sequence(), Some(40));
+        // 3 arrives: numbered from 0, the start is known; 0..3 and 4..40
+        // are ordinary gaps.
+        buffer
+            .push_into(payload(3, 0), start + ms(3), &mut out)
+            .unwrap();
+        assert!(!buffer.in_startup());
+        assert!(out.is_empty());
+        assert_eq!(buffer.next_sequence(), Some(0));
+        for sequence in (0..40).filter(|sequence| *sequence != 3) {
+            buffer
+                .push_into(payload(sequence, 0), start + ms(4), &mut out)
+                .unwrap();
+        }
+        assert_eq!(sequences(&out), (0..264).collect::<Vec<_>>());
+        assert_eq!(buffer.late_dropped(), 0);
+        // 262..100 one by one, then 40, then 3.
+        assert_eq!(buffer.stats().startup_rebased, 163 + 1 + 1);
+
+        // Too far below the first packet: not this start, dropped late, and
+        // the hold is over.
+        let mut buffer = OrderedPayloadBuffer::with_deadline(4_096, ms(120));
+        let mut out = Vec::new();
+        buffer
+            .push_into(payload(5_000, 0), start, &mut out)
+            .unwrap();
+        assert_eq!(
+            buffer.push_into(payload(5_000 - STARTUP_REACH - 1, 0), start, &mut out),
+            Ok(OrderedPush::Released)
+        );
+        assert_eq!(sequences(&out), vec![5_000]);
+        assert_eq!(buffer.late_dropped(), 1);
+    }
+
+    /// A stream that does not start near 0 and is not reordered (a
+    /// mid-stream join) is released when the hold ends; nothing is
+    /// skipped, and the steady state is as without a hold.
+    #[test]
+    fn ordered_startup_hold_ends_at_its_deadline_for_a_mid_stream_join() {
+        let start = Instant::now();
+        let mut held = OrderedPayloadBuffer::with_deadline(64, ms(1_000));
+        let mut plain =
+            OrderedPayloadBuffer::with_deadline(64, ms(1_000)).with_startup_hold(Duration::ZERO);
+        let mut out_held = Vec::new();
+        let mut out_plain = Vec::new();
+        for (index, sequence) in (40_000..40_100).enumerate() {
+            let at = start + Duration::from_micros(index as u64 * 500);
+            held.release_expired_into(at, &mut out_held);
+            held.push_into(payload(sequence, 0), at, &mut out_held)
+                .unwrap();
+            plain
+                .push_into(payload(sequence, 0), at, &mut out_plain)
+                .unwrap();
+            if at >= start + DEFAULT_STARTUP_HOLD {
+                assert_eq!(sequences(&out_held), sequences(&out_plain), "{index}");
+            } else {
+                assert!(out_held.is_empty());
+            }
+        }
+        assert_eq!(held.stats().startup_timeouts, 1);
+        assert_eq!(held.gaps_skipped(), 0);
+        assert_eq!(held.late_dropped(), 0);
+    }
+
     #[test]
     fn ordered_reset_drops_what_is_held() {
         let start = Instant::now();
-        let mut buffer = OrderedPayloadBuffer::with_deadline(8, Duration::from_millis(10));
+        let mut buffer = OrderedPayloadBuffer::with_deadline(8, Duration::from_millis(10))
+            .with_startup_hold(Duration::ZERO);
         buffer.push_at(payload(1, 0), start).unwrap();
         assert!(buffer.push_at(payload(3, 0), start).unwrap().is_empty());
         buffer.reset();
@@ -2032,7 +2513,8 @@ mod tests {
     #[test]
     fn ordered_with_deadline_skips_the_oldest_gap_at_its_bound() {
         let start = Instant::now();
-        let mut buffer = OrderedPayloadBuffer::with_deadline(2, Duration::from_secs(1));
+        let mut buffer = OrderedPayloadBuffer::with_deadline(2, Duration::from_secs(1))
+            .with_startup_hold(Duration::ZERO);
         assert_eq!(buffer.overflow_policy(), OverflowPolicy::SkipOldestGap);
         buffer.push_at(payload(30, 0), start).unwrap();
         assert!(buffer.push_at(payload(32, 0), start).unwrap().is_empty());
@@ -2348,6 +2830,102 @@ mod tests {
         assert_eq!(tracker.missing_sequences().next(), Some(2));
         // A repair for the far end of the horizon is still recognised.
         assert!(tracker.observe_at(2, start).recovered);
+        tracker.check_invariants();
+    }
+
+    /// A stream whose first sequence seen is 1..=16 is taken to start at 0:
+    /// the packets before it are holes, requested like any other.
+    #[test]
+    fn startup_window_takes_a_low_first_sequence_as_numbered_from_zero() {
+        let start = Instant::now();
+        let mut tracker = MissingTracker::with_limits(1_024, ms(1_000));
+        tracker.set_startup_window(ms(25));
+        let first = tracker.observe_at(3, start);
+        assert_eq!(first.newly_missing, vec![0, 1, 2]);
+        tracker.check_invariants();
+        assert_eq!(tracker.counters().startup_holes, 3);
+        let plan = schedule(5, 10);
+        assert!(take(&mut tracker, start + ms(4), &plan, 64).is_empty());
+        let due = take(&mut tracker, start + ms(15), &plan, 64);
+        assert_eq!(due, vec![0, 1, 2]);
+        tracker.commit_nacks(&due, start + ms(15), ms(20));
+        tracker.check_invariants();
+        // A later hole goes behind them; repairs close them.
+        assert_eq!(tracker.observe_at(5, start + ms(16)).newly_missing, vec![4]);
+        assert!(tracker.observe_at(1, start + ms(270)).recovered);
+        assert_eq!(
+            tracker.hole(1).map(|hole| hole.status),
+            Some(HoleStatus::Recovered)
+        );
+        assert_eq!(
+            tracker.missing_sequences().collect::<Vec<_>>(),
+            vec![0, 2, 4]
+        );
+        tracker.check_invariants();
+
+        // Off (the default): nothing before the first packet.
+        let mut tracker = MissingTracker::with_limits(1_024, ms(1_000));
+        assert!(tracker.observe_at(3, start).newly_missing.is_empty());
+        let late = tracker.observe_at(1, start + ms(1));
+        assert!(!late.duplicate && !late.recovered);
+        assert_eq!(tracker.counters().late_packets, 1);
+        assert_eq!(tracker.missing_len(), 0);
+    }
+
+    /// While the startup window is open, a packet below the start becomes
+    /// the new start and the sequences in between are holes; after the
+    /// window, or too far below, it is late as before.
+    #[test]
+    fn startup_window_takes_packets_below_the_first_as_the_new_start() {
+        let start = Instant::now();
+        let mut tracker = MissingTracker::with_limits(4_096, ms(1_000));
+        tracker.set_startup_window(ms(25));
+        assert!(tracker.observe_at(500, start).newly_missing.is_empty());
+        assert_eq!(tracker.observe_at(502, start).newly_missing, vec![501]);
+        // A retry-marked copy of the first packet, 10 below.
+        let below = tracker.observe_at(490, start + ms(12));
+        assert!(!below.duplicate && !below.recovered);
+        assert_eq!(below.newly_missing, (491..500).collect::<Vec<_>>());
+        tracker.check_invariants();
+        // Arrivals in between close holes; a copy of 490 is a duplicate.
+        assert!(tracker.observe_at(495, start + ms(13)).recovered);
+        assert!(tracker.observe_at(490, start + ms(13)).duplicate);
+        // Within the zero-start reach: back to 0.
+        let low = tracker.observe_at(7, start + ms(14));
+        assert_eq!(low.newly_missing.len(), 490 - 1);
+        assert_eq!(low.newly_missing.first(), Some(&0));
+        assert!(!low.newly_missing.contains(&7));
+        tracker.check_invariants();
+        let counters = tracker.counters();
+        assert_eq!(counters.startup_packets, 2);
+        assert_eq!(counters.startup_holes, 9 + 489);
+        assert_eq!(counters.late_packets, 0);
+        // They are requested oldest first, after the first-NACK delay.
+        let plan = schedule(5, 10);
+        let due = take(&mut tracker, start + ms(40), &plan, 1_024);
+        assert_eq!(due.len(), 489 + 8 + 1);
+        assert_eq!(due[..4], [0, 1, 2, 3]);
+
+        // After the window: late, as before.
+        let mut tracker = MissingTracker::with_limits(4_096, ms(1_000));
+        tracker.set_startup_window(ms(25));
+        tracker.observe_at(500, start);
+        let late = tracker.observe_at(490, start + ms(25));
+        assert!(late.newly_missing.is_empty());
+        assert_eq!(tracker.counters().late_packets, 1);
+        // Too far below: late.
+        let mut tracker = MissingTracker::with_limits(4_096, ms(1_000));
+        tracker.set_startup_window(ms(25));
+        tracker.observe_at(5_000, start);
+        let late = tracker.observe_at(5_000 - STARTUP_REACH - 1, start + ms(1));
+        assert!(late.newly_missing.is_empty());
+        assert_eq!(tracker.counters().late_packets, 1);
+        // A reset (new sender) opens the window again.
+        tracker.reset();
+        assert_eq!(
+            tracker.observe_at(2, start + ms(100)).newly_missing,
+            vec![0, 1]
+        );
         tracker.check_invariants();
     }
 

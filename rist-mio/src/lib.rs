@@ -7684,6 +7684,12 @@ mod tests {
         let receiver_addr = receiver.local_addr().unwrap();
         let mut sender =
             MainMioSender::connect(loopback_any(), receiver_addr, flow_id, 64).unwrap();
+        // Only the first copy of the first packet: the late one (12 ms)
+        // would fall due among the repairs below, on the wall clock.
+        sender.set_recovery_tuning(RecoveryTuning {
+            first_packet_late_copy: Duration::ZERO,
+            ..RecoveryTuning::default()
+        });
         let sender_addr = sender.local_addr().unwrap();
         assert_eq!(sender.next_timeout(), None, "nothing armed yet");
         sender.poll_rtcp_and_send(now, ntp).unwrap();
@@ -8195,6 +8201,17 @@ mod tests {
         assert_eq!(stats.duplicate_repairs, 601);
         assert_eq!(stats.retransmitted_packets, 1_801);
         assert_eq!(stats.repairs_dropped_queue_full, 0);
+        // The late copy of the first packet is all that is left.
+        assert_eq!(
+            sender.core.next_repair_at(),
+            Some(t + Duration::from_millis(12))
+        );
+        assert_eq!(
+            sender
+                .poll_repairs_and_send(t + Duration::from_millis(12))
+                .unwrap(),
+            1
+        );
         assert_eq!(sender.core.next_repair_at(), None);
     }
 

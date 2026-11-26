@@ -886,6 +886,99 @@ fn librist_main_sender_recovers_every_injected_loss_for_pure_rust_receiver() {
     }
 }
 
+/// librist numbers its RTP packets from 0 (`ctx->common.seq_rtp` starts at
+/// 0) and never copies its first packet. With the first packets of the
+/// stream dropped, the pure Rust receiver (`RecoveryTuning::default()`)
+/// takes the stream as numbered from 0 and NACKs them, librist repairs them
+/// from its history, and the default ordered buffer delivers the whole
+/// stream in order, the first payloads included.
+#[test]
+fn librist_main_sender_first_packets_lost_are_repaired_for_pure_rust_receiver() {
+    if !interop_enabled() {
+        return;
+    }
+    let _guard = lock_interop();
+
+    const PACKETS: u8 = 20;
+    for drop_first in [1_u64, 3] {
+        let flow_id = 0x1122_3344;
+        let receiver_port = next_even_test_port_pair();
+        let receiver_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, receiver_port));
+        let mut receiver =
+            MainMioReceiver::bind(receiver_addr, flow_id, "rust-start", NackMode::Range).unwrap();
+        let mut ordered =
+            rist_core::OrderedPayloadBuffer::with_deadline(1_024, Duration::from_millis(1_000));
+        let mut proxy = LossProxy::bind(LossProxyConfig {
+            listen: loopback_any(),
+            upstream_bind: loopback_any(),
+            target: receiver.local_addr().unwrap(),
+            drop_every: 0,
+        })
+        .unwrap()
+        .with_drop_first(drop_first);
+        let sender_url = format!("rist://{}", proxy.listen_addr().unwrap());
+        let mut sender = rist::Sender::new(rist::Profile::Main).unwrap();
+        sender.add_peer(&sender_url).unwrap();
+        sender.start().unwrap();
+
+        for value in 0..PACKETS {
+            sender.send(&[value; 1_316]).unwrap();
+            proxy.poll().unwrap();
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut delivered = Vec::new();
+        let mut released = Vec::new();
+        let mut receiver_buf = vec![0; 65_536];
+        while delivered.len() < usize::from(PACKETS) {
+            proxy.poll().unwrap();
+            while let Some((_from, payload)) = receiver.try_recv_payload(&mut receiver_buf).unwrap()
+            {
+                ordered
+                    .push_into(payload, Instant::now(), &mut released)
+                    .unwrap();
+            }
+            ordered.release_expired_into(Instant::now(), &mut released);
+            delivered.extend(released.drain(..).map(|payload| payload.payload[0]));
+            receiver
+                .poll_rtcp_and_send(Instant::now(), ntp_now())
+                .unwrap();
+            proxy.poll().unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "drop_first {drop_first}: delivered {delivered:?}; proxy={:?}, ordered={:?}, receiver={:?}",
+                proxy.stats(),
+                ordered.stats(),
+                receiver.stats()
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        assert_eq!(
+            delivered,
+            (0..PACKETS).collect::<Vec<_>>(),
+            "drop_first {drop_first}"
+        );
+        let stats = proxy.stats();
+        assert_eq!(stats.injected_drops, drop_first, "{stats:?}");
+        assert!(stats.all_injected_drops_recovered(), "{stats:?}");
+        assert_eq!(ordered.stats().zero_starts, 1);
+        assert_eq!(ordered.stats().gaps_skipped, 0);
+        let peer = receiver
+            .peer_addr()
+            .expect("pure receiver lost the proxy peer");
+        let startup_holes = receiver
+            .peer_flow_ids(peer)
+            .unwrap()
+            .into_iter()
+            .filter_map(|flow_id| receiver.peer_flow_stats(peer, flow_id))
+            .map(|stats| stats.startup_holes)
+            .sum::<u64>();
+        assert_eq!(startup_holes, drop_first);
+    }
+}
+
 #[test]
 fn pure_rust_main_sender_recovers_every_injected_loss_for_librist_receiver() {
     if !interop_enabled() {

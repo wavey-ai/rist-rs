@@ -94,6 +94,22 @@ pub struct RecoveryTuning {
     /// time.
     pub duplicate_late_repairs: bool,
     pub duplicate_gap: Duration,
+    /// Sender (with `duplicate_late_repairs`): the first data packet of a
+    /// flow goes out again, retry-marked, `duplicate_gap` after it and once
+    /// more this long after it, so a loss burst that takes the first packets
+    /// and the first copy still leaves one. Zero: only the first copy.
+    pub first_packet_late_copy: Duration,
+    /// Receiver: during the first
+    /// [`crate::recovery::DEFAULT_STARTUP_HOLD`] of a stream (at most the
+    /// recovery buffer), take a packet up to
+    /// [`crate::recovery::STARTUP_REACH`] below the first sequence seen as
+    /// the new start of the stream and NACK the sequences between it and
+    /// the old start like any hole; a stream whose first sequence seen is
+    /// at most [`crate::recovery::ZERO_START_REACH`] is taken to start at 0
+    /// (librist and rist-rs number from 0), so a loss of its first packets
+    /// is NACKed too. [`Self::ordered_startup_hold`] is the matching hold
+    /// for an [`crate::OrderedPayloadBuffer`].
+    pub startup_recovery: bool,
     /// Sender: resend the last packet of a burst once the sender has been
     /// idle for a few packet gaps, so a lost frame tail is repaired without
     /// waiting for the next frame. While the sender stays idle the probe is
@@ -124,6 +140,8 @@ impl Default for RecoveryTuning {
             redundant_nacks: true,
             duplicate_late_repairs: true,
             duplicate_gap: Duration::from_millis(1),
+            first_packet_late_copy: Duration::from_millis(12),
+            startup_recovery: true,
             tail_probe: TailProbe::Auto,
             tail_probe_max_per_mille: 20,
             tail_probe_loss_window: Duration::from_secs(10),
@@ -135,16 +153,31 @@ impl Default for RecoveryTuning {
 
 impl RecoveryTuning {
     /// RTT measurement and history by time stay on; the extras (adaptive
-    /// first NACK, re-NACK drain, NACK copies, duplicate repairs, tail
-    /// probes) are off.
+    /// first NACK, re-NACK drain, NACK copies, duplicate repairs, copies of
+    /// the first packet, startup recovery, tail probes) are off.
     pub fn librist_like() -> Self {
         Self {
             adaptive_first_nack: false,
             renack_drain: false,
             redundant_nacks: false,
             duplicate_late_repairs: false,
+            first_packet_late_copy: Duration::ZERO,
+            startup_recovery: false,
             tail_probe: TailProbe::Off,
             ..Self::default()
+        }
+    }
+
+    /// The first-payload hold for an [`crate::OrderedPayloadBuffer`] that
+    /// delivers this receiver's payloads with gap deadline `reorder_delay`:
+    /// [`crate::recovery::DEFAULT_STARTUP_HOLD`] capped at `reorder_delay`
+    /// with `startup_recovery`, zero without. It is what
+    /// [`crate::OrderedPayloadBuffer::with_deadline`] uses by default.
+    pub fn ordered_startup_hold(&self, reorder_delay: Duration) -> Duration {
+        if self.startup_recovery {
+            crate::recovery::DEFAULT_STARTUP_HOLD.min(reorder_delay)
+        } else {
+            Duration::ZERO
         }
     }
 }

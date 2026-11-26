@@ -151,6 +151,12 @@ pub struct ReceiverStats {
     /// Size of the duplicate-detection ring, in packets (it grows with the
     /// observed packet rate).
     pub duplicate_window_packets: u64,
+    /// Holes opened below the first sequence seen at the start of a stream
+    /// (`RecoveryTuning::startup_recovery`); also in total_missing_packets.
+    pub startup_holes: u64,
+    /// Packets taken below the first sequence seen at the start of a stream
+    /// as its new start.
+    pub startup_packets: u64,
 }
 
 impl ReceiverStats {
@@ -186,6 +192,8 @@ impl ReceiverStats {
             rtt_samples_karn_rejected: 0,
             stale_far_behind: 0,
             duplicate_window_packets: 0,
+            startup_holes: 0,
+            startup_packets: 0,
         }
     }
 
@@ -239,6 +247,8 @@ impl ReceiverStats {
         self.late_packets = counters.late_packets;
         self.retries_exhausted = counters.retries_exhausted;
         self.nack_too_late = counters.nack_too_late;
+        self.startup_holes = counters.startup_holes;
+        self.startup_packets = counters.startup_packets;
     }
 }
 

@@ -71,8 +71,8 @@ pub struct SimpleSenderPeerState {
     retry_window_started: Instant,
     retry_window_bytes: u64,
     rtt: RttEstimator,
-    /// Second copies of repairs, due at the instant given (FIFO: the
-    /// duplicate gap is fixed).
+    /// Second copies of repairs, due at the instant given, ordered by due
+    /// time (see `schedule_duplicate`).
     duplicates: VecDeque<(Instant, u32)>,
     /// When this peer last asked for a retransmission.
     last_nack_at: Option<Instant>,
@@ -592,11 +592,14 @@ impl SimpleSenderCore {
         self
     }
 
-    /// The first data packet of a flow goes out a second time,
-    /// `duplicate_gap` later (with `duplicate_late_repairs`): the receiver
-    /// starts at the first packet it gets, so it can never NACK one lost
-    /// before that. The copy is marked as a retransmission; a receiver that
-    /// has the original drops it as a duplicate.
+    /// The first data packet of a flow goes out again `duplicate_gap`
+    /// later and once more `first_packet_late_copy` later (with
+    /// `duplicate_late_repairs`): a receiver cannot NACK what precedes the
+    /// first packet it gets, and the late copy survives a loss burst that
+    /// takes the first packets and the first copy. The copies are marked as
+    /// retransmissions; a receiver that has the original drops them as
+    /// duplicates (and an ordered buffer takes a duplicate of its first
+    /// payload as the start of the stream).
     fn duplicate_first_packet(&mut self, sequence: u32, now: Instant) {
         if !self.tuning.duplicate_late_repairs
             || self.recovery.mode == RecoveryMode::Disabled
@@ -604,9 +607,11 @@ impl SimpleSenderCore {
         {
             return;
         }
-        self.recovery_state
-            .duplicates
-            .push_back((now + self.tuning.duplicate_gap, sequence));
+        let queue = &mut self.recovery_state.duplicates;
+        schedule_duplicate(queue, now + self.tuning.duplicate_gap, sequence);
+        if self.tuning.first_packet_late_copy > self.tuning.duplicate_gap {
+            schedule_duplicate(queue, now + self.tuning.first_packet_late_copy, sequence);
+        }
     }
 
     /// The packet [`Self::store_payload`] just stored for `sequence`.
@@ -1081,12 +1086,26 @@ fn retransmit_from_history(
             state.retry_window_bytes = state
                 .retry_window_bytes
                 .saturating_add(packet.payload_len as u64);
-            state
-                .duplicates
-                .push_back((now + context.tuning.duplicate_gap, sequence));
+            schedule_duplicate(
+                &mut state.duplicates,
+                now + context.tuning.duplicate_gap,
+                sequence,
+            );
         }
     }
     packets
+}
+
+/// Queues a duplicate repair due at `due`, keeping the queue ordered by
+/// due time (repairs are queued `duplicate_gap` ahead, the late copy of the
+/// first packet further: those after it go in front of it).
+fn schedule_duplicate(queue: &mut VecDeque<(Instant, u32)>, due: Instant, sequence: u32) {
+    if queue.back().map_or(true, |(last, _)| *last <= due) {
+        queue.push_back((due, sequence));
+    } else {
+        let index = queue.partition_point(|(at, _)| *at <= due);
+        queue.insert(index, (due, sequence));
+    }
 }
 
 /// Duplicate repairs due at `now` (see `RecoveryTuning::duplicate_late_repairs`),
@@ -1641,6 +1660,12 @@ impl SimpleReceiverCore {
             far_run_last: 0,
             echo_rtt_min_us: None,
         }
+        .with_startup_window()
+    }
+
+    fn with_startup_window(mut self) -> Self {
+        self.apply_startup_window();
+        self
     }
 
     pub fn with_rtcp_intervals(mut self, intervals: RtcpIntervals) -> Self {
@@ -1655,6 +1680,16 @@ impl SimpleReceiverCore {
 
     pub fn set_recovery_tuning(&mut self, tuning: RecoveryTuning) {
         self.tuning = tuning;
+        self.apply_startup_window();
+    }
+
+    /// The tracker's startup window: [`RecoveryTuning::ordered_startup_hold`]
+    /// of the recovery age (the hold of the default ordered buffer).
+    fn apply_startup_window(&mut self) {
+        let window = self
+            .tuning
+            .ordered_startup_hold(self.missing_tracker.recovery_age());
+        self.missing_tracker.set_startup_window(window);
     }
 
     pub fn recovery_tuning(&self) -> RecoveryTuning {
@@ -1687,6 +1722,7 @@ impl SimpleReceiverCore {
         self.missing_tracker
             .set_initial_nack_delay(recovery.reorder_buffer);
         self.recovery = recovery;
+        self.apply_startup_window();
         self.congestion_control = congestion_control;
         self.return_window_started = Instant::now();
         self.return_window_bytes = 0;
@@ -3449,6 +3485,15 @@ mod tests {
         // Only the first packet of the flow.
         sender.send_payload(b"third", ntp, t + ms(2));
         assert!(sender.poll_repairs_at(t + ms(3)).is_empty());
+        // And once more, late enough that the burst which took the first
+        // packets and the first copy has passed.
+        assert_eq!(sender.next_repair_at(), Some(t + ms(12)));
+        let late = sender.poll_repairs_at(t + ms(12));
+        assert_eq!(late.len(), 1);
+        assert_eq!(late[0].sequence, first.sequence);
+        assert!(late[0].retry);
+        assert_eq!(sender.stats().duplicate_repairs, 2);
+        assert_eq!(sender.next_repair_at(), None);
 
         // The first copy lost: the receiver starts at the second packet, then
         // the copy arrives (late, not a duplicate) and an ordered buffer with
@@ -3478,6 +3523,32 @@ mod tests {
             SimpleSenderCore::new(FLOW, 64).with_recovery_tuning(RecoveryTuning::librist_like());
         plain.send_payload(b"first", ntp, t);
         assert_eq!(plain.next_repair_at(), None);
+    }
+
+    /// The duplicate queue stays ordered by due time when a repair's copy
+    /// is queued after the late copy of the first packet.
+    #[test]
+    fn duplicates_are_queued_by_due_time() {
+        let t = Instant::now();
+        let mut queue = VecDeque::new();
+        schedule_duplicate(&mut queue, t + ms(1), 0);
+        schedule_duplicate(&mut queue, t + ms(12), 0);
+        schedule_duplicate(&mut queue, t + ms(6), 7);
+        schedule_duplicate(&mut queue, t + ms(12), 9);
+        schedule_duplicate(&mut queue, t + ms(13), 10);
+        assert_eq!(
+            queue
+                .iter()
+                .map(|(due, sequence)| (*due - t, *sequence))
+                .collect::<Vec<_>>(),
+            vec![
+                (ms(1), 0),
+                (ms(6), 7),
+                (ms(12), 0),
+                (ms(12), 9),
+                (ms(13), 10)
+            ]
+        );
     }
 
     #[test]
