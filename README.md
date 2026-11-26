@@ -72,8 +72,10 @@ A red cross means that required work or verification remains.
 
 - ✅ Workspace, build, CI, interoperability, and toolchain controls
 - ✅ Security, SRP, EAP, PSK, parser bounds, and resource limits
-  - A keyed endpoint drops clear packets other than EAPOL and never sends
-    them; PSK itself has no authentication tag (see the security note below).
+  - A keyed Main endpoint drops clear packets other than EAPOL and never
+    sends them; a Simple-profile endpoint refuses a key (Simple has no
+    encryption). PSK itself has no authentication tag (see the security note
+    below).
 - ✅ Bounded Simple and Main recovery, NACKs, retries, rollover, and backpressure
 - ✅ Typed one-pass Main datagram dispatch with bounded queues
 - ✅ Per-peer authentication, liveness, RTT, recovery, and feedback state
@@ -110,8 +112,19 @@ authentication tag. What that means:
 
 - **Confidentiality, not integrity.** Without the passphrase nobody can read
   the media or control payloads (the GRE header, with the nonce and sequence,
-  stays clear). There is no cryptographic integrity check and no sender
-  authentication of data packets.
+  stays clear), as long as no keystream is used twice. There is no
+  cryptographic integrity check and no sender authentication of data packets.
+- **Confidentiality rests on unique nonces.** The AES-CTR counter comes only
+  from the GRE sequence, so two packets sent under the same nonce (AES key)
+  and sequence share a keystream, and the XOR of their ciphertexts is the XOR
+  of their plaintexts, which MPEG-TS's known bytes make readable. rist-rs
+  gives every sender, multi-peer sender peer and receiver session its own
+  random 32-bit nonce, and renews it every `key-rotation` packets (default
+  1,000,000, well before the 32-bit sequence wraps). The nonce is only 32
+  bits: across many sessions under one passphrase, two picking the same
+  nonce becomes likely after some tens of thousands of nonces (the birthday
+  bound), and rotating often makes more of them. A librist peer picks its
+  own nonces.
 - **Wrong keys and forgeries are caught by header checks only.** After
   decryption rist-rs checks what librist checks (RTP version 2, VSF protocol
   and subtype) and more: no RTP padding or CSRC, MPEG-TS payload type, the
@@ -120,8 +133,22 @@ authentication tag. What that means:
   has passed them, at the seventh in a row after, as librist does). These
   checks reject a wrong key or a forged packet with high probability but not
   with cryptographic strength: random data passes the data-packet checks
-  about once in 2^15 tries. Keepalives, buffer negotiation and out-of-band
-  data carry too little structure to check.
+  about once in 2^15 tries, RTCP about once in 2^22. Per wrong-key nonce,
+  the first data or RTCP packet decides: about one such nonce in 32,600
+  gets a garbage packet delivered (rarely more than one) before it is shut
+  out; the rest are shut out at once. Each time the wrong-key sender
+  rotates its nonce it gets another try.
+- **Keepalives, buffer negotiation and out-of-band data are not checked.**
+  They carry too little structure to check, so they neither prove a nonce
+  nor shut it out. A wrong key's or a forger's out-of-band (GRE full)
+  packet is always accepted and delivered, as `MainReceiverEvent::Oob` or
+  `MainSenderEvent::Oob`, with garbage bytes; keepalives and buffer
+  negotiation messages are likewise accepted with garbage contents. Treat
+  out-of-band data from a keyed peer as unauthenticated. RIST control
+  packets rist-rs does not use (VSF subtypes such as 0x8001, which librist
+  also drops quietly, and keepalive extensions of an unknown form) are
+  dropped without counting against the nonce, so a correct peer that sends
+  one is never shut out.
 - **Bit flips go undetected.** AES-CTR is malleable: an on-path attacker can
   change bits of an encrypted payload, for example media bytes, and the
   receiver cannot tell as long as the headers still pass.
@@ -137,7 +164,9 @@ encrypted packets that fail the checks count in `decrypt_rejected`, packets
 of a shut-out nonce in `decrypt_latched` (receiver and sender stats). An
 endpoint with a key sends nothing clear but EAPOL: given only a receive key
 it encrypts with the same passphrase, and given only a transmit key it also
-drops clear packets from its peer. Where integrity
+drops clear packets from its peer. A Simple-profile sender or receiver
+given a key (`psk`, `secret=` or SRP) is refused with
+`EncryptionUnsupported`, since Simple cannot encrypt. Where integrity
 matters, carry RIST over an authenticated transport such as WireGuard or
 IPsec.
 
