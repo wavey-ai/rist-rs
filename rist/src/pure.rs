@@ -44,6 +44,12 @@ pub enum Error {
     #[error("profile {0:?} is not implemented by the pure Rust transport")]
     UnsupportedProfile(Profile),
 
+    /// Encryption (a PSK or SRP) was configured for a profile that has
+    /// none: RIST Simple Profile cannot encrypt, so a keyed Simple endpoint
+    /// is refused instead of sending and accepting clear packets.
+    #[error("profile {0:?} does not support encryption (PSK or SRP); use the Main profile")]
+    EncryptionUnsupported(Profile),
+
     #[error("RIST URL option {0} is not implemented by this pure Rust builder")]
     UnsupportedUrlOption(String),
 
@@ -410,6 +416,9 @@ impl SenderBuilder {
         }
         match self.profile {
             Profile::Simple => {
+                if self.psk.is_some() || self.srp_client.is_some() || self.srp_store.is_some() {
+                    return Err(Error::EncryptionUnsupported(Profile::Simple));
+                }
                 let mut sender = match peer {
                     Some(peer) => rist_mio::SimpleMioSender::connect(
                         self.local,
@@ -1266,6 +1275,9 @@ impl ReceiverBuilder {
         }
         match self.profile {
             Profile::Simple => {
+                if self.psk.is_some() || self.srp_client.is_some() || self.srp_store.is_some() {
+                    return Err(Error::EncryptionUnsupported(Profile::Simple));
+                }
                 let mut receiver = match peer {
                     Some(peer) => rist_mio::SimpleMioReceiver::connect(
                         self.local,
@@ -1765,6 +1777,113 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    fn assert_encryption_refused<T>(result: Result<T>) {
+        match result {
+            Err(Error::EncryptionUnsupported(Profile::Simple)) => {}
+            Err(error) => panic!("expected EncryptionUnsupported(Simple), got {error}"),
+            Ok(_) => panic!("a keyed Simple endpoint was built; it would send and accept clear"),
+        }
+    }
+
+    #[test]
+    fn simple_sender_with_a_key_is_refused() {
+        let sink = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let peer = sink.local_addr().unwrap();
+        assert_encryption_refused(
+            Sender::builder(Profile::Simple)
+                .peer_addr(peer)
+                .psk(128, b"12345678")
+                .connect(),
+        );
+        assert_encryption_refused(
+            Sender::builder(Profile::Simple)
+                .peer_addr(peer)
+                .psk_with_rotation(256, 100, b"12345678")
+                .connect(),
+        );
+        assert_encryption_refused(
+            Sender::builder(Profile::Simple)
+                .peer_addr(peer)
+                .srp_client("user", b"password")
+                .connect(),
+        );
+        assert_encryption_refused(
+            Sender::builder(Profile::Simple)
+                .listen_addr(loopback_any())
+                .srp_store(SrpCredentialStore::default())
+                .connect(),
+        );
+        // URL path: a secret in the URL is refused too, and nothing reaches
+        // the wire.
+        let port = peer.port();
+        assert_encryption_refused(Sender::connect_url(
+            Profile::Simple,
+            &format!("rist://127.0.0.1:{port}?secret=12345678&aes-type=128"),
+        ));
+        assert_encryption_refused(Sender::listen_url(
+            Profile::Simple,
+            "rist://@127.0.0.1:0?secret=12345678&aes-type=256",
+        ));
+        sink.set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let mut buf = [0u8; 2048];
+        assert!(
+            sink.recv_from(&mut buf).is_err(),
+            "a refused sender sent a datagram"
+        );
+        // Without a key the Simple sender still builds.
+        Sender::builder(Profile::Simple)
+            .peer_addr(SocketAddr::from((
+                Ipv4Addr::LOCALHOST,
+                next_even_port_pair(),
+            )))
+            .connect()
+            .unwrap();
+    }
+
+    #[test]
+    fn simple_receiver_with_a_key_is_refused() {
+        assert_encryption_refused(
+            Receiver::builder(Profile::Simple)
+                .psk(128, b"12345678")
+                .bind(),
+        );
+        assert_encryption_refused(
+            Receiver::builder(Profile::Simple)
+                .psk_with_rotation(192, 100, b"12345678")
+                .bind(),
+        );
+        assert_encryption_refused(
+            Receiver::builder(Profile::Simple)
+                .srp_password("user", b"password")
+                .unwrap()
+                .bind(),
+        );
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        assert_encryption_refused(
+            Receiver::builder(Profile::Simple)
+                .peer_addr(sender.local_addr().unwrap())
+                .srp_client("user", b"password")
+                .bind(),
+        );
+        // URL path.
+        assert_encryption_refused(Receiver::bind_url(
+            Profile::Simple,
+            "rist://@127.0.0.1:0?secret=12345678&aes-type=128",
+        ));
+        let port = sender.local_addr().unwrap().port();
+        assert_encryption_refused(Receiver::connect_url(
+            Profile::Simple,
+            &format!("rist://127.0.0.1:{port}?secret=12345678&aes-type=256"),
+        ));
+        // The Main profile still takes the same key.
+        Receiver::bind_url(
+            Profile::Main,
+            "rist://@127.0.0.1:0?secret=12345678&aes-type=128",
+        )
+        .unwrap();
     }
 
     #[test]
