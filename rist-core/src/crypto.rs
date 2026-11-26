@@ -464,6 +464,27 @@ impl PskKey {
             .any(|health| health.nonce == self.nonce && health.proven && !health.latched)
     }
 
+    /// Whether a nonce this copy still tracks carried a packet with a
+    /// [`DecryptVerdict::Strong`] verdict (checked RTP data or RTCP) and is
+    /// not shut out. A receive state is proven this way only by a peer with
+    /// the right passphrase (or, by the chance a wrong key passes the
+    /// checks, about one forged nonce in 2^15). Keepalives, buffer
+    /// negotiation and out-of-band packets get a [`DecryptVerdict::Weak`]
+    /// verdict, which a host with no key can earn every time: a receive
+    /// state that has seen only those is never proven. An endpoint uses
+    /// this to decide whether a session is a peer at all: whether it may
+    /// become the one feedback and keepalives go to, and whether it is sent
+    /// anything.
+    ///
+    /// Two nonces are tracked, so the peer's own nonce renewal keeps the
+    /// state proven while the new nonce has carried only keepalives.
+    pub fn receive_proven(&self) -> bool {
+        self.nonce_health
+            .iter()
+            .flatten()
+            .any(|health| health.proven && !health.latched)
+    }
+
     /// Makes `nonce` the receive nonce, deriving its AES key. Every change
     /// counts against this copy's [`MAX_RECEIVE_REKEYS_PER_SECOND`]; while
     /// the current nonce is not proven (see [`Self::current_nonce_proven`])
@@ -780,6 +801,40 @@ mod tests {
         assert_eq!(fresh.receive_counters(), PskReceiveCounters::default());
         let mut fresh = fresh;
         assert!(fresh.refuse_latched(unproven).is_ok());
+    }
+
+    /// Only a Strong verdict proves a receive state: keepalives (which a
+    /// host with no key gets through every time) never do, a latched nonce
+    /// no longer counts, and the peer's renewal to a new nonce keeps it.
+    #[test]
+    fn only_a_strong_verdict_proves_a_receive_state() {
+        let template = PskKey::receiver(128, b"secret").unwrap();
+        let mut rx = template.fresh_copy();
+        assert!(!rx.receive_proven());
+        for _ in 0..1000 {
+            rx.record_verdict([9, 9, 9, 9], DecryptVerdict::Weak);
+        }
+        rx.record_verdict([9, 9, 9, 9], DecryptVerdict::Ignore);
+        assert!(!rx.receive_proven());
+
+        let peer = [1, 0, 0, 1];
+        rx.record_verdict(peer, DecryptVerdict::Strong);
+        assert!(rx.receive_proven());
+        // The peer renews its nonce and sends a keepalive first.
+        rx.record_verdict([1, 0, 0, 2], DecryptVerdict::Weak);
+        assert!(rx.receive_proven());
+        // A fresh copy for another source starts unproven.
+        assert!(!rx.fresh_copy().receive_proven());
+
+        // A lucky forged nonce that then fails the checks is shut out, and
+        // with it the proof.
+        let mut lucky = template.fresh_copy();
+        lucky.record_verdict([3, 0, 0, 1], DecryptVerdict::Strong);
+        assert!(lucky.receive_proven());
+        for _ in 0..PSK_BAD_DECRYPTION_LIMIT {
+            lucky.record_verdict([3, 0, 0, 1], DecryptVerdict::Bad);
+        }
+        assert!(!lucky.receive_proven());
     }
 
     #[test]

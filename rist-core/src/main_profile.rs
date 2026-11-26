@@ -1202,6 +1202,19 @@ impl MainReceiverCore {
         }
     }
 
+    /// Whether this session's source has shown it holds the passphrase:
+    /// always true without a receive key; with one, true once a packet
+    /// passed the checks with a strong verdict (RTP data or RTCP) under a
+    /// nonce that is still tracked and not shut out
+    /// ([`PskKey::receive_proven`]). Keepalives, buffer negotiation and
+    /// out-of-band packets pass with a weak verdict that a host with no key
+    /// gets every time, so a session that has sent only those is not
+    /// proven: an endpoint should not take it as its peer (send it
+    /// feedback or keepalives) or count its packets as peer activity.
+    pub fn rx_peer_proven(&self) -> bool {
+        self.rx_key.as_ref().map_or(true, PskKey::receive_proven)
+    }
+
     /// What the receive key turned away (zero without a key).
     pub fn psk_receive_counters(&self) -> PskReceiveCounters {
         self.rx_key
@@ -2310,6 +2323,60 @@ mod tests {
 
         // A fresh session for a new source starts its counters at zero.
         assert_eq!(receiver.fresh_session().stats().clear_packets_dropped, 0);
+    }
+
+    /// A keyed receive session is proven only by checked data or RTCP: a
+    /// forged keepalive from a host with no key (which decrypts to
+    /// something that passes the keepalive check every time) and the
+    /// peer's own keepalives leave it unproven.
+    #[test]
+    fn keyed_receive_session_is_proven_only_by_data_or_rtcp() {
+        let now = Instant::now();
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let template = MainReceiverCore::new(0x1122_3344, "rust", NackMode::Range)
+            .with_rx_key(PskKey::receiver(128, b"secret").unwrap());
+        assert!(MainReceiverCore::new(0x1122_3344, "rust", NackMode::Range).rx_peer_proven());
+
+        // GRE K and S, keepalive protocol, a fixed nonce, eight junk bytes.
+        let mut forged = vec![0x30, 0x00, 0x88, 0xb5, 0x0b, 0xad, 0x00, 0x01];
+        forged.extend_from_slice(&7u32.to_be_bytes());
+        forged.extend_from_slice(&[0x5a; 8]);
+        let mut attacker = template.fresh_session();
+        for _ in 0..100 {
+            assert!(matches!(
+                attacker.decode_datagram(&forged).unwrap(),
+                MainPacket::Keepalive(_)
+            ));
+        }
+        assert!(!attacker.rx_peer_proven());
+
+        let mut sender =
+            MainSenderCore::new(0x1122_3344, 64).with_tx_key(PskKey::new(128, b"secret").unwrap());
+        let mut session = template.fresh_session();
+        let keepalive = sender.build_keepalive(GreKeepalive::librist_default([1, 2, 3, 4, 5, 6]));
+        let negotiation = sender.build_buffer_negotiation(BufferNegotiation::session(1000, 0));
+        assert!(matches!(
+            session.decode_datagram(&keepalive.bytes).unwrap(),
+            MainPacket::Keepalive(_)
+        ));
+        assert!(matches!(
+            session.decode_datagram(&negotiation.bytes).unwrap(),
+            MainPacket::BufferNegotiation(_)
+        ));
+        assert!(!session.rx_peer_proven());
+        let data = sender.send_payload(b"payload", ntp, now);
+        assert!(matches!(
+            session.decode_datagram(&data.bytes).unwrap(),
+            MainPacket::Reduced(_)
+        ));
+        assert!(session.rx_peer_proven());
+
+        // RTCP proves a session as well.
+        let mut rtcp_session = template.fresh_session();
+        assert_eq!(sender.poll_rtcp(now, ntp), None);
+        let rtcp = sender.poll_rtcp(now + Duration::from_secs(1), ntp).unwrap();
+        rtcp_session.decode_datagram(&rtcp.bytes).unwrap();
+        assert!(rtcp_session.rx_peer_proven());
     }
 
     /// A keyed Main sender takes no clear feedback: a clear NACK is

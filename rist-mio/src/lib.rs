@@ -4715,7 +4715,16 @@ impl MainMioReceiver {
                 }
                 if accepted {
                     runtime.timers.observe_peer_activity(now);
-                    self.last_peer = Some(from);
+                    // EAPOL is clear, so with a key any host can send it:
+                    // it makes its source the peer only once the source
+                    // completed SRP or its data or RTCP passed the checks.
+                    if self.configured_peer.is_some()
+                        || !runtime.core.has_rx_key()
+                        || receiver_runtime_authenticated(runtime)
+                        || runtime.core.rx_peer_proven()
+                    {
+                        self.last_peer = Some(from);
+                    }
                 }
                 MainReceiverEvent::Eapol {
                     from,
@@ -4746,19 +4755,30 @@ impl MainMioReceiver {
                 runtime.timers.observe_peer_activity(now);
                 MainReceiverEvent::Payload { from, payload }
             }
+            // With a key, these pass with a weak verdict that a host with
+            // no key gets every time: they make a source the peer (the one
+            // feedback and keepalives go to) and count as its activity only
+            // once its data or RTCP has proven it holds the passphrase. A
+            // configured peer's address is fixed already.
             MainPacket::Keepalive(packet) => {
-                self.last_peer = Some(from);
-                runtime.timers.observe_peer_activity(now);
+                if self.configured_peer.is_some() || runtime.core.rx_peer_proven() {
+                    self.last_peer = Some(from);
+                    runtime.timers.observe_peer_activity(now);
+                }
                 MainReceiverEvent::Keepalive { from, packet }
             }
             MainPacket::BufferNegotiation(packet) => {
-                self.last_peer = Some(from);
-                runtime.timers.observe_peer_activity(now);
+                if self.configured_peer.is_some() || runtime.core.rx_peer_proven() {
+                    self.last_peer = Some(from);
+                    runtime.timers.observe_peer_activity(now);
+                }
                 MainReceiverEvent::BufferNegotiation { from, packet }
             }
             MainPacket::Oob(packet) => {
-                self.last_peer = Some(from);
-                runtime.timers.observe_peer_activity(now);
+                if self.configured_peer.is_some() || runtime.core.rx_peer_proven() {
+                    self.last_peer = Some(from);
+                    runtime.timers.observe_peer_activity(now);
+                }
                 MainReceiverEvent::Oob { from, packet }
             }
             packet => MainReceiverEvent::Unhandled { from, packet },
@@ -4813,12 +4833,14 @@ impl MainMioReceiver {
                 .min();
         }
         self.peer_runtime
-            .values()
-            .flat_map(|runtime| {
-                [
-                    runtime.core.next_poll_at(),
-                    runtime.timers.next_keepalive_at(),
-                ]
+            .iter()
+            .flat_map(|(&peer, runtime)| {
+                // A session that is not a peer is sent no RTCP, so its
+                // report timer would stay due.
+                let rtcp = receiver_runtime_proven(runtime, peer, self.configured_peer)
+                    .then(|| runtime.core.next_poll_at())
+                    .flatten();
+                [rtcp, runtime.timers.next_keepalive_at()]
             })
             .flatten()
             .min()
@@ -4826,15 +4848,19 @@ impl MainMioReceiver {
 
     /// [`Self::poll_rtcp_and_send`] for every authenticated peer, not only
     /// the last one heard from, so two contributors on one port both get
-    /// NACKs. Returns the number of RTCP packets sent. On a send error the
-    /// rest of that peer's batch stays due; the error is returned when
-    /// nothing went out.
+    /// NACKs. With a receive key, a session whose data or RTCP never passed
+    /// the checks is not a peer and is sent nothing. Returns the number of
+    /// RTCP packets sent. On a send error the rest of that peer's batch
+    /// stays due; the error is returned when nothing went out.
     pub fn poll_all_rtcp_and_send(&mut self, now: Instant, now_ntp: u64) -> io::Result<usize> {
         let socket = &mut self.socket;
+        let configured_peer = self.configured_peer;
         let mut sent = 0;
         let mut error = None;
         for (&peer, runtime) in self.peer_runtime.iter_mut() {
-            if !receiver_runtime_authenticated(runtime) {
+            if !receiver_runtime_authenticated(runtime)
+                || !receiver_runtime_proven(runtime, peer, configured_peer)
+            {
                 continue;
             }
             sent += runtime
@@ -4862,7 +4888,10 @@ impl MainMioReceiver {
     }
 
     /// Sends a keepalive to every authenticated peer whose keepalive timer
-    /// is due (each peer keeps its own schedule). Returns the keepalives
+    /// is due (each peer keeps its own schedule). With a receive key, a
+    /// session whose data or RTCP never passed the checks is not a peer: it
+    /// is sent no keepalive, so it never derives a transmit key and a
+    /// forged (or spoofed) source gets nothing back. Returns the keepalives
     /// sent. On a send error the other peers are still served; the error is
     /// returned when nothing went out.
     pub fn poll_keepalive_all(
@@ -4871,10 +4900,17 @@ impl MainMioReceiver {
         keepalive: GreKeepalive<'_>,
     ) -> io::Result<usize> {
         let socket = &mut self.socket;
+        let configured_peer = self.configured_peer;
         let mut sent = 0;
         let mut error = None;
         for (&peer, runtime) in self.peer_runtime.iter_mut() {
-            if !receiver_runtime_authenticated(runtime) || !runtime.timers.poll(now).keepalive_due {
+            // The timer is polled (so kept moving) before the proof is
+            // checked: a session that loses its proof (its nonce shut out)
+            // must not leave a due timer behind for `next_timeout`.
+            if !receiver_runtime_authenticated(runtime)
+                || !runtime.timers.poll(now).keepalive_due
+                || !receiver_runtime_proven(runtime, peer, configured_peer)
+            {
                 continue;
             }
             let packet = runtime.core.build_keepalive(keepalive);
@@ -5501,6 +5537,17 @@ impl MainMioReceiver {
             Err(srp_not_authenticated_error())
         }
     }
+}
+
+/// Whether a receiver session counts as a peer under the receive key: a
+/// configured peer always does (its address is fixed), any other only once
+/// its data or RTCP passed the checks ([`MainReceiverCore::rx_peer_proven`]).
+fn receiver_runtime_proven(
+    runtime: &MainReceiverPeerRuntime,
+    peer: SocketAddr,
+    configured_peer: Option<SocketAddr>,
+) -> bool {
+    configured_peer == Some(peer) || runtime.core.rx_peer_proven()
 }
 
 fn receiver_runtime_authenticated(runtime: &MainReceiverPeerRuntime) -> bool {
@@ -9265,6 +9312,75 @@ mod tests {
         sender.send_payload(b"after-rollover", ntp, now).unwrap();
         let received = recv_main_payload_eventually(&mut receiver, &mut receiver_buf);
         assert_eq!(received.payload, b"after-rollover");
+    }
+
+    /// EAPOL is clear, so with a key any host can send it: a keyed SRP
+    /// receiver takes a source as its peer from EAPOL only once that source
+    /// completed SRP. A host that only starts a handshake does not become
+    /// the peer feedback and keepalives go to.
+    #[test]
+    fn keyed_srp_receiver_does_not_take_a_handshake_starter_as_its_peer() {
+        let _srp_test = lock_srp_test();
+        let flow_id = 0x1122_3344;
+        let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+        let mut receiver =
+            MainMioReceiver::bind(loopback_any(), flow_id, "receiver", NackMode::Range).unwrap();
+        receiver.set_rx_key(PskKey::receiver(128, b"secret").unwrap());
+        let mut store = SrpCredentialStore::new();
+        store.stage_password("rist", b"right").unwrap();
+        receiver.enable_srp_authenticator(store);
+        let receiver_addr = receiver.local_addr().unwrap();
+
+        let mut sender =
+            MainMioSender::connect(loopback_any(), receiver_addr, flow_id, 64).unwrap();
+        sender.set_tx_key(PskKey::new(128, b"secret").unwrap());
+        sender.enable_srp_client("rist", b"right");
+        let sender_addr = sender.local_addr().unwrap();
+        let mut sender_buf = [0u8; 2048];
+        let mut receiver_buf = [0u8; 2048];
+        sender.start_srp_authentication().unwrap();
+        drive_main_srp_authentication(
+            &mut sender,
+            &mut receiver,
+            &mut sender_buf,
+            &mut receiver_buf,
+        );
+        assert_eq!(receiver.peer_addr(), Some(sender_addr));
+        sender.send_payload(b"proven", ntp, Instant::now()).unwrap();
+        let received = recv_main_payload_eventually(&mut receiver, &mut receiver_buf);
+        assert_eq!(received.payload, b"proven");
+
+        // A host with neither the passphrase nor the SRP password starts
+        // handshakes; the receiver answers them, but its peer stays put.
+        let mut intruder =
+            MainMioSender::connect(loopback_any(), receiver_addr, flow_id, 64).unwrap();
+        intruder.enable_srp_client("rist", b"wrong");
+        let intruder_addr = intruder.local_addr().unwrap();
+        let mut eapol_seen = 0;
+        for _ in 0..4 {
+            intruder.start_srp_authentication().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                match receiver.try_recv_event(&mut receiver_buf) {
+                    Ok(Some(MainReceiverEvent::Eapol { from, .. })) if from == intruder_addr => {
+                        eapol_seen += 1;
+                        break;
+                    }
+                    Ok(Some(_)) | Err(_) => {}
+                    Ok(None) => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "the intruder's EAPOL never arrived"
+                        );
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            }
+            let _ = intruder.try_recv_eapol_and_respond(&mut sender_buf);
+        }
+        assert_eq!(eapol_seen, 4);
+        assert_eq!(receiver.peer_addr(), Some(sender_addr));
+        assert!(receiver.srp_authenticated());
     }
 
     #[test]
