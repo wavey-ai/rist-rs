@@ -74,8 +74,9 @@ A red cross means that required work or verification remains.
 - ✅ Security, SRP, EAP, PSK, parser bounds, and resource limits
   - A keyed Main endpoint drops clear packets other than EAPOL and never
     sends them; a Simple-profile endpoint refuses a key (Simple has no
-    encryption). PSK itself has no authentication tag (see the security note
-    below).
+    encryption). PSK itself has no authentication tag, so a host without the
+    key can still forge packets that pass, with low probability (see the
+    security note below).
 - ✅ Bounded Simple and Main recovery, NACKs, retries, rollover, and backpressure
 - ✅ Typed one-pass Main datagram dispatch with bounded queues
 - ✅ Per-peer authentication, liveness, RTT, recovery, and feedback state
@@ -120,11 +121,14 @@ authentication tag. What that means:
   of their plaintexts, which MPEG-TS's known bytes make readable. rist-rs
   gives every sender, multi-peer sender peer and receiver session its own
   random 32-bit nonce, and renews it every `key-rotation` packets (default
-  1,000,000, well before the 32-bit sequence wraps). The nonce is only 32
-  bits: across many sessions under one passphrase, two picking the same
-  nonce becomes likely after some tens of thousands of nonces (the birthday
-  bound), and rotating often makes more of them. A librist peer picks its
-  own nonces.
+  1,000,000) and in any case before 2^32 packets, so the 32-bit sequence
+  never wraps under one nonce, also with `key-rotation=0` (no rotation) or a
+  value above 2^32. If the operating system's random source fails, a new
+  nonce comes from a process-wide counter: unique, though predictable. The
+  nonce is only 32 bits: across many sessions under one passphrase, two
+  picking the same nonce becomes likely after some tens of thousands of
+  nonces (the birthday bound), and rotating often makes more of them. A
+  librist peer picks its own nonces.
 - **Wrong keys and forgeries are caught by header checks only.** After
   decryption rist-rs checks what librist checks (RTP version 2, VSF protocol
   and subtype) and more: no RTP padding or CSRC, MPEG-TS payload type, the
@@ -136,15 +140,32 @@ authentication tag. What that means:
   about once in 2^15 tries, RTCP about once in 2^22. Per wrong-key nonce,
   the first data or RTCP packet decides: about one such nonce in 32,600
   gets a garbage packet delivered (rarely more than one) before it is shut
-  out; the rest are shut out at once. Each time the wrong-key sender
-  rotates its nonce it gets another try.
-- **Keepalives, buffer negotiation and out-of-band data are not checked.**
-  They carry too little structure to check, so they neither prove a nonce
-  nor shut it out. A wrong key's or a forger's out-of-band (GRE full)
-  packet is always accepted and delivered, as `MainReceiverEvent::Oob` or
-  `MainSenderEvent::Oob`, with garbage bytes; keepalives and buffer
-  negotiation messages are likewise accepted with garbage contents. Treat
-  out-of-band data from a keyed peer as unauthenticated. RIST control
+  out; the rest are shut out at once.
+- **How often a forger gets garbage through.** A forger needs no key: it
+  can put a new nonce on every packet, and each new nonce is another try at
+  about 1 in 32,600 (3.1e-5). The limit is how fast rist-rs takes new
+  nonces, each a PBKDF2 derivation: at most 8 a second for one session (one
+  source address and port) and at most 64 a second for all sessions of a
+  keyed endpoint together (`MAX_SHARED_RECEIVE_REKEYS_PER_SECOND`, shared by
+  every copy of the configured key). A sustained flood therefore gets about
+  one garbage data packet delivered every 68 minutes from a single source
+  address and port, and at most about one every 8.5 minutes (2e-3 a second)
+  however many addresses and ports it uses, and costs at most 64
+  derivations a second of CPU. The same budget means such a flood can
+  delay a correct peer's first packets or its nonce change: they are
+  dropped (counted in `decrypt_rejected`) until the budget allows them, as
+  a flood can already fill a listening receiver's session capacity.
+- **Keepalives, buffer negotiation and out-of-band data are barely
+  checked.** They carry too little structure to tell a wrong key: one of
+  valid form neither proves a nonce nor counts against it. One that is
+  malformed after decryption (a keepalive or buffer negotiation shorter
+  than its fixed fields, a VSF whose protocol is not RIST) counts as a
+  failure like a bad data packet. A wrong key's or a forger's out-of-band
+  (GRE full) packet is always accepted and delivered, as
+  `MainReceiverEvent::Oob` or `MainSenderEvent::Oob`, with garbage bytes;
+  keepalives and buffer negotiation messages are likewise accepted with
+  garbage contents. Treat out-of-band data from a keyed peer as
+  unauthenticated. RIST control
   packets rist-rs does not use (VSF subtypes such as 0x8001, which librist
   also drops quietly, and keepalive extensions of an unknown form) are
   dropped without counting against the nonce, so a correct peer that sends
@@ -152,9 +173,29 @@ authentication tag. What that means:
 - **Bit flips go undetected.** AES-CTR is malleable: an on-path attacker can
   change bits of an encrypted payload, for example media bytes, and the
   receiver cannot tell as long as the headers still pass.
-- **A spoofed packet can stall a stream.** Packets forged with a sender's
-  nonce can get that nonce shut out until the sender's nonce rotates, as
-  with librist.
+- **A spoofed packet can stall a stream.** Packets forged with a peer's
+  nonce (it is in the clear GRE header) and sent from the peer's own
+  address and port can get that nonce shut out until the peer's nonce
+  changes, as with librist. A receiver that sends only feedback changes
+  its nonce only after `key-rotation` packets of its own, so in practice
+  its feedback stays shut out for the session. In rist-mio's endpoints,
+  packets from any other address cannot do this: each source has its own
+  receive state, so they are decrypted (if at all) with a state of their
+  own, as librist picks the peer by address before it picks a key. A
+  caller ignores datagrams from other addresses before decoding them; a
+  keyed listening receiver keeps one session per source address and port;
+  a keyed listening sender keeps one receive state per candidate source
+  until it has chosen its peer, then ignores other sources without
+  decrypting them.
+- **A keyed listening sender chooses its receiver by RTCP.** It takes as
+  its peer the first source whose RTCP passes the checks; a keepalive,
+  buffer negotiation or out-of-band packet, which a host without the key
+  can forge, never chooses it. A forger can still be chosen if one of its
+  RTCP packets passes the checks by chance, about once in 2^22 tries at no
+  more than 64 tries a second: about a day of sustained flooding on
+  average, and only before the real receiver has been chosen, since the
+  sender keeps the peer it chose. An unkeyed listening sender takes the
+  first source that sends it anything, as before.
 - **SRP does not change this.** EAP-SRP authenticates the peers to each
   other when a session is set up; it adds no per-packet integrity.
 
