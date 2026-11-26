@@ -7,7 +7,9 @@ use rist_core::packet::rtcp::{
 };
 use rist_core::time::ntp_now;
 use rist_core::{PskKey, SrpCredentialStore};
-use rist_mio::{MainMioReceiver, MainMioSender, SimpleMioReceiver, SimpleMioSender};
+use rist_mio::{
+    MainMioReceiver, MainMioSender, MainSenderEvent, SimpleMioReceiver, SimpleMioSender,
+};
 use rist_tools::{LossProxy, LossProxyConfig};
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket};
@@ -1296,6 +1298,82 @@ fn librist_main_receiver_caller_from_pure_rust_sender_listener() {
             "timed out waiting for the librist Main receiver caller"
         );
     }
+}
+
+/// A keyed listening Rust sender chooses its peer only from RTCP that
+/// passed the PSK checks: librist's encrypted RTCP does, so a librist
+/// receiver caller with the right secret is chosen and gets the media.
+#[test]
+fn librist_main_aes_receiver_caller_from_pure_rust_sender_listener() {
+    if !interop_enabled() {
+        return;
+    }
+    let _guard = lock_interop();
+
+    let flow_id = 0x1122_3344;
+    let sender_port = next_even_test_port_pair();
+    let sender_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, sender_port));
+    let mut sender = MainMioSender::listen(sender_addr, flow_id, 64).unwrap();
+    sender.set_tx_key(PskKey::new(128, b"12345678").unwrap());
+    sender.set_rx_key(PskKey::receiver(128, b"12345678").unwrap());
+    let receiver_url = format!("rist://127.0.0.1:{sender_port}?secret=12345678&aes-type=128");
+    let mut receiver = rist::Receiver::new(rist::Profile::Main).unwrap();
+    receiver.add_peer(&receiver_url).unwrap();
+    receiver.start().unwrap();
+
+    let mut control_buf = [0u8; 1500];
+    let mut saw_feedback = false;
+    let discovery_deadline = Instant::now() + Duration::from_secs(10);
+    while sender.peer_addr().is_none() {
+        match sender.try_recv_event(&mut control_buf) {
+            Ok(Some(MainSenderEvent::Feedback { .. })) => saw_feedback = true,
+            Ok(_) => thread::sleep(Duration::from_millis(1)),
+            Err(error) => panic!("Rust sender refused librist's packet: {error}"),
+        }
+        assert!(
+            Instant::now() < discovery_deadline,
+            "timed out waiting for the encrypted librist Main receiver caller"
+        );
+    }
+    assert!(saw_feedback, "the peer was chosen without RTCP");
+    send_main_session_probe(&mut sender);
+
+    let label = b"LIBRIST AES CALLER FROM RUST LISTENER";
+    let payload = mpegts_payload_7("LIBRIST AES CALLER FROM RUST LISTENER");
+    for _ in 0..20 {
+        sender
+            .send_payload(&payload, ntp_now(), Instant::now())
+            .unwrap();
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(block) = receiver.read(Duration::from_millis(50)).unwrap() {
+            assert!(block.payload().starts_with(&[0x47]));
+            assert!(block
+                .payload()
+                .windows(label.len())
+                .any(|window| window == label));
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the encrypted librist Main receiver caller"
+        );
+    }
+    let deadline = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < deadline {
+        match sender.try_recv_event(&mut control_buf) {
+            Ok(Some(_)) => {}
+            Ok(None) => thread::sleep(Duration::from_millis(1)),
+            Err(error) => panic!("Rust sender refused librist's packet: {error}"),
+        }
+    }
+    let stats = sender.stats();
+    assert_eq!(stats.clear_packets_dropped, 0);
+    assert_eq!(stats.decrypt_rejected, 0);
+    assert_eq!(stats.decrypt_latched, 0);
 }
 
 #[test]

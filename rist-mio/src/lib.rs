@@ -12,7 +12,7 @@ use mio::{Interest, Registry, Token};
 use rist_core::auth::{EapSrpAuthenticatorSession, EapSrpClientSession, EapolFrame, SrpUserRecord};
 use rist_core::crypto::{PskKey, PskReceiveCounters};
 use rist_core::packet::gre::{
-    BufferNegotiation, GreKeepalive, OwnedBufferNegotiationPacket, OwnedKeepalivePacket,
+    BufferNegotiation, GreHeader, GreKeepalive, OwnedBufferNegotiationPacket, OwnedKeepalivePacket,
     OwnedOobPacket, ReducedPacket,
 };
 use rist_core::packet::rtp::{encode_packet, RtpHeader, RtpPacket};
@@ -38,6 +38,10 @@ pub const MAX_RIST_DATAGRAM_SIZE: usize = 10_000;
 const SAFE_RECEIVE_CAPACITY: usize = MAX_RIST_DATAGRAM_SIZE + 1;
 pub const DEFAULT_MAIN_EVENT_QUEUE_CAPACITY: usize = 256;
 pub const DEFAULT_MAIN_PEER_CAPACITY: usize = 256;
+/// Candidate sources whose own copy of the receive key a keyed listening
+/// [`MainMioSender`] keeps until it has chosen its peer (the least recently
+/// heard one makes room).
+pub const MAIN_LISTENER_KEY_CANDIDATES: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkInterface {
@@ -1981,6 +1985,10 @@ pub struct MainMioSender {
     srp: Option<EapSrpClientSession>,
     srp_authenticator: Option<EapSrpAuthenticatorSession>,
     srp_candidates: HashMap<SocketAddr, EapSrpAuthenticatorSession>,
+    /// With a receive key, until a listening sender has chosen its peer:
+    /// each candidate source's own copy of the key (least recently heard
+    /// first), so one source's packets never touch another's nonce state.
+    rx_candidates: VecDeque<(SocketAddr, PskKey)>,
     peer: Option<SocketAddr>,
     listening: bool,
     last_reauthentication: Option<Instant>,
@@ -2471,6 +2479,7 @@ impl MainMioSender {
             srp: None,
             srp_authenticator: None,
             srp_candidates: HashMap::new(),
+            rx_candidates: VecDeque::new(),
             peer,
             listening: peer.is_none(),
             last_reauthentication: None,
@@ -2582,10 +2591,12 @@ impl MainMioSender {
 
     pub fn set_tx_key(&mut self, key: PskKey) {
         self.core.set_tx_key(key);
+        self.rx_candidates.clear();
     }
 
     pub fn set_rx_key(&mut self, key: PskKey) {
         self.core.set_rx_key(key);
+        self.rx_candidates.clear();
     }
 
     pub fn enable_srp_client(&mut self, username: impl Into<String>, password: impl AsRef<[u8]>) {
@@ -2661,8 +2672,18 @@ impl MainMioSender {
         self.peer
     }
 
+    /// The sender's statistics, with the PSK counters of candidate sources
+    /// not chosen yet (see [`MAIN_LISTENER_KEY_CANDIDATES`]).
     pub fn stats(&self) -> SenderStats {
-        self.core.stats()
+        let mut stats = self.core.stats();
+        for (_, key) in &self.rx_candidates {
+            let counters = key.receive_counters();
+            stats.clear_packets_dropped += counters.clear_packets_dropped;
+            stats.decrypt_rejected += counters.decrypt_rejected;
+            stats.decrypt_latched += counters.decrypt_latched;
+            stats.nonce_latches += counters.nonce_latches;
+        }
+        stats
     }
 
     pub fn send_outbound(&mut self, packet: &MainOutboundPacket) -> io::Result<usize> {
@@ -3101,13 +3122,15 @@ impl MainMioSender {
         from: SocketAddr,
         datagram: &[u8],
     ) -> io::Result<MainSenderEvent> {
-        let packet = self
-            .core
-            .decode_datagram(datagram)
-            .map_err(core_to_io_error)?;
         if self.peer.is_some_and(|peer| peer != from) {
-            return Ok(MainSenderEvent::Unhandled { from, packet });
+            return self.foreign_datagram(from, datagram);
         }
+        let packet = if self.listening && self.peer.is_none() && self.core.has_rx_key() {
+            self.decode_candidate_datagram(from, datagram)
+        } else {
+            self.core.decode_datagram(datagram)
+        }
+        .map_err(core_to_io_error)?;
         let event = match packet {
             MainPacket::Eapol(eapol) => {
                 if self.handle_eapol_frame_from(from, &eapol.frame)? {
@@ -3135,7 +3158,15 @@ impl MainMioSender {
                         now,
                     )
                     .map_err(core_to_io_error)?;
-                self.select_unsecured_listener_peer(from);
+                // With a key only RTCP that passed the checks (a structure
+                // a forger without the key reproduces about once in 2^22)
+                // chooses the peer: keepalives, buffer negotiation and
+                // out-of-band data prove nothing.
+                if self.select_unsecured_listener_peer(from) && self.core.has_rx_key() {
+                    self.adopt_candidate_rx_key(from);
+                    self.core.upgrade_gre_version(packet.gre.version);
+                    self.send_keepalive(GreKeepalive::librist_default([0; 6]))?;
+                }
                 for response in &outcome.responses {
                     // Best effort: a full queue drops an echo response as a
                     // lost datagram would.
@@ -3170,25 +3201,24 @@ impl MainMioSender {
                 }
             }
             MainPacket::Keepalive(packet) => {
-                let discovered = self.listening && self.peer.is_none();
-                self.select_unsecured_listener_peer(from);
+                let discovered = self.select_listener_peer_without_key(from);
                 if self.listening && self.peer == Some(from) {
                     self.core.upgrade_gre_version(packet.gre.version);
                 }
-                if discovered && self.peer == Some(from) {
+                if discovered {
                     self.send_keepalive(GreKeepalive::librist_default([0; 6]))?;
                 }
-                self.timers.observe_peer_activity(Instant::now());
+                self.observe_activity_from(from);
                 MainSenderEvent::Keepalive { from, packet }
             }
             MainPacket::BufferNegotiation(packet) => {
-                self.select_unsecured_listener_peer(from);
-                self.timers.observe_peer_activity(Instant::now());
+                self.select_listener_peer_without_key(from);
+                self.observe_activity_from(from);
                 MainSenderEvent::BufferNegotiation { from, packet }
             }
             MainPacket::Oob(packet) => {
-                self.select_unsecured_listener_peer(from);
-                self.timers.observe_peer_activity(Instant::now());
+                self.select_listener_peer_without_key(from);
+                self.observe_activity_from(from);
                 MainSenderEvent::Oob { from, packet }
             }
             packet => MainSenderEvent::Unhandled { from, packet },
@@ -3366,13 +3396,109 @@ impl MainMioSender {
         }
         if completed && self.peer.is_none() {
             self.peer = Some(from);
+            self.adopt_candidate_rx_key(from);
         }
         Ok(accepted)
     }
 
-    fn select_unsecured_listener_peer(&mut self, from: SocketAddr) {
+    /// Chooses `from` as the listening sender's peer if none is chosen and
+    /// SRP does not choose it. Returns whether it was chosen now.
+    fn select_unsecured_listener_peer(&mut self, from: SocketAddr) -> bool {
         if self.listening && self.peer.is_none() && self.srp_authenticator.is_none() {
             self.peer = Some(from);
+            return true;
+        }
+        false
+    }
+
+    /// [`Self::select_unsecured_listener_peer`] on a keepalive, buffer
+    /// negotiation or out-of-band packet: only without a receive key. With
+    /// one, such a packet chooses nothing: a host without the key can make
+    /// one that passes (they carry too little structure to check).
+    fn select_listener_peer_without_key(&mut self, from: SocketAddr) -> bool {
+        !self.core.has_rx_key() && self.select_unsecured_listener_peer(from)
+    }
+
+    /// Valid traffic from the chosen peer keeps the session alive; a keyed
+    /// listening sender's candidates do not.
+    fn observe_activity_from(&mut self, from: SocketAddr) {
+        if self.peer == Some(from) {
+            self.timers.observe_peer_activity(Instant::now());
+        }
+    }
+
+    /// A datagram from a source other than the chosen peer. With a receive
+    /// key it is not decrypted, so it cannot touch the peer's nonce state
+    /// (librist, too, picks the peer by address before it picks a key): it
+    /// is returned as `Unhandled`, `MainPacket::Unknown` with its GRE header
+    /// and its payload as it arrived. Without a key it is decoded as before.
+    fn foreign_datagram(
+        &mut self,
+        from: SocketAddr,
+        datagram: &[u8],
+    ) -> io::Result<MainSenderEvent> {
+        let packet = if self.core.has_rx_key() {
+            let (gre, offset) = GreHeader::decode(datagram).map_err(core_to_io_error)?;
+            MainPacket::Unknown {
+                gre,
+                vsf: None,
+                payload: datagram[offset..].to_vec(),
+            }
+        } else {
+            self.core
+                .decode_datagram(datagram)
+                .map_err(core_to_io_error)?
+        };
+        Ok(MainSenderEvent::Unhandled { from, packet })
+    }
+
+    /// Decodes a datagram for a keyed listening sender that has not chosen
+    /// its peer, with the source's own copy of the receive key.
+    fn decode_candidate_datagram(
+        &mut self,
+        from: SocketAddr,
+        datagram: &[u8],
+    ) -> rist_core::Result<MainPacket> {
+        let entry = match self
+            .rx_candidates
+            .iter()
+            .position(|(addr, _)| *addr == from)
+        {
+            Some(index) => self
+                .rx_candidates
+                .remove(index)
+                .expect("candidate index was just found"),
+            None => {
+                let Some(key) = self.core.fresh_rx_key() else {
+                    return self.core.decode_datagram(datagram);
+                };
+                if self.rx_candidates.len() >= MAIN_LISTENER_KEY_CANDIDATES {
+                    if let Some((_, evicted)) = self.rx_candidates.pop_front() {
+                        self.core.absorb_psk_counters(evicted.receive_counters());
+                    }
+                }
+                (from, key)
+            }
+        };
+        // Most recently heard last.
+        self.rx_candidates.push_back(entry);
+        let (_, key) = self
+            .rx_candidates
+            .back_mut()
+            .expect("candidate was just pushed");
+        self.core.decode_datagram_with_rx_key(key, datagram)
+    }
+
+    /// The peer is chosen: its candidate copy of the receive key becomes
+    /// the receive key (its nonce state goes on), and the other candidates'
+    /// copies are dropped, their counters kept.
+    fn adopt_candidate_rx_key(&mut self, peer: SocketAddr) {
+        for (addr, key) in self.rx_candidates.drain(..) {
+            if addr == peer {
+                self.core.adopt_rx_key(key);
+            } else {
+                self.core.absorb_psk_counters(key.receive_counters());
+            }
         }
     }
 
